@@ -1,0 +1,295 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  TC
+  CHAMPION
+  AGENT
+}
+
+enum TerritoryType {
+  PROVINCE
+  DISTRICT
+  SECTOR
+  CELL
+  VILLAGE
+}
+
+enum AgentTransferStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
+enum AgentStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  PENDING
+}
+
+enum LocationStatus {
+  VERIFIED
+  OUTSIDE_RADIUS
+  LOW_ACCURACY
+}
+
+enum VisitStatus {
+  STARTED
+  COMPLETED
+  FLAGGED
+  REJECTED
+}
+
+enum SyncStatus {
+  SYNCED
+  PENDING
+  FAILED
+}
+
+model User {
+  id                    String                   @id @default(uuid()) @db.Uuid
+  username              String                   @unique
+  email                 String                   @unique
+  passwordHash          String
+  mustChangePassword    Boolean                  @default(false)
+  passwordResetExpiresAt DateTime?
+  tokenVersion           Int                      @default(0)
+  role                  Role
+  firstName             String
+  lastName              String
+  phoneNumber           String?
+  isActive              Boolean                  @default(true)
+  lastLogin             DateTime?
+  createdAt             DateTime                 @default(now())
+  updatedAt             DateTime                 @updatedAt
+  tcTerritoryAssignments TcTerritoryAssignment[]  @relation("TcToAssignment")
+  tcTerritoryAssignmentsAssignedBy TcTerritoryAssignment[]  @relation("AssignedBy")
+  agentsCreated         Agent[]                  @relation("AgentCreatedBy")
+  championAgents        Agent[]                  @relation("AgentChampion")
+  agentLocationsRecorded AgentLocation[]         @relation("AgentLocationRecordedBy")
+  visits                Visit[]                  @relation("VisitTc")
+  auditLogs             AuditLog[]               @relation("AuditLogUser")
+  systemConfigsUpdated  SystemConfig[]           @relation("ConfigUpdatedBy")
+  requestedAgentTransfers AgentTransfer[]        @relation("AgentTransferRequester")
+  receivedAgentTransfers  AgentTransfer[]        @relation("AgentTransferRecipient")
+}
+
+model Territory {
+  id              String                   @id @default(uuid()) @db.Uuid
+  name            String
+  type            TerritoryType
+  parentId        String?                  @db.Uuid
+  parent          Territory?               @relation("TerritoryHierarchy", fields: [parentId], references: [id])
+  children        Territory[]              @relation("TerritoryHierarchy")
+  code            String                   @unique
+  isActive        Boolean                  @default(true)
+  createdAt       DateTime                 @default(now())
+  updatedAt       DateTime                 @updatedAt
+  tcAssignments   TcTerritoryAssignment[]
+  agentsDistrict  Agent[]                  @relation("AgentTerritory")
+  agentsSector    Agent[]                  @relation("AgentSector")
+  agentsCell      Agent[]                  @relation("AgentCell")
+  agentsVillage   Agent[]                  @relation("AgentVillage")
+  transfersFrom   AgentTransfer[]          @relation("AgentTransferFromTerritory")
+  transfersTo     AgentTransfer[]          @relation("AgentTransferToTerritory")
+  visits          Visit[]                  @relation("VisitTerritory")
+
+  @@index([type, parentId])
+}
+
+model TcTerritoryAssignment {
+  id          String    @id @default(uuid()) @db.Uuid
+  tcId        String    @db.Uuid
+  tc          User      @relation("TcToAssignment", fields: [tcId], references: [id])
+  territoryId String    @db.Uuid
+  territory   Territory @relation(fields: [territoryId], references: [id])
+  assignedAt  DateTime  @default(now())
+  assignedById String   @db.Uuid
+  assignedBy  User      @relation("AssignedBy", fields: [assignedById], references: [id])
+  endDate     DateTime?
+  isActive    Boolean   @default(true)
+
+  @@index([tcId, isActive])
+  @@index([territoryId, isActive])
+}
+
+model Agent {
+  id                 String           @id @default(uuid()) @db.Uuid
+  agentId            String           @unique
+  name               String
+  phoneNumber        String?
+  businessName       String?
+  address            String?
+  nationalIdEncrypted String?
+  nextOfKinNameEncrypted String?
+  nextOfKinPhoneEncrypted String?
+  territoryId        String           @db.Uuid
+  territory          Territory        @relation("AgentTerritory", fields: [territoryId], references: [id])
+  sectorId           String?          @db.Uuid
+  sector             Territory?       @relation("AgentSector", fields: [sectorId], references: [id])
+  cellId             String?          @db.Uuid
+  cell               Territory?       @relation("AgentCell", fields: [cellId], references: [id])
+  villageId          String?          @db.Uuid
+  village            Territory?       @relation("AgentVillage", fields: [villageId], references: [id])
+  firstVisitLocationCapturedAt DateTime?
+  firstVisitCompletedAt DateTime?
+  championId         String?          @db.Uuid
+  champion           User?            @relation("AgentChampion", fields: [championId], references: [id])
+  status             AgentStatus      @default(ACTIVE)
+  registeredLatitude Float?
+  registeredLongitude Float?
+  gpsAccuracy        Float?
+  locationVerified   Boolean          @default(false)
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  createdById        String           @db.Uuid
+  createdBy          User             @relation("AgentCreatedBy", fields: [createdById], references: [id])
+  locations          AgentLocation[]
+  visits             Visit[]          @relation("VisitAgent")
+  transfers          AgentTransfer[]
+
+  @@index([territoryId, status])
+  @@index([sectorId])
+  @@index([cellId])
+  @@index([villageId])
+  @@index([championId, status])
+}
+
+model AgentTransfer {
+  id                String              @id @default(uuid()) @db.Uuid
+  agentId           String              @db.Uuid
+  agent             Agent               @relation(fields: [agentId], references: [id])
+  fromTerritoryId   String              @db.Uuid
+  fromTerritory     Territory           @relation("AgentTransferFromTerritory", fields: [fromTerritoryId], references: [id])
+  toTerritoryId     String              @db.Uuid
+  toTerritory       Territory           @relation("AgentTransferToTerritory", fields: [toTerritoryId], references: [id])
+  requestedByTcId   String              @db.Uuid
+  requestedByTc     User                @relation("AgentTransferRequester", fields: [requestedByTcId], references: [id])
+  recipientTcId     String              @db.Uuid
+  recipientTc       User                @relation("AgentTransferRecipient", fields: [recipientTcId], references: [id])
+  reason            String?
+  status            AgentTransferStatus @default(PENDING)
+  requestedAt       DateTime            @default(now())
+  completedAt       DateTime?
+
+  @@index([agentId, status])
+  @@index([recipientTcId, status])
+  @@index([requestedByTcId, requestedAt])
+}
+
+model AgentLocation {
+  id          String   @id @default(uuid()) @db.Uuid
+  agentId     String   @db.Uuid
+  agent       Agent    @relation(fields: [agentId], references: [id])
+  latitude    Float
+  longitude   Float
+  accuracy    Float?
+  recordedAt  DateTime @default(now())
+  recordedById String  @db.Uuid
+  recordedBy  User     @relation("AgentLocationRecordedBy", fields: [recordedById], references: [id])
+  reason      String?
+
+  @@index([agentId, recordedAt])
+}
+
+model Visit {
+  id                String         @id @default(uuid()) @db.Uuid
+  visitId           String         @unique
+  tcId              String         @db.Uuid
+  tc                User           @relation("VisitTc", fields: [tcId], references: [id])
+  agentId           String         @db.Uuid
+  agent             Agent          @relation("VisitAgent", fields: [agentId], references: [id])
+  territoryId       String         @db.Uuid
+  territory         Territory      @relation("VisitTerritory", fields: [territoryId], references: [id])
+  visitDate         DateTime
+  checkInTime       DateTime
+  checkOutTime      DateTime?
+  agentLatitude     Float
+  agentLongitude    Float
+  tcLatitude        Float
+  tcLongitude       Float
+  distanceMeters    Float
+  gpsAccuracyMeters Float
+  locationStatus    LocationStatus
+  visitStatus       VisitStatus    @default(STARTED)
+  isOffline         Boolean        @default(false)
+  syncStatus        SyncStatus     @default(SYNCED)
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  report            VisitReport?
+  photos            VisitPhoto[]
+
+  @@index([tcId, visitDate])
+  @@index([agentId, visitDate])
+  @@index([territoryId, visitDate])
+}
+
+model VisitReport {
+  id                         String   @id @default(uuid()) @db.Uuid
+  visitId                    String   @unique @db.Uuid
+  visit                      Visit    @relation(fields: [visitId], references: [id])
+  operatingStatus            String?
+  servicesOffered            String?
+  productsOffered            String?
+  generalObservations        String?
+  liquidityObservations      String?
+  customerQualityObservations String?
+  challengesFaced            String?
+  supportNeeds               String?
+  trainingNeeds              String?
+  followUpActions            String?
+  additionalRemarks          String?
+  checklistData              Json?
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+}
+
+model VisitPhoto {
+  id              String   @id @default(uuid()) @db.Uuid
+  visitId         String   @db.Uuid
+  visit           Visit    @relation(fields: [visitId], references: [id])
+  photoUrl        String
+  thumbnailUrl    String?
+  photoCapturedAt DateTime
+  fileSizeBytes   Int?
+  mimeType        String?
+  originalFilename String?
+  createdAt       DateTime @default(now())
+
+  @@index([visitId])
+}
+
+model AuditLog {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String?  @db.Uuid
+  user         User?    @relation("AuditLogUser", fields: [userId], references: [id])
+  action       String
+  resourceType String
+  resourceId   String?
+  details      Json?
+  ipAddress    String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+}
+
+model SystemConfig {
+  id          String   @id @default(uuid()) @db.Uuid
+  key         String   @unique
+  value       String
+  description String?
+  updatedById String?  @db.Uuid
+  updatedBy   User?    @relation("ConfigUpdatedBy", fields: [updatedById], references: [id])
+  updatedAt   DateTime @updatedAt
+}

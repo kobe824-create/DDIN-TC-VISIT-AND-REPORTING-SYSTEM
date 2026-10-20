@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+**/node_modules
+**/uploads
+data/*credential*
+data/*demo*
+**/dist
+*.pdf
+npm-debug.log*

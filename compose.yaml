@@ -1,0 +1,124 @@
+services:
+  api-gateway:
+    build: ./ApiGateway
+    environment:
+      PORT: 3000
+      AUTH_SERVICE_URL: http://auth-service:3001
+      AGENTS_SERVICE_URL: http://agents-service:3002
+      VISITS_SERVICE_URL: http://visits-service:3003
+      REPORTS_SERVICE_URL: http://reports-service:3004
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      agents-service:
+        condition: service_healthy
+      visits-service:
+        condition: service_healthy
+      reports-service:
+        condition: service_healthy
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: AuthService/Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      TC_INITIAL_PASSWORD: ${TC_INITIAL_PASSWORD:-}
+      PORT: 3001
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  agents-service:
+    build:
+      context: .
+      dockerfile: AgentsService/Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      PII_ENCRYPTION_KEY: ${PII_ENCRYPTION_KEY}
+      PORT: 3002
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3002/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Named volumes keep their original ownership across image rebuilds. Repair
+  # the mount before VisitsService starts; the application still runs as node.
+  visits-uploads-init:
+    image: node:22-bookworm-slim
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p /uploads && chown node:node /uploads"]
+    volumes:
+      - visit-photos:/uploads
+    restart: "no"
+
+  visits-service:
+    build:
+      context: .
+      dockerfile: VisitsService/Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      PORT: 3003
+    restart: unless-stopped
+    volumes:
+      - visit-photos:/app/VisitsService/uploads
+    depends_on:
+      visits-uploads-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3003/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  reports-service:
+    build:
+      context: .
+      dockerfile: ReportsService/Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      PORT: 3004
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3004/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:8080"
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  visit-photos:

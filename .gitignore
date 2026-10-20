@@ -1,0 +1,19 @@
+# Local environment secrets. Keep the root template, never commit real values.
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Installed dependencies and generated output
+node_modules/
+**/node_modules/
+frontend/dist/
+
+# Uploaded visit evidence and runtime output
+**/uploads/
+data/*credential*
+data/*demo*
+*.log
+npm-debug.log*

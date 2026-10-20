@@ -1,0 +1,19 @@
+{
+  "name": "ddin-tc-visit-reporting-system",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@prisma/client": "^5.10.0"
+  },
+  "devDependencies": {
+    "prisma": "^5.10.0"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma",
+    "seed": "node AuthService/src/seed.js"
+  },
+  "scripts": {
+    "seed:demo": "node AuthService/src/seedDemoAccounts.js",
+    "reset:demo": "node AuthService/src/resetDemoAccounts.js"
+  }
+}

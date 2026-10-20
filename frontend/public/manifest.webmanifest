@@ -1,0 +1,14 @@
+{
+  "name": "DDIN TC Visit and Reporting",
+  "short_name": "DDIN Visits",
+  "description": "Territory visits and agent reporting for DDIN field teams.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f5f7fb",
+  "theme_color": "#202a4e",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
