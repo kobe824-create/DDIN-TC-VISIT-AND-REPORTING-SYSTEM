@@ -40,11 +40,12 @@ function parseAgentRows(upload) {
   const sectorIndex = findHeader(headers, ['SECTOR']);
   const cellIndex = findHeader(headers, ['CELL']);
   const villageIndex = findHeader(headers, ['VILLAGE']);
+  const venueIndex = findHeader(headers, ['VENUE', 'AGENT VENUE', 'LOCATION VENUE']);
   const nationalIdIndex = findHeader(headers, ['ID', 'NATIONAL ID', 'ID NUMBER', 'NATIONAL ID NUMBER']);
   const nextOfKinNameIndex = findHeader(headers, ['NEXT OF KIN NAME', 'NEXT OF KIN', 'NEXT OF KIN FULL NAME']);
   const nextOfKinPhoneIndex = findHeader(headers, ['NEXT OF KIN PHONE NUMBER', 'NEXT OF KIN PHONE', 'NEXT OF KIN MOBILE']);
-  if ([codeIndex, nameIndex, provinceIndex, districtIndex].some((index) => index < 0)) {
-    throw new Error('Required columns were not found. Include Agent Code, Agent Name, Province and District.');
+  if ([codeIndex, nameIndex, provinceIndex, districtIndex, venueIndex].some((index) => index < 0)) {
+    throw new Error('Required columns were not found. Include Agent Code, Agent Name, Venue, Province and District.');
   }
 
   const errors = [];
@@ -65,11 +66,14 @@ function parseAgentRows(upload) {
     const sectorName = cellValue(row, sectorIndex);
     const cellName = cellValue(row, cellIndex);
     const villageName = cellValue(row, villageIndex);
+    const venue = cellValue(row, venueIndex);
     const phoneSource = cellValue(row, phoneIndex);
     const phoneNumber = normalizeAgentPhone(phoneSource, phoneIsUsername);
     const rowErrors = [];
     if (!agentId) rowErrors.push('Agent Code is blank.');
     if (!name) rowErrors.push('Agent Name is blank.');
+    if (!venue) rowErrors.push('Venue is blank.');
+    if (venue.length > 200) rowErrors.push('Venue must be 200 characters or fewer.');
     if (!sourceProvince) rowErrors.push('Province is blank.');
     else if (!suppliedProvinceName) rowErrors.push('Province is not recognized.');
     if (!districtName) rowErrors.push('District is blank.');
@@ -87,7 +91,7 @@ function parseAgentRows(upload) {
     }
     if (!sectorName) warnings.push({ row: row.rowNumber, key: agentId, reason: 'Sector is blank. This agent will need a sector before its first visit.' });
     records.push({
-      row: row.rowNumber, agentId, name, provinceName, districtName, sectorName, cellName, villageName,
+      row: row.rowNumber, agentId, name, venue, provinceName, districtName, sectorName, cellName, villageName,
       nationalId: cellValue(row, nationalIdIndex),
       nextOfKinName: cellValue(row, nextOfKinNameIndex),
       nextOfKinPhone: cellValue(row, nextOfKinPhoneIndex),
@@ -191,7 +195,7 @@ async function analyzeAgentImport(upload, user) {
   const ids = parsed.records.map((record) => record.agentId);
   const existing = ids.length ? await prisma.agent.findMany({
     where: { agentId: { in: ids, mode: 'insensitive' } },
-    select: { agentId: true, name: true, address: true, phoneNumber: true, territoryId: true, nationalIdEncrypted: true, nextOfKinNameEncrypted: true, nextOfKinPhoneEncrypted: true },
+    select: { agentId: true, name: true, venue: true, address: true, phoneNumber: true, territoryId: true, nationalIdEncrypted: true, nextOfKinNameEncrypted: true, nextOfKinPhoneEncrypted: true },
   }) : [];
   const existingByCode = new Map(existing.map((item) => [normalize(item.agentId), item]));
   const ready = [];
@@ -204,10 +208,12 @@ async function analyzeAgentImport(upload, user) {
       parsed.errors.push({ row: record.row, key: record.agentId, reasons: ['This agent already exists outside your assigned district. Existing record was not changed.'] });
       continue;
     }
-    if (normalize(existingRecord.name) === normalize(record.name) && normalize(existingRecord.address) === normalize(addressOf(record))) {
+    if (normalize(existingRecord.name) === normalize(record.name) && normalize(existingRecord.address) === normalize(addressOf(record))
+      && (!String(existingRecord.venue || '').trim() || normalize(existingRecord.venue) === normalize(record.venue))) {
       alreadyPresent += 1;
       const missingFields = { agentId: existingRecord.agentId };
       if (record.phoneNumber && !String(existingRecord.phoneNumber || '').trim()) missingFields.phoneNumber = record.phoneNumber;
+      if (record.venue && !String(existingRecord.venue || '').trim()) missingFields.venue = record.venue;
       if (record.nationalId && !existingRecord.nationalIdEncrypted) missingFields.nationalId = record.nationalId;
       if (record.nextOfKinName && !existingRecord.nextOfKinNameEncrypted) missingFields.nextOfKinName = record.nextOfKinName;
       if (record.nextOfKinPhone && !existingRecord.nextOfKinPhoneEncrypted) missingFields.nextOfKinPhone = record.nextOfKinPhone;
@@ -278,55 +284,49 @@ async function createTerritories(tx, records) {
 
   const sectorPairs = new Map();
   for (const record of records) if (record.sectorName) sectorPairs.set(`${normalize(record.districtName)}|${normalize(record.sectorName)}`, record);
-  const existingSectors = await tx.territory.findMany({ where: { type: 'SECTOR' }, select: { id: true, name: true, code: true, parentId: true } });
+  const existingSectors = await tx.territory.findMany({ where: { type: 'SECTOR', isActive: true }, select: { id: true, name: true, code: true, parentId: true } });
   const sectorMap = new Map();
   for (const sector of existingSectors) sectorMap.set(`${sector.parentId}|${normalize(sector.name)}`, sector);
-  const sectorsToCreate = [];
+  const missingSectors = [];
   for (const record of sectorPairs.values()) {
     const province = provinceMap.get(normalize(record.provinceName));
     const district = province && districtMap.get(`${province.id}|${normalize(record.districtName)}`);
     if (!district) throw new Error(`Could not resolve district ${record.districtName}.`);
     const key = `${district.id}|${normalize(record.sectorName)}`;
-    if (!sectorMap.has(key)) sectorsToCreate.push({
-      name: record.sectorName, type: 'SECTOR', parentId: district.id,
-      code: `SECT-${slug(record.districtName).toUpperCase()}-${slug(record.sectorName).toUpperCase()}`,
-    });
+    if (!sectorMap.has(key)) missingSectors.push(`${record.districtName} / ${record.sectorName}`);
   }
-  if (sectorsToCreate.length) await tx.territory.createMany({ data: sectorsToCreate, skipDuplicates: true });
-  for (const sector of await tx.territory.findMany({ where: { type: 'SECTOR' }, select: { id: true, name: true, parentId: true } })) sectorMap.set(`${sector.parentId}|${normalize(sector.name)}`, sector);
+  if (missingSectors.length) throw new Error(`These sectors are not in the official territory catalog: ${[...new Set(missingSectors)].join(', ')}. Import the official territory list before importing these agents.`);
 
   const cellMap = new Map();
   const cellPairs = new Map();
   for (const record of records) if (record.sectorName && record.cellName) cellPairs.set(`${normalize(record.provinceName)}|${normalize(record.districtName)}|${normalize(record.sectorName)}|${normalize(record.cellName)}`, record);
-  const existingCells = await tx.territory.findMany({ where: { type: 'CELL' }, select: { id: true, name: true, parentId: true } });
+  const existingCells = await tx.territory.findMany({ where: { type: 'CELL', isActive: true }, select: { id: true, name: true, parentId: true } });
   for (const cell of existingCells) cellMap.set(`${cell.parentId}|${normalize(cell.name)}`, cell);
-  const cellsToCreate = [];
+  const missingCells = [];
   for (const record of cellPairs.values()) {
     const district = provinceMap.get(normalize(record.provinceName)) && districtMap.get(`${provinceMap.get(normalize(record.provinceName)).id}|${normalize(record.districtName)}`);
     const sector = district && sectorMap.get(`${district.id}|${normalize(record.sectorName)}`);
     if (!sector) throw new Error(`Could not resolve sector ${record.sectorName}.`);
     const key = `${sector.id}|${normalize(record.cellName)}`;
-    if (!cellMap.has(key)) cellsToCreate.push({ name: record.cellName, type: 'CELL', parentId: sector.id, code: `CELL-${sector.id}-${slug(record.cellName).toUpperCase()}` });
+    if (!cellMap.has(key)) missingCells.push(`${record.sectorName} / ${record.cellName}`);
   }
-  if (cellsToCreate.length) await tx.territory.createMany({ data: cellsToCreate, skipDuplicates: true });
-  for (const cell of await tx.territory.findMany({ where: { type: 'CELL' }, select: { id: true, name: true, parentId: true } })) cellMap.set(`${cell.parentId}|${normalize(cell.name)}`, cell);
+  if (missingCells.length) throw new Error(`These cells are not in the official territory catalog: ${[...new Set(missingCells)].join(', ')}. Contact an administrator to refresh the official territory import.`);
 
   const villageMap = new Map();
   const villagePairs = new Map();
   for (const record of records) if (record.cellName && record.villageName) villagePairs.set(`${normalize(record.provinceName)}|${normalize(record.districtName)}|${normalize(record.sectorName)}|${normalize(record.cellName)}|${normalize(record.villageName)}`, record);
-  const existingVillages = await tx.territory.findMany({ where: { type: 'VILLAGE' }, select: { id: true, name: true, parentId: true } });
+  const existingVillages = await tx.territory.findMany({ where: { type: 'VILLAGE', isActive: true }, select: { id: true, name: true, parentId: true } });
   for (const village of existingVillages) villageMap.set(`${village.parentId}|${normalize(village.name)}`, village);
-  const villagesToCreate = [];
+  const missingVillages = [];
   for (const record of villagePairs.values()) {
     const district = provinceMap.get(normalize(record.provinceName)) && districtMap.get(`${provinceMap.get(normalize(record.provinceName)).id}|${normalize(record.districtName)}`);
     const sector = district && sectorMap.get(`${district.id}|${normalize(record.sectorName)}`);
     const cell = sector && cellMap.get(`${sector.id}|${normalize(record.cellName)}`);
     if (!cell) throw new Error(`Could not resolve cell ${record.cellName}.`);
     const key = `${cell.id}|${normalize(record.villageName)}`;
-    if (!villageMap.has(key)) villagesToCreate.push({ name: record.villageName, type: 'VILLAGE', parentId: cell.id, code: `VILL-${cell.id}-${slug(record.villageName).toUpperCase()}` });
+    if (!villageMap.has(key)) missingVillages.push(`${record.cellName} / ${record.villageName}`);
   }
-  if (villagesToCreate.length) await tx.territory.createMany({ data: villagesToCreate, skipDuplicates: true });
-  for (const village of await tx.territory.findMany({ where: { type: 'VILLAGE' }, select: { id: true, name: true, parentId: true } })) villageMap.set(`${village.parentId}|${normalize(village.name)}`, village);
+  if (missingVillages.length) throw new Error(`These villages are not in the official territory catalog: ${[...new Set(missingVillages)].join(', ')}. Contact an administrator to refresh the official territory import.`);
 
   return records.map((record) => {
     const province = provinceMap.get(normalize(record.provinceName));
@@ -361,8 +361,8 @@ router.post('/', authenticateToken, requireRole('ADMIN', 'TC'), async (req, res)
     const analysis = await analyzeAgentImport(req.body, req.user);
     if (!analysis.ready.length && !analysis.enrichments.length) return res.status(400).json({
       error: req.user.role === 'TC'
-        ? 'No new agent rows or missing phone numbers are available to import.'
-        : 'No new agent rows or missing contact and personal details are available to import.',
+        ? 'No new agent rows or missing profile details are available to import.'
+        : 'No new agent rows or missing profile and personal details are available to import.',
       summary: analysis.summary,
       errors: analysis.errors,
       warnings: analysis.warnings,
@@ -377,6 +377,7 @@ router.post('/', authenticateToken, requireRole('ADMIN', 'TC'), async (req, res)
           agentId: record.agentId,
           name: record.name,
           phoneNumber: record.phoneNumber,
+          venue: record.venue,
           address: record.address,
           territoryId: record.territoryId,
           sectorId: record.sectorId,
@@ -395,6 +396,7 @@ router.post('/', authenticateToken, requireRole('ADMIN', 'TC'), async (req, res)
       const details = analysis.enrichments.map((record) => ({
         agentId: record.agentId,
         phoneNumber: record.phoneNumber || null,
+        venue: record.venue || null,
         nationalIdEncrypted: encryptPii(record.nationalId),
         nextOfKinNameEncrypted: encryptPii(record.nextOfKinName),
         nextOfKinPhoneEncrypted: encryptPii(record.nextOfKinPhone),
@@ -402,18 +404,19 @@ router.post('/', authenticateToken, requireRole('ADMIN', 'TC'), async (req, res)
       for (let start = 0; start < details.length; start += 200) {
         const batch = details.slice(start, start + 200);
         const valueRows = batch.map((_record, index) => {
-          const offset = index * 6;
-          return `($${offset + 1}::text, $${offset + 2}::text, $${offset + 3}::text, $${offset + 4}::text, $${offset + 5}::text, $${offset + 6}::text)`;
+          const offset = index * 7;
+          return `($${offset + 1}::text, $${offset + 2}::text, $${offset + 3}::text, $${offset + 4}::text, $${offset + 5}::text, $${offset + 6}::text, $${offset + 7}::text)`;
         }).join(',');
-        const parameters = batch.flatMap((record) => [record.agentId, record.phoneNumber, record.nationalIdEncrypted, record.nextOfKinNameEncrypted, record.nextOfKinPhoneEncrypted, record.territoryId]);
+        const parameters = batch.flatMap((record) => [record.agentId, record.phoneNumber, record.venue, record.nationalIdEncrypted, record.nextOfKinNameEncrypted, record.nextOfKinPhoneEncrypted, record.territoryId]);
         const statement = `
           UPDATE "Agent" AS agent
           SET "phoneNumber" = COALESCE(NULLIF(BTRIM(agent."phoneNumber"), ''), incoming."phoneNumber"),
+              "venue" = COALESCE(NULLIF(BTRIM(agent."venue"), ''), incoming."venue"),
               "nationalIdEncrypted" = COALESCE(agent."nationalIdEncrypted", incoming."nationalIdEncrypted"),
               "nextOfKinNameEncrypted" = COALESCE(agent."nextOfKinNameEncrypted", incoming."nextOfKinNameEncrypted"),
               "nextOfKinPhoneEncrypted" = COALESCE(agent."nextOfKinPhoneEncrypted", incoming."nextOfKinPhoneEncrypted"),
               "updatedAt" = NOW()
-          FROM (VALUES ${valueRows}) AS incoming("agentId", "phoneNumber", "nationalIdEncrypted", "nextOfKinNameEncrypted", "nextOfKinPhoneEncrypted", "territoryId")
+          FROM (VALUES ${valueRows}) AS incoming("agentId", "phoneNumber", "venue", "nationalIdEncrypted", "nextOfKinNameEncrypted", "nextOfKinPhoneEncrypted", "territoryId")
           WHERE agent."agentId" = incoming."agentId"
             AND agent."territoryId" = incoming."territoryId"::uuid
         `;

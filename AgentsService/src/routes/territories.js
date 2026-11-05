@@ -15,6 +15,21 @@ async function validateTerritoryParent(type, parentId) {
 
 router.get('/', authenticateToken, async (req, res) => {
   const { type, parentId } = req.query;
+  if (req.user.role === 'TC') {
+    const assignments = await prisma.tcTerritoryAssignment.findMany({ where: { tcId: req.user.id, isActive: true, territory: { is: { type: 'DISTRICT', isActive: true } } }, select: { territoryId: true } });
+    const districtIds = assignments.map(({ territoryId }) => territoryId);
+    if (!districtIds.length) return res.json([]);
+    const [districts, sectors] = await Promise.all([
+      prisma.territory.findMany({ where: { id: { in: districtIds }, type: 'DISTRICT', isActive: true }, select: { id: true, name: true, type: true, code: true, parentId: true, isActive: true } }),
+      prisma.territory.findMany({ where: { type: 'SECTOR', isActive: true, parentId: { in: districtIds } }, select: { id: true, name: true, type: true, code: true, parentId: true, isActive: true } }),
+    ]);
+    const sectorIds = sectors.map(({ id }) => id);
+    const cells = sectorIds.length ? await prisma.territory.findMany({ where: { type: 'CELL', isActive: true, parentId: { in: sectorIds } }, select: { id: true, name: true, type: true, code: true, parentId: true, isActive: true } }) : [];
+    const cellIds = cells.map(({ id }) => id);
+    const villages = cellIds.length ? await prisma.territory.findMany({ where: { type: 'VILLAGE', isActive: true, parentId: { in: cellIds } }, select: { id: true, name: true, type: true, code: true, parentId: true, isActive: true } }) : [];
+    const hierarchy = [...districts, ...sectors, ...cells, ...villages];
+    return res.json(hierarchy.filter((item) => (!type || item.type === type) && (!parentId || item.parentId === parentId)).sort((a, b) => a.name.localeCompare(b.name)));
+  }
   const where = {};
   if (type) where.type = type;
   if (parentId) where.parentId = parentId;

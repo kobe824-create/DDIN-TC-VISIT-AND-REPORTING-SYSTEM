@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { ArrowLeft, Download, FileBarChart2, MapPin, Printer, ShieldCheck, UsersRound } from 'lucide-react';
+import { ArrowLeft, Download, FileBarChart2, MapPin, Printer, ShieldCheck, UsersRound, ArrowRightLeft } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import api from '../api';
+import { useAuth } from '../AuthContext';
 import PageHeader from '../components/PageHeader';
 import { ErrorState, ListPagination, LoadingState, StatusBadge } from '../components';
 
@@ -10,6 +11,7 @@ const nameOf = (person) => [person?.firstName, person?.lastName].filter(Boolean)
 const day = (value) => value ? new Intl.DateTimeFormat('en-GB', { dateStyle: 'medium' }).format(new Date(value)) : '—';
 
 export default function Reports() {
+  const { user } = useAuth();
   const navigate = useNavigate();
   const [tab, setTab] = useState('visits');
   const [visits, setVisits] = useState([]);
@@ -29,6 +31,10 @@ export default function Reports() {
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState('');
+  const [movementReport, setMovementReport] = useState(null);
+  const [movementLoading, setMovementLoading] = useState(false);
+  const [movementError, setMovementError] = useState('');
+  const isAdmin = user?.role === 'ADMIN';
 
   const loadReports = useCallback(async () => {
     setLoading(true);
@@ -58,6 +64,16 @@ export default function Reports() {
   }, [fromDate, toDate, pageSize, visitsPage, verificationPage]);
 
   useEffect(() => { loadReports(); }, [loadReports]);
+  const loadMovements = useCallback(async () => {
+    if (!isAdmin) return;
+    setMovementLoading(true); setMovementError('');
+    try {
+      const { data } = await api.get('/api/v1/reports/movements', { params: { fromDate, toDate } });
+      setMovementReport(data);
+    } catch (err) { setMovementError(err.response?.data?.error || 'Could not load transfer and relocation activity.'); }
+    finally { setMovementLoading(false); }
+  }, [fromDate, toDate, isAdmin]);
+  useEffect(() => { if (tab === 'movements') loadMovements(); }, [tab, loadMovements]);
   useEffect(() => {
     if (coveragePage > Math.max(Math.ceil(coverage.length / pageSize), 1)) setCoveragePage(Math.max(Math.ceil(coverage.length / pageSize), 1));
   }, [coverage.length, coveragePage, pageSize]);
@@ -86,7 +102,9 @@ export default function Reports() {
     setVerificationPage(1);
     setCoveragePage(1);
   };
-  const tabs = [{ id: 'visits', label: 'Visit activity', icon: MapPin }, { id: 'coverage', label: 'Territory coverage', icon: UsersRound }, { id: 'verification', label: 'GPS verification', icon: ShieldCheck }];
+  const tabs = [{ id: 'visits', label: 'Visit activity', icon: MapPin }, { id: 'coverage', label: 'Territory coverage', icon: UsersRound }, { id: 'verification', label: 'GPS verification', icon: ShieldCheck }, ...(isAdmin ? [{ id: 'movements', label: 'Transfers & relocations', icon: ArrowRightLeft }] : [])];
+  const movementStats = movementReport?.summary || {};
+  const movementStatus = (event) => event.status === 'ACCEPTED_GPS_PENDING' ? 'Accepted · first visit GPS pending' : event.status === 'PENDING' ? (event.kind === 'TRANSFER' ? 'Awaiting TC review' : 'Awaiting admin review') : event.status.replaceAll('_', ' ').toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase());
 
   return <div className="reports-page page">
     <PageHeader title="Reports" subtitle={`Field activity · ${fromDate} to ${toDate}`} actions={<div className="page-header-actions"><button className="btn btn-secondary" onClick={() => navigate('/visits')}><ArrowLeft size={16} />Back to visits</button><button className="btn btn-secondary" onClick={exportPdf}><Printer size={15} />Export PDF</button><button className="btn btn-primary" onClick={exportReport} disabled={exporting}><Download size={15} />{exporting ? 'Preparing…' : 'Export CSV'}</button></div>} />
@@ -98,6 +116,23 @@ export default function Reports() {
         {tab === 'visits' && <><div className="table-scroll"><table className="data-table report-table"><thead><tr><th>Visit</th><th>Agent</th><th>Coordinator</th><th>Status</th><th>GPS result</th><th>Date</th></tr></thead><tbody>{visits.map((visit) => <tr key={visit.id}><td>{visit.visitId}</td><td>{visit.agent?.name || '—'}</td><td>{nameOf(visit.tc)}</td><td><StatusBadge status={visit.visitStatus} /></td><td><StatusBadge status={visit.locationStatus} /></td><td>{day(visit.visitDate || visit.checkInTime)}</td></tr>)}{!visits.length && <tr><td className="report-empty" colSpan="6">No visits recorded during this period.</td></tr>}</tbody></table></div><ListPagination page={visitsPage} pages={visitPages} total={visitTotal} pageSize={pageSize} onPageChange={setVisitsPage} onPageSizeChange={(value) => { setPageSize(value); setVisitsPage(1); setVerificationPage(1); setCoveragePage(1); }} /></>}
         {tab === 'coverage' && <><div className="table-scroll"><table className="data-table report-table"><thead><tr><th>Territory</th><th>Active agents</th><th>Agents visited</th><th>Coverage</th></tr></thead><tbody>{coveragePageRows.map((row) => <tr key={row.territoryId}><td><strong>{row.territoryName}</strong></td><td>{row.totalAgents}</td><td>{row.uniqueAgentsVisited}</td><td><span className="coverage-cell">{row.coveragePercentage}</span></td></tr>)}{!coverage.length && <tr><td className="report-empty" colSpan="4">No territory coverage data for this period.</td></tr>}</tbody></table></div><ListPagination page={coveragePage} pages={coveragePages} total={coverage.length} pageSize={pageSize} onPageChange={setCoveragePage} onPageSizeChange={(value) => { setPageSize(value); setCoveragePage(1); setVisitsPage(1); setVerificationPage(1); }} /></>}
         {tab === 'verification' && <><div className="table-scroll"><table className="data-table report-table"><thead><tr><th>Visit</th><th>Agent</th><th>Coordinator</th><th>Distance</th><th>GPS accuracy</th><th>Result</th></tr></thead><tbody>{verificationVisits.map((visit) => <tr key={visit.id}><td>{visit.visitId}</td><td>{visit.agent?.name || '—'}</td><td>{nameOf(visit.tc)}</td><td>{Math.round(visit.distanceMeters || 0)} m</td><td>±{Math.round(visit.gpsAccuracyMeters || 0)} m</td><td><StatusBadge status={visit.locationStatus} /></td></tr>)}{!verificationTotal && <tr><td className="report-empty" colSpan="6">All visits in this period passed GPS verification.</td></tr>}</tbody></table></div><ListPagination page={verificationPage} pages={verificationPages} total={verificationTotal} pageSize={pageSize} onPageChange={setVerificationPage} onPageSizeChange={(value) => { setPageSize(value); setVerificationPage(1); setVisitsPage(1); setCoveragePage(1); }} /></>}
+        {tab === 'movements' && <>
+          {movementError && <ErrorState message={movementError} onRetry={loadMovements} />}
+          {movementLoading ? <LoadingState message="Loading transfer and relocation activity…" /> : !movementError && <>
+            <section className="report-metrics movement-metrics">
+              <div><span className="report-metric-icon orange"><ArrowRightLeft size={16} /></span><span><small>Transfer requests</small><strong>{(movementStats.transferRequests || 0).toLocaleString()}</strong><em>{movementStats.transferAcceptanceRate || 0}% accepted</em></span></div>
+              <div><span className="report-metric-icon green"><ShieldCheck size={16} /></span><span><small>Transfers completed</small><strong>{(movementStats.transfersCompleted || 0).toLocaleString()}</strong><em>{movementStats.transferCompletionRate || 0}% of accepted</em></span></div>
+              <div><span className="report-metric-icon amber"><MapPin size={16} /></span><span><small>Relocation requests</small><strong>{(movementStats.relocationRequests || 0).toLocaleString()}</strong><em>{movementStats.relocationApprovalRate || 0}% approved</em></span></div>
+              <div><span className="report-metric-icon blue"><UsersRound size={16} /></span><span><small>Admin relocations</small><strong>{(movementStats.adminRelocations || 0).toLocaleString()}</strong><em>{movementStats.relocationsAwaitingReview || 0} requests awaiting review</em></span></div>
+            </section>
+            <div className="movement-rate-strip"><span>{movementStats.transfersAwaitingReview || 0} transfers awaiting receiving-TC review</span><span>{movementStats.relocationsRejected || 0} relocation requests declined</span><span>{movementStats.relocationsApproved || 0} relocation requests approved</span></div>
+            <div className="table-scroll"><table className="data-table report-table movement-table"><thead><tr><th>Type</th><th>Agent & contact</th><th>From</th><th>To</th><th>Requested by</th><th>Reviewed by</th><th>Status</th><th>Date</th></tr></thead><tbody>
+              {(movementReport?.events || []).map((event) => <tr key={event.id}><td>{event.kind === 'TRANSFER' ? 'Transfer' : event.kind === 'RELOCATION' ? 'TC relocation request' : 'Admin relocation'}</td><td><strong>{event.agentName}</strong><small className="visit-subtext">{event.agentNumber}{event.phoneNumber ? ` · ${event.phoneNumber}` : ''}</small></td><td>{event.from}</td><td>{event.to}</td><td>{event.requestedBy}</td><td>{event.reviewedBy}</td><td><span className={`movement-status ${event.status.toLowerCase().replaceAll('_', '-')}`}>{movementStatus(event)}</span></td><td>{day(event.requestedAt)}</td></tr>)}
+              {!movementReport?.events?.length && <tr><td className="report-empty" colSpan="8">No transfers or relocations were recorded during this period.</td></tr>}
+            </tbody></table></div>
+            {movementReport?.eventLimitReached && <p className="card-footnote">Showing the latest 1,000 events. Summary rates include all records in the selected date range.</p>}
+          </>}
+        </>}
         <div className="card-footnote"><ShieldCheck size={14} /><span>Coverage = unique active agents visited ÷ active agents in each territory.</span></div>
       </section>
     </>}

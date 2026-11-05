@@ -14,6 +14,7 @@ export default function UserList() {
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
   const [role, setRole] = useState('');
+  const [includeInactive, setIncludeInactive] = useState(false);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
   const [total, setTotal] = useState(0);
@@ -28,6 +29,7 @@ export default function UserList() {
     setLoading(true); setError('');
     try {
       const params = { page, limit: pageSize };
+      if (includeInactive) params.includeInactive = 'true';
       if (role) params.role = role;
       if (search.trim()) params.search = search.trim();
       const { data } = await api.get('/api/v1/users', { params });
@@ -37,7 +39,7 @@ export default function UserList() {
       setPage(data.page ?? page);
     } catch (err) { setError(err.response?.data?.error || 'Could not load user accounts.'); }
     finally { setLoading(false); }
-  }, [page, pageSize, role, search]);
+  }, [page, pageSize, role, search, includeInactive]);
 
   useEffect(() => {
     const timer = window.setTimeout(loadUsers, search.trim() ? 250 : 0);
@@ -84,7 +86,7 @@ export default function UserList() {
 
   return <div className="user-list-page page">
     <PageHeader title="Users & roles" subtitle="Account access for coordinators, champions and management." actions={isAdmin && <button className="btn btn-primary" onClick={() => navigate('/users/new')}><Plus size={16} />Create account</button>} />
-    <section className="agent-filter-bar surface-card"><label className="visit-search"><Search size={16} /><input value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} placeholder="Search name, username or email" /></label><select className="input agent-status-select" value={role} onChange={(event) => { setRole(event.target.value); setPage(1); }}><option value="">All roles</option>{['ADMIN', 'MANAGER', 'TC', 'CHAMPION', 'AGENT'].map((value) => <option value={value} key={value}>{value}</option>)}</select><span className="agent-result-count">{total.toLocaleString()} accounts</span></section>
+    <section className="agent-filter-bar surface-card"><label className="visit-search"><Search size={16} /><input value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} placeholder="Search name, username or email" /></label><select className="input agent-status-select" value={role} onChange={(event) => { setRole(event.target.value); setPage(1); }}><option value="">All roles</option>{['ADMIN', 'MANAGER', 'TC', 'CHAMPION', 'AGENT'].map((value) => <option value={value} key={value}>{value}</option>)}</select>{isAdmin && <label className="agent-page-size-control"><input type="checkbox" checked={includeInactive} onChange={(event) => { setIncludeInactive(event.target.checked); setPage(1); }} /> Include inactive</label>}<span className="agent-result-count">{total.toLocaleString()} accounts</span></section>
     {error && <ErrorState message={error} onRetry={() => loadUsers()} />}
     {loading ? <LoadingState message="Loading accounts…" /> : !error && <section className="surface-card user-table-card">{users.length ? <div className="table-scroll"><table className="data-table user-table"><thead><tr><th>Account</th><th>Role</th><th>Contact</th><th>Created</th><th>Status</th>{isAdmin && <th>Manage</th>}</tr></thead><tbody>{users.map((item) => <tr key={item.id} onClick={() => isAdmin && navigate(`/users/${item.id}/edit`)}><td><div className="table-person"><span className="table-avatar"><UsersRound size={14} /></span><span><strong>{item.firstName} {item.lastName}</strong><small>@{item.username}</small></span></div></td><td><StatusBadge status={item.role} />{item.mustChangePassword && <small className="account-reset-flag">Password reset required</small>}</td><td>{item.email}</td><td>{new Intl.DateTimeFormat('en-GB', { dateStyle: 'medium' }).format(new Date(item.createdAt))}</td><td><span className={`location-result ${item.isActive ? 'verified' : 'needs-review'}`}><span />{item.isActive ? 'Active' : 'Inactive'}</span></td>{isAdmin && <td><div className="user-row-actions"><button className="btn btn-secondary btn-sm" onClick={(event) => { event.stopPropagation(); toggleStatus(item); }}>{item.isActive ? 'Deactivate' : 'Activate'}</button>{item.role === 'TC' && <button className="btn btn-secondary btn-sm" onClick={(event) => { event.stopPropagation(); setResetTarget(item); }}><KeyRound size={14} />Reset password</button>}</div></td>}</tr>)}</tbody></table></div> : <div className="table-empty"><div className="empty-mark"><ShieldCheck size={20} /></div><strong>No matching accounts</strong><span>Adjust the search or role filter.</span></div>}<ListPagination page={page} pages={pages} total={total} pageSize={pageSize} onPageChange={setPage} onPageSizeChange={(value) => { setPageSize(value); setPage(1); }} /><div className="card-footnote"><ShieldCheck size={14} /><span>Role based permissions are enforced by each service, in addition to the frontend.</span></div></section>}
 

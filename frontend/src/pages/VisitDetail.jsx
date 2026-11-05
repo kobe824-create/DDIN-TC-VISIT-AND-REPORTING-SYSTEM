@@ -65,8 +65,8 @@ export default function VisitDetail() {
         </article>
 
         <article className="surface-card detail-panel report-panel">
-          <div className="detail-panel-heading"><span className="detail-icon report-icon"><FileText size={17} /></span><div><h3>Visit report</h3><p>Observations and follow-up recorded by the coordinator</p></div></div>
-          {visit.report ? <div className="report-grid">{reportFields.map(([key, label]) => <div className="report-answer" key={key}><span>{label}</span><p>{visit.report[key] || <em>Not provided</em>}</p></div>)}{Object.entries(visit.report.checklistData || {}).map(([key, result]) => <div className="report-answer" key={key}><span>{result?.question || `Checklist ${key}`}</span><p>{result?.answer ?? result ?? <em>Not provided</em>}</p></div>)}</div> : <div className="detail-empty">No report was attached to this visit.</div>}
+          <div className="detail-panel-heading"><span className="detail-icon report-icon"><FileText size={17} /></span><div><h3>Visit report</h3><p>Questionnaire responses recorded by the coordinator</p></div></div>
+          {visit.report ? <div className="report-grid">{reportFields.filter(([key]) => visit.report[key]).map(([key, label]) => <div className="report-answer" key={key}><span>{label}</span><p>{visit.report[key]}</p></div>)}{Object.entries(visit.report.checklistData || {}).map(([key, result]) => <div className="report-answer" key={key}><span>{result?.question || `Checklist ${key}`}</span><p>{result?.answer ?? result ?? <em>Not provided</em>}</p></div>)}</div> : <div className="detail-empty">No report was attached to this visit.</div>}
         </article>
       </div>
 

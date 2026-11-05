@@ -14,6 +14,8 @@
   },
   "scripts": {
     "seed:demo": "node AuthService/src/seedDemoAccounts.js",
-    "reset:demo": "node AuthService/src/resetDemoAccounts.js"
+    "reset:demo": "node AuthService/src/resetDemoAccounts.js",
+    "import:rwanda-territories:preview": "node scripts/import-rwanda-territories.js",
+    "import:rwanda-territories": "node scripts/import-rwanda-territories.js --apply"
   }
 }

@@ -28,7 +28,18 @@ const distanceMeters = (a, b) => {
 };
 
 const STEPS = ['Select Agent', 'Check In', 'Photo', 'Report', 'Review'];
-const sameTerritoryName = (left, right) => String(left || '').trim().toLocaleLowerCase() === String(right || '').trim().toLocaleLowerCase();
+const VISIT_REPORT_QUESTIONS = [
+  { id: 'agents_in_shop', text: 'How many agents are in a shop?', type: 'NUMBER', required: true, section: 'IREMBO' },
+  { id: 'account_owner', text: 'Is the agent the owner of the account/User name?', type: 'YES_NO', required: true, section: 'IREMBO' },
+  { id: 'branding_materials', text: 'Does the agent have the branding materials?', type: 'TEXT', hint: 'List the branding materials available.', required: true, section: 'IREMBO' },
+  { id: 'whatsapp_updates', text: 'Do you follow the Irembo Agents WhatsApp Channel for essential updates?', type: 'YES_NO', required: true, section: 'IREMBO' },
+  { id: 'difficulties', text: 'Do you have any other difficulties/recommendation to Irembo?', type: 'YES_NO', required: true, section: 'IREMBO' },
+  { id: 'difficulties_description', text: 'If yes, describe', type: 'TEXT', hint: 'Describe the difficulty or recommendation.', required: true, section: 'IREMBO', conditionalOn: { id: 'difficulties', value: 'Yes' } },
+];
+const isAgentLocationQuestion = (text) => /\bagent\s+(district|sector|cell|village|venue)\s+location\b/i.test(String(text || ''));
+const normalizeQuestion = (text) => String(text || '').trim().toLocaleLowerCase().replace(/[?.]+$/, '');
+const isDuplicateVisitQuestion = (text) => VISIT_REPORT_QUESTIONS.some((question) => normalizeQuestion(question.text) === normalizeQuestion(text));
+const withoutDuplicateVisitQuestions = (items) => items.filter((item) => !isAgentLocationQuestion(item.text) && !isDuplicateVisitQuestion(item.text));
 
 export default function VisitWorkflow() {
   const navigate = useNavigate();
@@ -51,7 +62,7 @@ export default function VisitWorkflow() {
   const [workSectorIds, setWorkSectorIds] = useState([]);
   const [workCellIds, setWorkCellIds] = useState([]);
   const [workVillageIds, setWorkVillageIds] = useState([]);
-  const [firstVisitFields, setFirstVisitFields] = useState({ territoryId: '', sectorId: '', cellId: '', cellName: '', villageId: '', villageName: '' });
+  const [firstVisitFields, setFirstVisitFields] = useState({ territoryId: '', sectorId: '', cellId: '', cellName: '', villageId: '', villageName: '', venue: '' });
   const [transferPanelOpen, setTransferPanelOpen] = useState(false);
   const [transferTargets, setTransferTargets] = useState([]);
   const [transferTargetsLoaded, setTransferTargetsLoaded] = useState(false);
@@ -84,17 +95,12 @@ export default function VisitWorkflow() {
   const cameraRequestRef = useRef(0);
 
   const [reportData, setReportData] = useState({
-    operating_status: '',
-    services_offered: '',
-    products_offered: '',
-    general_observations: '',
-    liquidity_observations: '',
-    customer_quality_observations: '',
-    challenges_faced: '',
-    support_needs: '',
-    training_needs: '',
-    follow_up_actions: '',
-    additional_remarks: ''
+    agents_in_shop: '',
+    account_owner: '',
+    branding_materials: '',
+    whatsapp_updates: '',
+    difficulties: '',
+    difficulties_description: '',
   });
   const [savedReportPayload, setSavedReportPayload] = useState(null);
   const [reportLoading, setReportLoading] = useState(false);
@@ -111,7 +117,7 @@ export default function VisitWorkflow() {
       if (Array.isArray(pack.territories) && pack.territories.length) setWorkTerritoryId((current) => current || pack.territories[0].id);
       setRadiusMeters(Number(pack.radiusMeters) || 100);
       const items = Array.isArray(pack.checklistSchema) ? pack.checklistSchema : [];
-      setChecklist(items.map((item, index) => ({ ...item, id: item.id || `question-${index + 1}` })));
+      setChecklist(withoutDuplicateVisitQuestions(items).map((item, index) => ({ ...item, id: item.id || `question-${index + 1}`, section: item.section || 'DDIN', required: item.section === 'IREMBO' })));
     };
     (async () => {
       if (user?.role?.toUpperCase() === 'TC') {
@@ -126,7 +132,7 @@ export default function VisitWorkflow() {
         const { data } = await api.get('/api/v1/config/checklist');
         const schema = data.schema;
         const items = Array.isArray(schema) ? schema : Array.isArray(schema?.questions) ? schema.questions : [];
-        if (!cancelled) setChecklist(items.map((item, index) => ({ ...item, id: item.id || `question-${index + 1}` })));
+        if (!cancelled) setChecklist(withoutDuplicateVisitQuestions(items).map((item, index) => ({ ...item, id: item.id || `question-${index + 1}`, section: item.section || 'DDIN', required: item.section === 'IREMBO' })));
       } catch { if (!cancelled) setChecklist([]); }
     })();
     return () => { cancelled = true; };
@@ -173,7 +179,7 @@ export default function VisitWorkflow() {
             const transferToSelected = agent.transfers?.some((transfer) => transfer.toTerritoryId === workTerritoryId);
             if (workTerritoryId && agent.territoryId !== workTerritoryId && !transferToSelected) return false;
             if (areaIds.length && !transferToSelected && !areaIds.some((id) => [agent.sectorId, agent.cellId, agent.villageId].includes(id))) return false;
-            return !query || [agent.name, agent.phoneNumber, agent.agentId, agent.businessName, agent.address].some((value) => String(value || '').toLocaleLowerCase().includes(query));
+            return !query || [agent.name, agent.phoneNumber, agent.agentId, agent.businessName, agent.venue, agent.address].some((value) => String(value || '').toLocaleLowerCase().includes(query));
           });
           const pages = Math.ceil(filtered.length / agentPageSize);
           const page = Math.min(agentPage, Math.max(pages, 1));
@@ -183,7 +189,7 @@ export default function VisitWorkflow() {
           setAgentPages(pages);
           setAgentPage(page);
           setRadiusMeters(Number(pack.radiusMeters) || 100);
-          if (Array.isArray(pack.checklistSchema)) setChecklist(pack.checklistSchema.map((item, index) => ({ ...item, id: item.id || `question-${index + 1}` })));
+          if (Array.isArray(pack.checklistSchema)) setChecklist(withoutDuplicateVisitQuestions(pack.checklistSchema).map((item, index) => ({ ...item, id: item.id || `question-${index + 1}`, section: item.section || 'DDIN', required: item.section === 'IREMBO' })));
           setError(null);
         } catch (offlineError) { setError(offlineError.message || err.response?.data?.error || 'Could not load agents. Check your connection and try again.'); }
       } finally {
@@ -216,6 +222,7 @@ export default function VisitWorkflow() {
           cellName: pendingLocation.cellName || draft.selectedAgent?.cell?.name || '',
           villageId: pendingLocation.villageId || draft.selectedAgent?.villageId || '',
           villageName: pendingLocation.villageName || draft.selectedAgent?.village?.name || '',
+          venue: pendingLocation.venue || draft.selectedAgent?.venue || '',
         });
         setGpsData(draft.gpsData || null);
         setCheckInCoordinates(draft.checkInCoordinates || null);
@@ -261,20 +268,29 @@ export default function VisitWorkflow() {
 
   const handleAgentSelect = (agent) => {
     setSelectedAgent(agent);
+    setReportData({ agents_in_shop: '', account_owner: '', branding_materials: '', whatsapp_updates: '', difficulties: '', difficulties_description: '' });
+    setChecklistData({});
+    setSavedReportPayload(null);
     const incomingTransfer = agent.transfers?.find((transfer) => transfer.status === 'PENDING') || agent.transfers?.[0];
-    const transferChangesDistrict = Boolean(incomingTransfer?.toTerritoryId && incomingTransfer.toTerritoryId !== agent.territoryId);
+    const transferChangesDistrict = Boolean(incomingTransfer?.acceptedAt && incomingTransfer?.toTerritoryId && incomingTransfer.toTerritoryId !== agent.territoryId);
     setFirstVisitFields({
-      territoryId: incomingTransfer?.toTerritoryId || agent.territoryId || workTerritoryId,
+      territoryId: (incomingTransfer?.acceptedAt ? incomingTransfer.toTerritoryId : agent.territoryId) || workTerritoryId,
       sectorId: transferChangesDistrict ? '' : agent.sectorId || '',
       cellId: transferChangesDistrict ? '' : agent.cellId || '',
       cellName: transferChangesDistrict ? '' : agent.cell?.name || '',
       villageId: transferChangesDistrict ? '' : agent.villageId || '',
       villageName: transferChangesDistrict ? '' : agent.village?.name || '',
+      venue: agent.venue || '',
     });
     setTransferPanelOpen(false);
     setTransferTargets([]);
     setTransferTargetsLoaded(false);
     setTransferRequested(false);
+    setGpsStatus(null);
+    setGpsData(null);
+    setClientVisitId(null);
+    setVisitId(null);
+    setOfflineVisit(false);
     setCurrentStep(1);
     setError(null);
   };
@@ -322,6 +338,13 @@ export default function VisitWorkflow() {
 
   const captureAgentLocation = () => {
     if (!selectedAgent) return;
+    const incomingTransfer = selectedAgent.transfers?.find((transfer) => transfer.status === 'PENDING');
+    if (incomingTransfer && !incomingTransfer.acceptedAt) {
+      setError('The receiving TC must accept this transfer from the dashboard before recording the new location.');
+      return;
+    }
+    const needsLocationCapture = Boolean(selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || !selectedAgent.locationVerified || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt));
+    const transferNeedsLocationCapture = Boolean(incomingTransfer?.acceptedAt && needsLocationCapture);
     const locationAssignment = {
       territoryId: firstVisitFields.territoryId || selectedAgent.territoryId,
       sectorId: firstVisitFields.sectorId,
@@ -329,20 +352,31 @@ export default function VisitWorkflow() {
       cellName: firstVisitFields.cellName.trim(),
       villageId: firstVisitFields.villageId,
       villageName: firstVisitFields.villageName.trim(),
+      venue: String(firstVisitFields.venue || '').trim(),
     };
-    if (!locationAssignment.territoryId || !locationAssignment.sectorId || !locationAssignment.cellName || !locationAssignment.villageName) {
-      setError('Choose or enter the district, sector, cell and village before capturing the first-visit location.');
+    if (!locationAssignment.territoryId || !locationAssignment.sectorId || !locationAssignment.cellId || !locationAssignment.villageId) {
+      setError('Select the district, sector, cell and village from the official territory lists before capturing the first-visit location.');
       return;
     }
-    if (!navigator.geolocation) { setError('This browser does not support GPS location.'); return; }
-    setLocationCaptureLoading(true);
-    setError(null);
-    navigator.geolocation.getCurrentPosition(async ({ coords }) => {
-      const capturedLocation = { latitude: coords.latitude, longitude: coords.longitude, accuracy: coords.accuracy, ...locationAssignment };
+    if (!locationAssignment.venue) {
+      setError('Enter the agent’s venue before capturing the first-visit location.');
+      return;
+    }
+    const saveLocation = async (capturedLocation) => {
       try {
         if (!navigator.onLine) throw new Error('OFFLINE');
         const { data } = await api.post(`/api/v1/agents/${selectedAgent.id}/location/capture`, capturedLocation);
         setSelectedAgent({ ...data, pendingLocation: capturedLocation, locationSynced: true });
+        setFirstVisitFields((current) => ({
+          ...current,
+          territoryId: data.territoryId || current.territoryId,
+          sectorId: data.sectorId || current.sectorId,
+          cellId: data.cellId || current.cellId,
+          cellName: data.cell?.name || current.cellName,
+          villageId: data.villageId || current.villageId,
+          villageName: data.village?.name || current.villageName,
+          venue: data.venue || locationAssignment.venue,
+        }));
         setGpsStatus(null);
         setError(null);
       } catch (err) {
@@ -351,7 +385,8 @@ export default function VisitWorkflow() {
           else {
             setSelectedAgent({
               ...selectedAgent, ...locationAssignment, registeredLatitude: capturedLocation.latitude, registeredLongitude: capturedLocation.longitude,
-              gpsAccuracy: capturedLocation.accuracy, locationVerified: true, firstVisitLocationCapturedAt: new Date().toISOString(),
+              gpsAccuracy: capturedLocation.accuracy, locationVerified: true, venue: locationAssignment.venue,
+              firstVisitLocationCapturedAt: selectedAgent.firstVisitLocationCapturedAt || new Date().toISOString(),
               pendingLocation: capturedLocation, locationSynced: false,
             });
             setGpsStatus(null);
@@ -359,6 +394,23 @@ export default function VisitWorkflow() {
           }
         } else setError(err.response?.data?.error || 'Could not save the agent location. Try again in an open area.');
       } finally { setLocationCaptureLoading(false); }
+    };
+    if (selectedAgent.firstVisitLocationCapturedAt && !needsLocationCapture) {
+      if (selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || selectedAgent.gpsAccuracy == null) {
+        setError('The saved location is incomplete. Ask a manager to correct the agent record.');
+        return;
+      }
+      setLocationCaptureLoading(true);
+      setError(null);
+      saveLocation({ ...locationAssignment, latitude: selectedAgent.registeredLatitude, longitude: selectedAgent.registeredLongitude, accuracy: selectedAgent.gpsAccuracy });
+      return;
+    }
+    if (!navigator.geolocation) { setError('This browser does not support GPS location.'); return; }
+    setLocationCaptureLoading(true);
+    setError(null);
+    navigator.geolocation.getCurrentPosition(async ({ coords }) => {
+      const capturedLocation = { latitude: coords.latitude, longitude: coords.longitude, accuracy: coords.accuracy, ...locationAssignment };
+      await saveLocation(capturedLocation);
     }, (err) => {
       setError(`Could not capture GPS: ${err.message}. Allow location access and try again.`);
       setLocationCaptureLoading(false);
@@ -392,6 +444,7 @@ export default function VisitWorkflow() {
         const localGpsData = { distance: localDistance == null ? 0 : Math.round(localDistance), radius: radiusMeters, accuracy: Math.round(accuracy), locationStatus: 'VERIFIED', publicId: stableId };
         const startLocally = async () => {
           if (!knownLocation || knownLocation.latitude == null || knownLocation.longitude == null) throw new Error('Capture the agent’s GPS location before starting this visit.');
+          if (!selectedAgent.firstVisitCompletedAt && !String(selectedAgent.venue || '').trim()) throw new Error('Record the agent’s venue before starting the first visit.');
           if (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.pendingLocation) throw new Error('Complete the first-visit district, sector, cell, village and GPS capture before starting this visit.');
           if (!selectedAgent.locationVerified && !selectedAgent.pendingLocation) throw new Error('This agent’s GPS location is not verified yet. Connect to the network and refresh the agent package before starting an offline visit.');
           if (accuracy > 50) throw new Error(`GPS accuracy is ±${Math.round(accuracy)} m. Improve the signal before checking in (maximum ±50 m).`);
@@ -578,21 +631,39 @@ export default function VisitWorkflow() {
   };
 
   const handleSubmitReport = async () => {
+    const agentCount = String(reportData.agents_in_shop ?? '').trim();
+    if (!agentCount || !Number.isInteger(Number(agentCount)) || Number(agentCount) < 0) {
+      setError('Enter a whole number of agents in the shop.');
+      return;
+    }
+    if (!reportData.account_owner || !reportData.whatsapp_updates || !reportData.difficulties) {
+      setError('Answer each required yes/no question before submitting the report.');
+      return;
+    }
+    if (reportData.difficulties === 'Yes' && !String(reportData.difficulties_description || '').trim()) {
+      setError('Describe the difficulty or recommendation you selected.');
+      return;
+    }
+    const missingConfiguredRequired = withoutDuplicateVisitQuestions(checklist).some((item) => item.section === 'IREMBO' && !String(checklistData[item.id] ?? '').trim());
+    if (missingConfiguredRequired) {
+      setError('Complete every required Section A · IREMBO question before submitting.');
+      return;
+    }
+    setError(null);
     setReportLoading(true);
     try {
+      const reportAnswers = Object.fromEntries(VISIT_REPORT_QUESTIONS
+        .filter((question) => !question.conditionalOn || reportData[question.conditionalOn.id] === question.conditionalOn.value)
+        .filter((question) => String(reportData[question.id] ?? '').trim() !== '')
+        .map((question) => [question.id, {
+          question: question.text,
+          answer: reportData[question.id],
+        }]));
+      const configuredAnswers = Object.fromEntries(withoutDuplicateVisitQuestions(checklist)
+        .filter((item) => String(checklistData[item.id] ?? '').trim() !== '')
+        .map((item) => [item.id, { question: item.text, answer: checklistData[item.id] }]));
       const reportPayload = {
-        operatingStatus: reportData.operating_status,
-        servicesOffered: reportData.services_offered,
-        productsOffered: reportData.products_offered,
-        generalObservations: reportData.general_observations,
-        liquidityObservations: reportData.liquidity_observations,
-        customerQualityObservations: reportData.customer_quality_observations,
-        challengesFaced: reportData.challenges_faced,
-        supportNeeds: reportData.support_needs,
-        trainingNeeds: reportData.training_needs,
-        followUpActions: reportData.follow_up_actions,
-        additionalRemarks: reportData.additional_remarks,
-        checklistData: Object.fromEntries(Object.entries(checklistData).map(([id, answer]) => [id, { question: checklist.find((item) => item.id === id)?.text || id, answer }])),
+        checklistData: { ...reportAnswers, ...configuredAnswers },
       };
       setSavedReportPayload(reportPayload);
       if (offlineVisit || !navigator.onLine) {
@@ -605,19 +676,15 @@ export default function VisitWorkflow() {
       setCurrentStep(4);
     } catch (err) {
       if (!err.response && !navigator.onLine) {
+        const reportAnswers = Object.fromEntries(VISIT_REPORT_QUESTIONS
+          .filter((question) => !question.conditionalOn || reportData[question.conditionalOn.id] === question.conditionalOn.value)
+          .filter((question) => String(reportData[question.id] ?? '').trim() !== '')
+          .map((question) => [question.id, { question: question.text, answer: reportData[question.id] }]));
+        const configuredAnswers = Object.fromEntries(withoutDuplicateVisitQuestions(checklist)
+          .filter((item) => String(checklistData[item.id] ?? '').trim() !== '')
+          .map((item) => [item.id, { question: item.text, answer: checklistData[item.id] }]));
         const reportPayload = savedReportPayload || {
-          operatingStatus: reportData.operating_status,
-          servicesOffered: reportData.services_offered,
-          productsOffered: reportData.products_offered,
-          generalObservations: reportData.general_observations,
-          liquidityObservations: reportData.liquidity_observations,
-          customerQualityObservations: reportData.customer_quality_observations,
-          challengesFaced: reportData.challenges_faced,
-          supportNeeds: reportData.support_needs,
-          trainingNeeds: reportData.training_needs,
-          followUpActions: reportData.follow_up_actions,
-          additionalRemarks: reportData.additional_remarks,
-          checklistData,
+          checklistData: { ...reportAnswers, ...configuredAnswers },
         };
         try { setSavedReportPayload(reportPayload); await persistDraft({ reportPayload, currentStep: 4 }); setCurrentStep(4); }
         catch (saveError) { setError(saveError.message || 'Could not save the report on this device.'); }
@@ -665,25 +732,6 @@ export default function VisitWorkflow() {
   const locationCells = locationSector?.children || [];
   const locationCell = locationCells.find((cell) => cell.id === firstVisitFields.cellId);
   const locationVillages = locationCell?.children || [];
-  const updateLocationCell = (value) => {
-    const match = locationCells.find((cell) => sameTerritoryName(cell.name, value));
-    setFirstVisitFields((current) => ({
-      ...current,
-      cellId: match?.id || '',
-      cellName: match?.name || value,
-      villageId: '',
-      villageName: '',
-    }));
-  };
-  const updateLocationVillage = (value) => {
-    const match = locationVillages.find((village) => sameTerritoryName(village.name, value));
-    setFirstVisitFields((current) => ({
-      ...current,
-      villageId: match?.id || '',
-      villageName: match?.name || value,
-    }));
-  };
-
   const toggleAreaSelection = (current, setter, id) => setter(current.includes(id) ? current.filter((value) => value !== id) : [...current, id]);
 
   const openTransferPanel = async () => {
@@ -724,6 +772,13 @@ export default function VisitWorkflow() {
       </label>)}
     </div>
   </details> : null;
+
+  const activeIncomingTransfer = selectedAgent?.transfers?.find((transfer) => transfer.status === 'PENDING');
+  const waitingForTransferReview = Boolean(activeIncomingTransfer && !activeIncomingTransfer.acceptedAt);
+  const needsLocationCapture = Boolean(selectedAgent && (selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || !selectedAgent.locationVerified || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt)));
+  const transferNeedsLocationCapture = Boolean(activeIncomingTransfer?.acceptedAt && needsLocationCapture);
+  const showLocationCapture = Boolean(selectedAgent && (!selectedAgent.firstVisitCompletedAt || needsLocationCapture));
+  const relocationNeedsLocationCapture = Boolean(needsLocationCapture && selectedAgent?.firstVisitCompletedAt && !transferNeedsLocationCapture);
 
   if (visitCompleted) {
     const pendingSync = completionResult?.visitStatus === 'PENDING_SYNC';
@@ -865,46 +920,55 @@ export default function VisitWorkflow() {
             <p className="text-sm text-gray-500 mt-1 flex items-center"><MapPin className="w-4 h-4 mr-1"/> {selectedAgent.address}</p>
           </div>
 
+          {waitingForTransferReview && <div className="rounded-xl border border-amber-200 bg-amber-50 p-5 text-amber-950"><h3 className="font-semibold">Transfer awaiting your review</h3><p className="mt-1 text-sm">Open the dashboard notification, call the agent, and confirm they are in your district before accepting. You cannot visit or record their location yet.</p><button type="button" className="btn btn-secondary mt-3" onClick={() => navigate('/dashboard')}>Open dashboard requests</button></div>}
           {transferRequested ? <div className="rounded-xl border border-green-200 bg-green-50 p-5 text-green-900">
             <h3 className="font-semibold">Transfer request sent</h3>
             <p className="mt-1 text-sm">The coordinator in the destination district will assign the new village and record the agent’s location at the first visit.</p>
             <button type="button" className="btn btn-secondary mt-4" onClick={() => navigate('/visits')}>Return to visits</button>
           </div> : <div className="space-y-4">
-            {!selectedAgent.firstVisitCompletedAt && <div className="first-visit-location-panel">
+            {showLocationCapture && !waitingForTransferReview && <div className="first-visit-location-panel">
               <div className="first-visit-location-intro">
                 <span className="first-visit-location-mark"><MapPin size={18} aria-hidden="true" /></span>
                 <div>
-                  <span className="first-visit-location-kicker">ONE-TIME FIELD RECORD</span>
-                  <h3>Set the agent’s first-visit location</h3>
-                  <p>Choose a saved cell or village, or enter its local name. New areas are saved under the selected parent when GPS is captured; the territory and GPS are then locked.</p>
+                  <span className="first-visit-location-kicker">{transferNeedsLocationCapture ? 'TRANSFER LOCATION CHECK' : relocationNeedsLocationCapture ? 'RELOCATED AGENT LOCATION CHECK' : 'ONE-TIME FIELD RECORD'}</span>
+                  <h3>{transferNeedsLocationCapture ? 'Record the agent’s location in your district' : relocationNeedsLocationCapture ? 'Verify the agent’s new location' : 'Set the agent’s first-visit location'}</h3>
+                  <p>{transferNeedsLocationCapture ? 'The transfer is accepted. Choose the agent’s current sector, cell and village, enter the venue, and capture a fresh GPS location while you are with them.' : relocationNeedsLocationCapture ? 'This agent has moved. Confirm the sector, cell and village, update the venue if needed, then capture a fresh GPS location during this visit before check-in.' : 'Choose a saved cell or village, enter the agent’s venue, then capture the location. New areas are saved under the selected parent when GPS is captured; the territory and GPS are then locked.'}</p>
                 </div>
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
                 <label className="text-sm font-medium text-gray-700">District
-                  <select className="form-select mt-1 w-full" value={firstVisitFields.territoryId} disabled={Boolean(selectedAgent.firstVisitLocationCapturedAt)} onChange={(event) => setFirstVisitFields({ territoryId: event.target.value, sectorId: '', cellId: '', cellName: '', villageId: '', villageName: '' })}>
+                  <select className="form-select mt-1 w-full" value={firstVisitFields.territoryId} disabled={!needsLocationCapture} onChange={(event) => setFirstVisitFields((current) => ({ ...current, territoryId: event.target.value, sectorId: '', cellId: '', cellName: '', villageId: '', villageName: '' }))}>
                     <option value="">Choose district</option>{workTerritories.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
                   </select>
                 </label>
                 <label className="text-sm font-medium text-gray-700">Sector
-                  <select className="form-select mt-1 w-full" value={firstVisitFields.sectorId} disabled={Boolean(selectedAgent.firstVisitLocationCapturedAt)} onChange={(event) => setFirstVisitFields((current) => ({ ...current, sectorId: event.target.value, cellId: '', cellName: '', villageId: '', villageName: '' }))}>
+                  <select className="form-select mt-1 w-full" value={firstVisitFields.sectorId} disabled={!needsLocationCapture} onChange={(event) => setFirstVisitFields((current) => ({ ...current, sectorId: event.target.value, cellId: '', cellName: '', villageId: '', villageName: '' }))}>
                     <option value="">Choose sector</option>{locationSectors.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
                   </select>
                 </label>
                 <div className="first-visit-area-field">
-                  <div className="first-visit-area-heading"><label htmlFor="first-visit-cell">Cell</label><span>{locationCells.length ? `${locationCells.length} saved` : 'New entry'}</span></div>
-                  <div className="first-visit-area-control"><Search size={16} aria-hidden="true" /><input id="first-visit-cell" aria-describedby="first-visit-cell-hint" className="first-visit-area-input" type="text" list="first-visit-cell-options" value={firstVisitFields.cellName} disabled={Boolean(selectedAgent.firstVisitLocationCapturedAt) || !locationSector} onChange={(event) => updateLocationCell(event.target.value)} placeholder={locationSector ? 'Choose or enter a cell' : 'Choose a sector first'} maxLength={100} autoComplete="off" /></div>
-                  <datalist id="first-visit-cell-options">{locationCells.map((item) => <option key={item.id} value={item.name} />)}</datalist>
-                  <p id="first-visit-cell-hint" className={`first-visit-area-hint${firstVisitFields.cellName && !firstVisitFields.cellId ? ' is-custom' : ''}`}>{firstVisitFields.cellName && !firstVisitFields.cellId ? `“${firstVisitFields.cellName}” will be saved under this sector.` : locationCells.length ? 'Type to find a saved cell or enter a new name.' : 'No saved cells in this sector yet. Enter the local cell name.'}</p>
+                  <div className="first-visit-area-heading"><label htmlFor="first-visit-cell">Cell</label><span>{locationCells.length ? `${locationCells.length} available` : 'None available'}</span></div>
+                  <select id="first-visit-cell" aria-describedby="first-visit-cell-hint" className="form-select mt-1 w-full" value={firstVisitFields.cellId} disabled={!needsLocationCapture || !locationSector || !locationCells.length} onChange={(event) => { const cell = locationCells.find((item) => item.id === event.target.value); setFirstVisitFields((current) => ({ ...current, cellId: cell?.id || '', cellName: cell?.name || '', villageId: '', villageName: '' })); }}>
+                    <option value="">Choose an official cell</option>{locationCells.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                  </select>
+                  <p id="first-visit-cell-hint" className="first-visit-area-hint">Choose a saved cell. Manual territory entry is disabled to prevent duplicate names.</p>
                 </div>
                 <div className="first-visit-area-field">
-                  <div className="first-visit-area-heading"><label htmlFor="first-visit-village">Village</label><span>{locationVillages.length ? `${locationVillages.length} saved` : 'New entry'}</span></div>
-                  <div className="first-visit-area-control"><Search size={16} aria-hidden="true" /><input id="first-visit-village" aria-describedby="first-visit-village-hint" className="first-visit-area-input" type="text" list="first-visit-village-options" value={firstVisitFields.villageName} disabled={Boolean(selectedAgent.firstVisitLocationCapturedAt) || !firstVisitFields.cellName.trim()} onChange={(event) => updateLocationVillage(event.target.value)} placeholder={firstVisitFields.cellName ? 'Choose or enter a village' : 'Choose or enter a cell first'} maxLength={100} autoComplete="off" /></div>
-                  <datalist id="first-visit-village-options">{locationVillages.map((item) => <option key={item.id} value={item.name} />)}</datalist>
-                  <p id="first-visit-village-hint" className={`first-visit-area-hint${firstVisitFields.villageName && !firstVisitFields.villageId ? ' is-custom' : ''}`}>{firstVisitFields.villageName && !firstVisitFields.villageId ? `“${firstVisitFields.villageName}” will be saved under this cell.` : locationVillages.length ? 'Type to find a saved village or enter a new name.' : 'No saved villages in this cell yet. Enter the local village name.'}</p>
+                  <div className="first-visit-area-heading"><label htmlFor="first-visit-village">Village</label><span>{locationVillages.length ? `${locationVillages.length} available` : 'None available'}</span></div>
+                  <select id="first-visit-village" aria-describedby="first-visit-village-hint" className="form-select mt-1 w-full" value={firstVisitFields.villageId} disabled={!needsLocationCapture || !firstVisitFields.cellId || !locationVillages.length} onChange={(event) => { const village = locationVillages.find((item) => item.id === event.target.value); setFirstVisitFields((current) => ({ ...current, villageId: village?.id || '', villageName: village?.name || '' })); }}>
+                    <option value="">Choose an official village</option>{locationVillages.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                  </select>
+                  <p id="first-visit-village-hint" className="first-visit-area-hint">Choose a saved village from the selected cell.</p>
                 </div>
+                <label className="text-sm font-medium text-gray-700">Venue
+                  <input className="form-select mt-1 w-full" type="text" value={firstVisitFields.venue} onChange={(event) => setFirstVisitFields((current) => ({ ...current, venue: event.target.value }))} placeholder="Market, building or business centre" maxLength={200} required />
+                  <span className="first-visit-area-hint">Enter the place name people use to identify this agent’s location.</span>
+                </label>
               </div>
-              {selectedAgent.firstVisitLocationCapturedAt ? <p className="mt-3 text-sm font-medium text-green-800">The first-visit location has been captured and locked.</p> : <button onClick={captureAgentLocation} disabled={locationCaptureLoading || !locationSector || !firstVisitFields.cellName.trim() || !firstVisitFields.villageName.trim()} className="btn btn-primary mt-4 w-full justify-center disabled:opacity-50" type="button">
-                <MapPin size={17} />{locationCaptureLoading ? 'Capturing precise location…' : 'Capture first-visit location'}
+              {selectedAgent.firstVisitLocationCapturedAt && !needsLocationCapture ? <><p className="mt-3 text-sm font-medium text-green-800">The territory and GPS capture are locked.</p><button onClick={captureAgentLocation} disabled={locationCaptureLoading || selectedAgent.firstVisitCompletedAt || !firstVisitFields.venue.trim() || firstVisitFields.venue.trim() === String(selectedAgent.venue || '').trim()} className="btn btn-secondary mt-3 w-full justify-center disabled:opacity-50" type="button">
+                <MapPin size={17} />{locationCaptureLoading ? 'Saving venue…' : 'Save venue'}
+              </button></> : <button onClick={captureAgentLocation} disabled={locationCaptureLoading || !locationSector || !firstVisitFields.cellId || !firstVisitFields.villageId || !firstVisitFields.venue.trim()} className="btn btn-primary mt-4 w-full justify-center disabled:opacity-50" type="button">
+                <MapPin size={17} />{locationCaptureLoading ? 'Capturing precise location…' : transferNeedsLocationCapture ? 'Capture new transfer location' : relocationNeedsLocationCapture ? 'Capture relocated location' : 'Capture first-visit location'}
               </button>}
               {!selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.transfers?.some((transfer) => transfer.status === 'PENDING') && !selectedAgent.transferRequest && <div className="mt-4 border-t border-[#e5e8ef] pt-3">
                 <button type="button" className="text-sm font-semibold text-[#202a4e] underline" onClick={openTransferPanel}>The agent moved to another district?</button>
@@ -961,7 +1025,7 @@ export default function VisitWorkflow() {
 
             <button
               onClick={handleCheckIn}
-              disabled={checkInLoading || gpsStatus === 'success' || selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || (!selectedAgent.locationVerified && !selectedAgent.pendingLocation) || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.pendingLocation)}
+              disabled={checkInLoading || waitingForTransferReview || gpsStatus === 'success' || selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || (!selectedAgent.locationVerified && !selectedAgent.pendingLocation) || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.pendingLocation)}
               className="btn btn-primary w-full justify-center py-4 text-base disabled:opacity-50"
             >
               <MapPin className="w-6 h-6 mr-2" />
@@ -1030,99 +1094,52 @@ export default function VisitWorkflow() {
       {currentStep === 3 && (
         <div className="visit-workflow-step space-y-6">
           <h2 className="text-xl font-semibold text-[#202a4e] flex items-center"><FileText className="w-5 h-5 mr-2"/> Visit Report</h2>
-          
+          <p className="text-sm text-gray-600">Agent and visit locations come from the saved agent record and check-in GPS.</p>
           <div className="space-y-4">
-            <FormField.Select
-              label="Operating Status"
-              options={[
-                { value: 'Operational', label: 'Operational' },
-                { value: 'Temporarily Closed', label: 'Temporarily Closed' },
-                { value: 'Permanently Closed', label: 'Permanently Closed' }
-              ]}
-              value={reportData.operating_status}
-              onChange={(e) => handleReportChange('operating_status', e.target.value)}
-              required
-            />
-            <FormField.Textarea
-              label="Services Offered"
-              value={reportData.services_offered}
-              onChange={(e) => handleReportChange('services_offered', e.target.value)}
-              rows={2}
-            />
-            <FormField.Textarea
-              label="Products Offered"
-              value={reportData.products_offered}
-              onChange={(e) => handleReportChange('products_offered', e.target.value)}
-              rows={2}
-            />
-            <FormField.Textarea
-              label="General Observations"
-              value={reportData.general_observations}
-              onChange={(e) => handleReportChange('general_observations', e.target.value)}
-              rows={3}
-            />
-            <FormField.Textarea
-              label="Liquidity Observations"
-              value={reportData.liquidity_observations}
-              onChange={(e) => handleReportChange('liquidity_observations', e.target.value)}
-              rows={2}
-            />
-            <FormField.Textarea
-              label="Customer Quality Observations"
-              value={reportData.customer_quality_observations}
-              onChange={(e) => handleReportChange('customer_quality_observations', e.target.value)}
-              rows={2}
-            />
-            <FormField.Textarea
-              label="Challenges Faced"
-              value={reportData.challenges_faced}
-              onChange={(e) => handleReportChange('challenges_faced', e.target.value)}
-              rows={3}
-            />
-            <FormField.Textarea
-              label="Support Needs"
-              value={reportData.support_needs}
-              onChange={(e) => handleReportChange('support_needs', e.target.value)}
-              rows={2}
-            />
-            <FormField.Textarea
-              label="Training Needs"
-              value={reportData.training_needs}
-              onChange={(e) => handleReportChange('training_needs', e.target.value)}
-              rows={2}
-            />
-            <FormField.Textarea
-              label="Follow-up Actions"
-              value={reportData.follow_up_actions}
-              onChange={(e) => handleReportChange('follow_up_actions', e.target.value)}
-              rows={3}
-            />
-            {checklist.map((item) => (
-              <FormField key={item.id} label={item.text} required={Boolean(item.required)}>
-                {item.type === 'YES_NO' ? (
-                  <select className="input" value={checklistData[item.id] || ''} onChange={(event) => setChecklistData((current) => ({ ...current, [item.id]: event.target.value }))}>
-                    <option value="">Select an answer</option><option value="Yes">Yes</option><option value="No">No</option>
-                  </select>
-                ) : item.type === 'MULTIPLE_CHOICE' ? (
-                  <select className="input" value={checklistData[item.id] || ''} onChange={(event) => setChecklistData((current) => ({ ...current, [item.id]: event.target.value }))}>
-                    <option value="">Select an answer</option>{(item.options || []).map((option) => <option key={option} value={option}>{option}</option>)}
-                  </select>
-                ) : (
-                  <textarea className="input" rows={2} value={checklistData[item.id] || ''} onChange={(event) => setChecklistData((current) => ({ ...current, [item.id]: event.target.value }))} />
-                )}
-              </FormField>
-            ))}
-            <FormField.Textarea
-              label="Additional Remarks"
-              value={reportData.additional_remarks}
-              onChange={(e) => handleReportChange('additional_remarks', e.target.value)}
-              rows={2}
-            />
+            {['IREMBO', 'DDIN'].map((section) => {
+              const standard = section === 'IREMBO' ? VISIT_REPORT_QUESTIONS.filter((question) => !question.conditionalOn || reportData[question.conditionalOn.id] === question.conditionalOn.value) : [];
+              const configured = checklist.filter((item) => (item.section || 'DDIN') === section);
+              if (!standard.length && !configured.length && section === 'IREMBO') return null;
+              return <section className="visit-report-section" key={section}>
+                <div className="visit-report-section-heading"><span>{section === 'IREMBO' ? 'A' : 'B'}</span><div><h3>Section {section === 'IREMBO' ? 'A · IREMBO' : 'B · DDIN'}</h3><p>{section === 'IREMBO' ? 'Required · Complete every question before submitting.' : 'Optional · Answer these if relevant to the visit.'}</p></div></div>
+                {standard.map((question) => (
+                  <FormField key={question.id} label={question.text} required={question.required} hint={question.hint}>
+                    {question.type === 'NUMBER' ? (
+                      <input className="input" type="number" min="0" step="1" value={reportData[question.id]} onChange={(event) => handleReportChange(question.id, event.target.value)} required={question.required} />
+                    ) : question.type === 'YES_NO' ? (
+                      <select className="input" value={reportData[question.id]} onChange={(event) => handleReportChange(question.id, event.target.value)} required={question.required}>
+                        <option value="">Select an answer</option><option value="Yes">Yes</option><option value="No">No</option>
+                      </select>
+                    ) : (
+                      <textarea className="input" rows={2} value={reportData[question.id]} onChange={(event) => handleReportChange(question.id, event.target.value)} required={question.required} />
+                    )}
+                  </FormField>
+                ))}
+                {configured.map((item) => (
+                  <FormField key={item.id} label={item.text} required={section === 'IREMBO'}>
+                    {item.type === 'NUMBER' ? (
+                      <input className="input" type="number" step="any" value={checklistData[item.id] || ''} onChange={(event) => setChecklistData((current) => ({ ...current, [item.id]: event.target.value }))} required={section === 'IREMBO'} />
+                    ) : item.type === 'YES_NO' ? (
+                      <select className="input" value={checklistData[item.id] || ''} onChange={(event) => setChecklistData((current) => ({ ...current, [item.id]: event.target.value }))} required={section === 'IREMBO'}>
+                        <option value="">Select an answer</option><option value="Yes">Yes</option><option value="No">No</option>
+                      </select>
+                    ) : item.type === 'MULTIPLE_CHOICE' ? (
+                      <select className="input" value={checklistData[item.id] || ''} onChange={(event) => setChecklistData((current) => ({ ...current, [item.id]: event.target.value }))} required={section === 'IREMBO'}>
+                        <option value="">Select an answer</option>{(item.options || []).map((option) => <option key={option} value={option}>{option}</option>)}
+                      </select>
+                    ) : (
+                      <textarea className="input" rows={2} value={checklistData[item.id] || ''} onChange={(event) => setChecklistData((current) => ({ ...current, [item.id]: event.target.value }))} required={section === 'IREMBO'} />
+                    )}
+                  </FormField>
+                ))}
+                {section === 'DDIN' && !configured.length && <p className="text-sm text-gray-600">No optional DDIN questions have been configured.</p>}
+              </section>;
+            })}
           </div>
 
           <button
             onClick={handleSubmitReport}
-            disabled={reportLoading || !reportData.operating_status}
+            disabled={reportLoading || !String(reportData.agents_in_shop).trim() || !Number.isInteger(Number(reportData.agents_in_shop)) || Number(reportData.agents_in_shop) < 0 || !String(reportData.branding_materials || '').trim() || !reportData.account_owner || !reportData.whatsapp_updates || !reportData.difficulties || (reportData.difficulties === 'Yes' && !String(reportData.difficulties_description || '').trim()) || checklist.some((item) => item.section === 'IREMBO' && !String(checklistData[item.id] ?? '').trim())}
             className="w-full bg-[#202a4e] hover:bg-[#17213d] text-white py-3 rounded-md font-semibold flex items-center justify-center disabled:opacity-50"
           >
             {reportLoading ? 'Submitting...' : 'Submit Report'}
@@ -1146,9 +1163,14 @@ export default function VisitWorkflow() {
                 {gpsData?.distance <= gpsData?.radius ? 'Verified' : 'Flagged'} ({gpsData?.distance}m)
               </span>
             </div>
-            <div className="flex justify-between border-b pb-2">
-              <span className="text-gray-600">Operating Status</span>
-              <span className="font-medium">{reportData.operating_status}</span>
+            <div className="space-y-2 border-b pb-3">
+              <span className="text-gray-600 block">Visit report</span>
+              <div className="flex justify-between gap-4"><span>Agents in shop</span><span className="font-medium">{reportData.agents_in_shop}</span></div>
+              <div className="flex justify-between gap-4"><span>Account owner</span><span className="font-medium">{reportData.account_owner}</span></div>
+              <div className="flex justify-between gap-4"><span>Branding materials</span><span className="font-medium">{reportData.branding_materials || 'Not specified'}</span></div>
+              <div className="flex justify-between gap-4"><span>WhatsApp updates</span><span className="font-medium">{reportData.whatsapp_updates}</span></div>
+              <div className="flex justify-between gap-4"><span>Difficulties or recommendation</span><span className="font-medium">{reportData.difficulties}</span></div>
+              {reportData.difficulties === 'Yes' && <p className="text-sm text-gray-600">{reportData.difficulties_description}</p>}
             </div>
             
             <div>

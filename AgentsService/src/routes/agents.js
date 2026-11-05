@@ -4,9 +4,132 @@ const prisma = require('../utils/prisma');
 const { authenticateToken, requireRole, requireTerritoryAccess } = require('../middleware/auth');
 const { logAction } = require('../utils/auditLog');
 const { decryptPii, encryptPii } = require('../../../shared/pii');
-const { cleanTerritoryName, findChildTerritory, findOrCreateChildTerritory } = require('../../../shared/territory-capture');
+const { advisoryTransactionLock } = require('../../../shared/advisory-locks');
 
 const queryIds = (value) => (Array.isArray(value) ? value : value ? [value] : []).map(String).filter(Boolean);
+const isDatabaseSchemaError = (error) => ['P2021', 'P2022'].includes(error?.code);
+const databaseMigrationMessage = 'The database is missing an application update. Apply the pending Prisma migrations and restart the services.';
+const sectorWhatsAppGroupKey = (sectorId) => `SECTOR_WHATSAPP_GROUP:${sectorId}`;
+const sectorWhatsAppInviteKey = (sectorId) => `SECTOR_WHATSAPP_INVITE:${sectorId}`;
+
+function normalizeWhatsAppNumber(value) {
+  let digits = String(value || '').trim().split('@')[0].replace(/\D/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (/^0\d{9}$/.test(digits)) digits = `250${digits.slice(1)}`;
+  return /^[1-9]\d{7,14}$/.test(digits) ? digits : null;
+}
+
+function parseSystemConfigJson(value) {
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+function whatsAppProviderReady() {
+  return Boolean(String(process.env.WHAPI_API_TOKEN || '').trim());
+}
+
+async function whapiRequest(path, { method = 'GET', body } = {}) {
+  if (!whatsAppProviderReady()) {
+    const error = new Error('WhatsApp group API is not configured.');
+    error.statusCode = 503;
+    throw error;
+  }
+  let response;
+  try {
+    response = await fetch(`https://gate.whapi.cloud${path}`, {
+      method,
+      headers: {
+        accept: 'application/json',
+        authorization: `Bearer ${String(process.env.WHAPI_API_TOKEN || '').trim()}`,
+        ...(body ? { 'content-type': 'application/json' } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (cause) {
+    const error = new Error('The WhatsApp provider could not be reached.');
+    error.statusCode = 502;
+    error.ambiguous = true;
+    error.cause = cause;
+    throw error;
+  }
+  const raw = await response.text();
+  let data = {};
+  try { data = raw ? JSON.parse(raw) : {}; } catch { /* Provider returned a non-JSON error. */ }
+  if (!response.ok) {
+    const error = new Error('The WhatsApp provider rejected the group operation.');
+    error.statusCode = response.status;
+    error.ambiguous = response.status >= 500;
+    error.providerData = data;
+    throw error;
+  }
+  return data;
+}
+
+function extractWhapiGroupId(data) {
+  const id = data?.id || data?.group?.id || data?.chat?.id;
+  return typeof id === 'string' && /^[\d-]{10,31}@g\.us$/.test(id) ? id : null;
+}
+
+async function getWhapiInviteUrl(groupId) {
+  const data = await whapiRequest(`/groups/${encodeURIComponent(groupId)}/invite`);
+  const candidate = data?.invite_url || data?.url || data?.link;
+  if (typeof candidate === 'string' && candidate.startsWith('https://chat.whatsapp.com/')) return candidate;
+  const inviteCode = data?.invite_code || data?.code;
+  return typeof inviteCode === 'string' && /^[A-Za-z0-9_-]+$/.test(inviteCode)
+    ? `https://chat.whatsapp.com/${inviteCode}`
+    : '';
+}
+
+function normalizeProviderNumbers(values) {
+  return new Set((Array.isArray(values) ? values : [])
+    .map((value) => {
+      const raw = typeof value === 'string' ? value : value?.id || value?.phone || '';
+      return String(raw).endsWith('@lid') ? null : normalizeWhatsAppNumber(raw);
+    })
+    .filter(Boolean));
+}
+
+function getProviderParticipantResult(data, requested) {
+  const failedNumbers = new Set([
+    ...normalizeProviderNumbers(data?.unprocessed_participants || []),
+    ...normalizeProviderNumbers(data?.failed || []),
+  ]);
+  const processedValues = data?.processed || [];
+  const processedNumbers = normalizeProviderNumbers(processedValues);
+  const participants = Array.isArray(data?.participants) ? data.participants : [];
+  const groupMemberNumbers = normalizeProviderNumbers(participants);
+  const observed = new Set([...processedNumbers, ...groupMemberNumbers]);
+  const hasSuccessList = processedValues.length > 0 || participants.length > 0;
+  const addedNumbers = hasSuccessList
+    ? new Set([...observed].filter((number) => requested.has(number) && !failedNumbers.has(number)))
+    : new Set([...requested].filter((number) => !failedNumbers.has(number)));
+  if (hasSuccessList) {
+    for (const number of requested) if (!addedNumbers.has(number)) failedNumbers.add(number);
+  }
+  return { addedNumbers, failedNumbers };
+}
+
+async function saveSectorWhatsAppGroup(client, sector, groupData, userId) {
+  const key = sectorWhatsAppGroupKey(sector.id);
+  const value = JSON.stringify(groupData);
+  await client.systemConfig.upsert({
+    where: { key },
+    create: { key, value, description: `WhatsApp group for ${sector.name}, ${sector.parent.name}`, updatedById: userId },
+    update: { value, description: `WhatsApp group for ${sector.name}, ${sector.parent.name}`, updatedById: userId },
+  });
+}
+
+// Express 4 does not forward rejected async route promises. Wrap async handlers
+// so an unexpected database/query error becomes a request error instead of
+// terminating the Agents service process.
+const forwardAsyncErrors = (handler) => {
+  if (handler.constructor?.name !== 'AsyncFunction') return handler;
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+};
+for (const method of ['get', 'post', 'put', 'patch', 'delete']) {
+  const register = router[method].bind(router);
+  router[method] = (path, ...handlers) => register(path, ...handlers.map(forwardAsyncErrors));
+}
 
 async function validateAgentHierarchy({ territoryId, sectorId, cellId, villageId }, requireCellVillage = true, client = prisma) {
   const db = client || prisma;
@@ -59,6 +182,309 @@ async function areaAddress({ villageId }, client = prisma) {
   return [province?.name, district?.name, sector?.name, cell?.name, village?.name].filter(Boolean).join(', ');
 }
 
+router.get('/sector-groups', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  try {
+    const districtIds = req.user.assignedTerritories || [];
+    if (!districtIds.length) return res.json([]);
+    const sectors = await prisma.territory.findMany({
+      where: { type: 'SECTOR', isActive: true, parentId: { in: districtIds }, parent: { is: { isActive: true } } },
+      select: { id: true, name: true, parentId: true, parent: { select: { name: true } } },
+      orderBy: [{ parent: { name: 'asc' } }, { name: 'asc' }],
+    });
+    const sectorIds = sectors.map(({ id }) => id);
+    const [agents, configs] = await Promise.all([
+      sectorIds.length ? prisma.agent.findMany({
+        where: { sectorId: { in: sectorIds }, status: 'ACTIVE' },
+        select: { id: true, agentId: true, name: true, phoneNumber: true, sectorId: true },
+        orderBy: [{ name: 'asc' }, { id: 'asc' }],
+      }) : [],
+      sectorIds.length ? prisma.systemConfig.findMany({ where: { key: { in: sectorIds.flatMap((id) => [sectorWhatsAppInviteKey(id), sectorWhatsAppGroupKey(id)]) } }, select: { key: true, value: true } }) : [],
+    ]);
+    const configByKey = new Map(configs.map((row) => [row.key, row.value]));
+    res.json(sectors.map((sector) => ({
+      id: sector.id, name: sector.name, districtId: sector.parentId, districtName: sector.parent.name,
+      inviteUrl: parseSystemConfigJson(configByKey.get(sectorWhatsAppGroupKey(sector.id)))?.inviteUrl
+        || configByKey.get(sectorWhatsAppInviteKey(sector.id)) || '',
+      group: (() => {
+        const group = parseSystemConfigJson(configByKey.get(sectorWhatsAppGroupKey(sector.id)));
+        if (!group) return null;
+        return {
+          status: group.status || 'active',
+          groupName: group.groupName || `DDIN ${sector.name}`,
+          createdAt: group.createdAt || null,
+          attemptedCount: Number.isInteger(group.attemptedCount) ? group.attemptedCount : (group.attemptedAgentIds || []).length,
+          addedCount: Number.isInteger(group.addedCount) ? group.addedCount : (group.addedAgentIds || []).length,
+          failedCount: Number.isInteger(group.failedCount) ? group.failedCount : (group.failedAgentIds || []).length,
+        };
+      })(),
+      agents: agents.filter((agent) => agent.sectorId === sector.id),
+    })).map((sector) => ({ ...sector, providerAvailable: whatsAppProviderReady() })));
+  } catch (error) {
+    console.error('Sector WhatsApp groups error:', error.code || error.name);
+    res.status(500).json({ error: 'Could not load sectors and agent contact details.' });
+  }
+});
+
+router.put('/sector-groups/:sectorId', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  try {
+    const sectorId = String(req.params.sectorId || '');
+    const inviteUrl = String(req.body.inviteUrl || '').trim();
+    const sector = await prisma.territory.findFirst({ where: { id: sectorId, type: 'SECTOR', isActive: true, parentId: { in: req.user.assignedTerritories || [] } }, select: { id: true, name: true, parent: { select: { name: true } } } });
+    if (!sector) return res.status(404).json({ error: 'This sector is not in your assigned districts.' });
+    const key = sectorWhatsAppInviteKey(sector.id);
+    let normalizedUrl = '';
+    if (inviteUrl) {
+      const url = new URL(inviteUrl);
+      if (url.protocol !== 'https:' || url.hostname !== 'chat.whatsapp.com' || !/^\/[A-Za-z0-9_-]+\/?$/.test(url.pathname)) {
+        return res.status(400).json({ error: 'Paste a valid WhatsApp group invite link from chat.whatsapp.com.' });
+      }
+      normalizedUrl = url.toString();
+    }
+    const result = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, sector.id, 'WHATSAPP_SECTOR_GROUP');
+      const groupConfig = await tx.systemConfig.findUnique({ where: { key: sectorWhatsAppGroupKey(sector.id) }, select: { value: true } });
+      if (parseSystemConfigJson(groupConfig?.value)?.groupId) {
+        const conflict = new Error('This sector already has a provider-managed group. Its invite link is managed by the group integration.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      if (!normalizedUrl) {
+        await tx.systemConfig.deleteMany({ where: { key } });
+        return { inviteUrl: '', action: 'REMOVE_SECTOR_WHATSAPP_INVITE' };
+      }
+      await tx.systemConfig.upsert({
+        where: { key },
+        create: { key, value: normalizedUrl, description: `WhatsApp invite for ${sector.name}, ${sector.parent.name}`, updatedById: req.user.id },
+        update: { value: normalizedUrl, description: `WhatsApp invite for ${sector.name}, ${sector.parent.name}`, updatedById: req.user.id },
+      });
+      return { inviteUrl: normalizedUrl, action: 'SAVE_SECTOR_WHATSAPP_INVITE' };
+    }, { timeout: 10000 });
+    await logAction(req.user.id, result.action, 'Territory', sector.id, { sectorName: sector.name }, req);
+    res.json({ sectorId: sector.id, inviteUrl: result.inviteUrl });
+  } catch (error) {
+    if (error instanceof TypeError) return res.status(400).json({ error: 'Paste a valid WhatsApp group invite link.' });
+    if (error.statusCode === 409) return res.status(409).json({ error: error.message });
+    console.error('Save sector WhatsApp invite failed:', error.code || error.name);
+    res.status(500).json({ error: 'Could not save the WhatsApp group invite link.' });
+  }
+});
+
+router.post('/sector-groups/:sectorId/create', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  const sectorId = String(req.params.sectorId || '');
+  if (req.body?.confirmAgentConsent !== true) {
+    return res.status(400).json({ error: 'Confirm that every agent being added agreed to join this group and share their phone number with the WhatsApp provider.' });
+  }
+  if (!whatsAppProviderReady()) {
+    return res.status(503).json({ error: 'Automatic WhatsApp group creation is not configured. An administrator must set WHAPI_API_TOKEN for AgentsService.' });
+  }
+
+  try {
+    const sector = await prisma.territory.findFirst({
+      where: { id: sectorId, type: 'SECTOR', isActive: true, parentId: { in: req.user.assignedTerritories || [] } },
+      select: { id: true, name: true, parent: { select: { name: true } } },
+    });
+    if (!sector) return res.status(404).json({ error: 'This sector is not in your assigned districts.' });
+
+    const agents = await prisma.agent.findMany({
+      where: { sectorId: sector.id, status: 'ACTIVE' },
+      select: { id: true, phoneNumber: true },
+      orderBy: [{ id: 'asc' }],
+    });
+    const byNumber = new Map();
+    let missingPhoneCount = 0;
+    let invalidPhoneCount = 0;
+    for (const agent of agents) {
+      if (!agent.phoneNumber?.trim()) {
+        missingPhoneCount += 1;
+        continue;
+      }
+      const number = normalizeWhatsAppNumber(agent.phoneNumber);
+      if (!number) {
+        invalidPhoneCount += 1;
+        continue;
+      }
+      if (!byNumber.has(number)) byNumber.set(number, []);
+      byNumber.get(number).push(agent.id);
+    }
+    const groupKey = sectorWhatsAppGroupKey(sector.id);
+    if (!byNumber.size) return res.status(400).json({ error: 'No active agents in this sector have a valid phone number.', missingPhoneCount, invalidPhoneCount });
+    if (byNumber.size > 1023) return res.status(400).json({ error: 'This sector has more numbers than one WhatsApp group can hold. Use the manual group workflow or split the group.' });
+
+    const groupConfig = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, sector.id, 'WHATSAPP_SECTOR_GROUP');
+      const stored = await tx.systemConfig.findUnique({ where: { key: groupKey }, select: { value: true } });
+      const group = parseSystemConfigJson(stored?.value);
+      if (group) return { group, created: false };
+      const manualInvite = await tx.systemConfig.findUnique({ where: { key: sectorWhatsAppInviteKey(sector.id) }, select: { value: true } });
+      if (manualInvite?.value) {
+        const conflict = new Error('A manual WhatsApp group link is already saved for this sector. Remove or replace that link before creating a provider-managed group.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      const requestId = require('node:crypto').randomUUID();
+      const groupName = `DDIN ${sector.name}`.slice(0, 25);
+      const pending = {
+        provider: 'whapi', status: 'creating', requestId, groupName,
+        createdAt: new Date().toISOString(), createdById: req.user.id,
+        attemptedAgentIds: [], addedAgentIds: [], failedAgentIds: [],
+        attemptedCount: 0, addedCount: 0, failedCount: 0,
+      };
+      await saveSectorWhatsAppGroup(tx, sector, pending, req.user.id);
+      return { group: pending, created: true };
+    }, { timeout: 10000 });
+
+    if (groupConfig.group.status === 'creating' && !groupConfig.created) {
+      return res.status(409).json({ error: 'A previous group creation may still be in progress. Check the provider account before trying again to avoid creating duplicates.' });
+    }
+    if (groupConfig.group.status === 'needs_review') {
+      return res.status(409).json({ error: 'A previous provider request may have created a group without saving its ID. Ask an administrator to review the WhatsApp provider account before retrying.' });
+    }
+
+    if (groupConfig.created) {
+      const requested = new Set(byNumber.keys());
+      let created;
+      try {
+        created = await whapiRequest('/groups', {
+          method: 'POST',
+          body: { subject: groupConfig.group.groupName, participants: [...requested] },
+        });
+      } catch (error) {
+        if (error.ambiguous) {
+          await saveSectorWhatsAppGroup(prisma, sector, { ...groupConfig.group, status: 'needs_review' }, req.user.id);
+        } else {
+          await prisma.systemConfig.deleteMany({ where: { key: groupKey } });
+        }
+        throw error;
+      }
+      const groupId = extractWhapiGroupId(created);
+      if (!groupId) {
+        await saveSectorWhatsAppGroup(prisma, sector, { ...groupConfig.group, status: 'needs_review' }, req.user.id);
+        return res.status(502).json({ error: 'The provider responded but did not return a usable group ID. Ask an administrator to review the provider account before retrying.' });
+      }
+      const { addedNumbers, failedNumbers } = getProviderParticipantResult(created, requested);
+      let inviteUrl = '';
+      try { inviteUrl = await getWhapiInviteUrl(groupId); } catch (error) {
+        console.error('WhatsApp group invite lookup failed:', error.statusCode || error.name);
+      }
+      const activeGroup = {
+        ...groupConfig.group,
+        status: 'active', groupId, inviteUrl,
+        attemptedAgentIds: [...new Set([...requested].flatMap((number) => byNumber.get(number) || []))],
+        addedAgentIds: [...new Set([...addedNumbers].flatMap((number) => byNumber.get(number) || []))],
+        failedAgentIds: [...new Set([...failedNumbers].flatMap((number) => byNumber.get(number) || []))],
+        attemptedCount: requested.size, addedCount: addedNumbers.size, failedCount: failedNumbers.size,
+      };
+      await saveSectorWhatsAppGroup(prisma, sector, activeGroup, req.user.id);
+      await logAction(req.user.id, 'CREATE_SECTOR_WHATSAPP_GROUP', 'Territory', sector.id, {
+        sectorName: sector.name, provider: 'whapi', consentConfirmed: true,
+        requestedCount: requested.size, addedCount: addedNumbers.size,
+        failedCount: failedNumbers.size, missingPhoneCount, invalidPhoneCount,
+      }, req);
+      return res.status(201).json({
+        sectorId: sector.id, groupName: activeGroup.groupName, inviteUrl,
+        created: true, attemptedCount: requested.size, addedCount: addedNumbers.size,
+        failedCount: failedNumbers.size, missingPhoneCount, invalidPhoneCount,
+        message: inviteUrl ? 'WhatsApp group created.' : 'WhatsApp group created, but the provider did not return an invite link. The group is saved; ask an administrator to refresh the link.',
+      });
+    }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, sector.id, 'WHATSAPP_SECTOR_GROUP');
+      const stored = await tx.systemConfig.findUnique({ where: { key: groupKey }, select: { value: true } });
+      const storedGroup = parseSystemConfigJson(stored?.value);
+      if (!storedGroup?.groupId || storedGroup.status !== 'active') {
+        const unavailable = new Error('This sector group is not ready for member updates. Ask an administrator to review its provider status.');
+        unavailable.statusCode = 409;
+        throw unavailable;
+      }
+      const alreadyAttempted = new Set(storedGroup.attemptedAgentIds || []);
+      const newNumbers = [...byNumber.entries()]
+        .filter(([, agentIds]) => !agentIds.every((agentId) => alreadyAttempted.has(agentId)))
+        .map(([number]) => number);
+      if (!newNumbers.length) {
+        let inviteUrl = storedGroup.inviteUrl || '';
+        if (!inviteUrl) {
+          try {
+            inviteUrl = await getWhapiInviteUrl(storedGroup.groupId);
+            if (inviteUrl) await saveSectorWhatsAppGroup(tx, sector, { ...storedGroup, inviteUrl }, req.user.id);
+          } catch (error) {
+            console.error('WhatsApp group invite refresh failed:', error.statusCode || error.name);
+          }
+        }
+        return {
+          sectorId: sector.id, groupName: storedGroup.groupName, inviteUrl,
+          created: false, attemptedCount: storedGroup.attemptedCount || 0,
+          addedCount: storedGroup.addedCount || 0, failedCount: storedGroup.failedCount || 0,
+          missingPhoneCount, invalidPhoneCount,
+          message: storedGroup.failedCount
+            ? inviteUrl ? 'No new agent numbers are recorded. Use the invite link for people the provider could not add.' : 'No new agent numbers are recorded. Retry to refresh the group invite link for people the provider could not add.'
+            : 'This group already includes all active agent numbers recorded for the sector.',
+        };
+      }
+      const requested = new Set(newNumbers);
+      let result;
+      try {
+        result = await whapiRequest(`/groups/${encodeURIComponent(storedGroup.groupId)}/participants`, {
+          method: 'POST', body: { participants: newNumbers },
+        });
+      } catch (error) {
+        if (error.statusCode === 409) {
+          result = await whapiRequest(`/groups/${encodeURIComponent(storedGroup.groupId)}`);
+        } else {
+          throw error;
+        }
+      }
+      const { addedNumbers, failedNumbers } = getProviderParticipantResult(result, requested);
+      const attemptedAgentIds = new Set([...(storedGroup.attemptedAgentIds || []), ...newNumbers.flatMap((number) => byNumber.get(number) || [])]);
+      const allAddedAgentIds = new Set([...(storedGroup.addedAgentIds || []), ...[...addedNumbers].flatMap((number) => byNumber.get(number) || [])]);
+      const allFailedAgentIds = new Set([...(storedGroup.failedAgentIds || []), ...[...failedNumbers].flatMap((number) => byNumber.get(number) || [])]);
+      const updatedGroup = {
+        ...storedGroup,
+        attemptedAgentIds: [...attemptedAgentIds], addedAgentIds: [...allAddedAgentIds], failedAgentIds: [...allFailedAgentIds],
+        attemptedCount: (storedGroup.attemptedCount || 0) + newNumbers.length,
+        addedCount: (storedGroup.addedCount || 0) + addedNumbers.size,
+        failedCount: (storedGroup.failedCount || 0) + failedNumbers.size,
+      };
+      await saveSectorWhatsAppGroup(tx, sector, updatedGroup, req.user.id);
+      return {
+        sectorId: sector.id, groupName: storedGroup.groupName, inviteUrl: storedGroup.inviteUrl || '',
+        created: false, attemptedCount: newNumbers.length, addedCount: addedNumbers.size,
+        failedCount: failedNumbers.size, missingPhoneCount, invalidPhoneCount,
+        message: 'New agents were processed for the sector WhatsApp group.',
+      };
+    }, { timeout: 35000 });
+    await logAction(req.user.id, 'ADD_SECTOR_WHATSAPP_GROUP_MEMBERS', 'Territory', sector.id, {
+      sectorName: sector.name, provider: 'whapi', consentConfirmed: true,
+      requestedCount: updated.attemptedCount, addedCount: updated.addedCount,
+      failedCount: updated.failedCount, missingPhoneCount, invalidPhoneCount,
+    }, req);
+    return res.json(updated);
+  } catch (error) {
+    if (error.statusCode === 409) return res.status(409).json({ error: error.message });
+    if (error.statusCode === 503) return res.status(503).json({ error: error.message });
+    if (error.statusCode && error.statusCode < 500) {
+      return res.status(error.statusCode).json({ error: 'The WhatsApp provider could not complete this group action. Check its channel connection and group permissions.' });
+    }
+    console.error('WhatsApp sector group operation failed:', error.statusCode || error.code || error.name);
+    res.status(502).json({ error: error.message || 'Could not complete the WhatsApp group operation.' });
+  }
+});
+
+async function lockAgentMoveAndCheckPending(tx, agentId) {
+  await advisoryTransactionLock(tx, agentId, 'AGENT_MOVE');
+  const [pendingTransfer, pendingRelocation] = await Promise.all([
+    tx.agentTransfer.findFirst({ where: { agentId, status: 'PENDING' }, select: { id: true } }),
+    tx.agentRelocationRequest.findFirst({ where: { agentId, status: 'PENDING' }, select: { id: true } }),
+  ]);
+  if (pendingTransfer || pendingRelocation) {
+    const conflict = new Error(pendingTransfer
+      ? 'This agent has a pending territory transfer. Resolve it before relocating the agent.'
+      : 'This agent has a relocation request awaiting admin review. Review it before making another move.');
+    conflict.statusCode = 409;
+    throw conflict;
+  }
+}
+
 router.get('/', authenticateToken, requireTerritoryAccess, async (req, res) => {
   const requestedPage = Number.parseInt(req.query.page, 10);
   const requestedLimit = Number.parseInt(req.query.limit, 10);
@@ -82,6 +508,7 @@ router.get('/', authenticateToken, requireTerritoryAccess, async (req, res) => {
       { name: { contains: search, mode: 'insensitive' } },
       { agentId: { contains: search, mode: 'insensitive' } },
       { businessName: { contains: search, mode: 'insensitive' } },
+      { venue: { contains: search, mode: 'insensitive' } },
       { phoneNumber: { contains: search, mode: 'insensitive' } }
     ];
   }
@@ -107,36 +534,63 @@ router.get('/', authenticateToken, requireTerritoryAccess, async (req, res) => {
   }
   if (req.user.role === 'CHAMPION') where.championId = req.user.id;
 
-  const total = await prisma.agent.count({ where });
-  const pages = Math.ceil(total / limit);
-  const page = Math.min(safePage, Math.max(pages, 1));
-  const skip = (page - 1) * limit;
-  const [agents, activeCount, verifiedCount] = await Promise.all([
-    prisma.agent.findMany({
+  try {
+    const counts = await prisma.agent.groupBy({ by: ['status', 'locationVerified'], where, _count: { _all: true } });
+    const summary = counts.reduce((result, group) => {
+      const count = group._count._all;
+      result.total += count;
+      if (group.status === 'ACTIVE') result.active += count;
+      if (group.locationVerified) result.locationVerified += count;
+      return result;
+    }, { total: 0, active: 0, locationVerified: 0 });
+    const { total, active: activeCount, locationVerified: verifiedCount } = summary;
+    const pages = Math.ceil(total / limit);
+    const page = Math.min(safePage, Math.max(pages, 1));
+    const agents = await prisma.agent.findMany({
       where,
-      skip,
+      skip: (page - 1) * limit,
       take: limit,
       orderBy: [{ name: 'asc' }, { id: 'asc' }],
-      include: {
-        territory: true, sector: true, cell: true, village: true, champion: true,
+      select: {
+        id: true, agentId: true, name: true, phoneNumber: true, businessName: true, venue: true, address: true,
+        status: true, territoryId: true, sectorId: true, cellId: true, villageId: true,
+        registeredLatitude: true, registeredLongitude: true, gpsAccuracy: true, locationVerified: true,
+        firstVisitLocationCapturedAt: true, firstVisitCompletedAt: true,
+        territory: { select: { id: true, name: true } },
+        sector: { select: { id: true, name: true } },
+        cell: { select: { id: true, name: true } },
+        village: { select: { id: true, name: true } },
+        champion: { select: { id: true, firstName: true, lastName: true } },
         transfers: {
           where: { status: 'PENDING', ...(req.user.role === 'TC' ? { recipientTcId: req.user.id } : {}) },
-          include: { toTerritory: true, requestedByTc: { select: { id: true, firstName: true, lastName: true } } },
+          select: {
+            id: true, fromTerritoryId: true, toTerritoryId: true, recipientTcId: true,
+            status: true, acceptedAt: true, requestedAt: true,
+            toTerritory: { select: { id: true, name: true } },
+            requestedByTc: { select: { id: true, firstName: true, lastName: true } },
+          },
         },
-      }
-    }),
-    prisma.agent.count({ where: { AND: [where, { status: 'ACTIVE' }] } }),
-    prisma.agent.count({ where: { AND: [where, { locationVerified: true }] } }),
-  ]);
+        ...(req.user.role === 'ADMIN' ? { relocationRequests: {
+          where: { status: 'PENDING' },
+          take: 1,
+          select: { id: true, requestedAt: true },
+        } } : {}),
+      },
+    });
 
-  res.json({
-    data: agents,
-    total,
-    page,
-    limit,
-    pages,
-    summary: { active: activeCount, locationVerified: verifiedCount },
-  });
+    res.json({
+      data: agents,
+      total,
+      page,
+      limit,
+      pages,
+      summary: { active: activeCount, locationVerified: verifiedCount },
+    });
+  } catch (error) {
+    console.error('List agents error:', error);
+    if (isDatabaseSchemaError(error)) return res.status(503).json({ error: databaseMigrationMessage });
+    res.status(500).json({ error: 'Could not load agents.' });
+  }
 });
 
 router.get('/offline-pack', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
@@ -158,6 +612,7 @@ router.get('/offline-pack', authenticateToken, requireTerritoryAccess, requireRo
           name: true,
           phoneNumber: true,
           businessName: true,
+          venue: true,
           address: true,
           territoryId: true,
           sectorId: true,
@@ -173,7 +628,7 @@ router.get('/offline-pack', authenticateToken, requireTerritoryAccess, requireRo
           sector: { select: { id: true, name: true } },
           cell: { select: { id: true, name: true } },
           village: { select: { id: true, name: true } },
-          transfers: { where: { recipientTcId: req.user.id, status: 'PENDING' }, select: { id: true, fromTerritoryId: true, toTerritoryId: true, status: true, requestedAt: true } },
+          transfers: { where: { recipientTcId: req.user.id, status: 'PENDING' }, select: { id: true, fromTerritoryId: true, toTerritoryId: true, status: true, acceptedAt: true, requestedAt: true } },
         },
       }),
       prisma.systemConfig.findUnique({ where: { key: 'GEOFENCE_RADIUS_METERS' }, select: { value: true } }),
@@ -205,6 +660,9 @@ router.get('/offline-pack', authenticateToken, requireTerritoryAccess, requireRo
 
 router.post('/', authenticateToken, requireTerritoryAccess, requireRole('ADMIN', 'MANAGER', 'TC'), async (req, res) => {
   try {
+    const venue = String(req.body.venue || '').trim();
+    if (!venue) return res.status(400).json({ error: 'Enter the agent’s venue.' });
+    if (venue.length > 200) return res.status(400).json({ error: 'Venue must be 200 characters or fewer.' });
     const sector = req.body.sectorId ? await prisma.territory.findUnique({ where: { id: req.body.sectorId }, select: { type: true, parentId: true } }) : null;
     if (!sector || sector.type !== 'SECTOR' || sector.parentId !== req.body.territoryId) return res.status(400).json({ error: 'Select a sector that belongs to the selected district.' });
     if (req.body.cellId || req.body.villageId) {
@@ -224,6 +682,7 @@ router.post('/', authenticateToken, requireTerritoryAccess, requireRole('ADMIN',
     const agent = await prisma.agent.create({
       data: {
         ...agentFields,
+        venue,
         nationalIdEncrypted: encryptPii(nationalId),
         nextOfKinNameEncrypted: encryptPii(nextOfKinName),
         nextOfKinPhoneEncrypted: encryptPii(nextOfKinPhone),
@@ -258,7 +717,6 @@ router.get('/:id/transfer-targets', authenticateToken, requireTerritoryAccess, r
   const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, territoryId: true, firstVisitLocationCapturedAt: true, firstVisitCompletedAt: true } });
   if (!agent) return res.status(404).json({ error: 'Agent not found.' });
   if (!(req.user.assignedTerritories || []).includes(agent.territoryId)) return res.status(403).json({ error: 'This agent is outside your assigned district.' });
-  if (agent.firstVisitCompletedAt || agent.firstVisitLocationCapturedAt) return res.status(409).json({ error: 'Transfers by a coordinator are allowed only before the first-visit location is captured.' });
   const assignments = await prisma.tcTerritoryAssignment.findMany({
     where: { isActive: true, territoryId: { notIn: req.user.assignedTerritories || [] }, territory: { is: { type: 'DISTRICT', isActive: true } }, tc: { is: { role: 'TC', isActive: true } } },
     include: { territory: { select: { id: true, name: true, parent: { select: { name: true } } } }, tc: { select: { id: true, firstName: true, lastName: true } } },
@@ -275,10 +733,10 @@ router.get('/:id/transfer-targets', authenticateToken, requireTerritoryAccess, r
 
 router.post('/:id/transfer', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
   try {
-    const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, territoryId: true, firstVisitCompletedAt: true, firstVisitLocationCapturedAt: true, name: true, agentId: true } });
+    const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, territoryId: true, name: true, agentId: true, phoneNumber: true } });
     if (!agent) return res.status(404).json({ error: 'Agent not found.' });
     if (!(req.user.assignedTerritories || []).includes(agent.territoryId)) return res.status(403).json({ error: 'This agent is outside your assigned district.' });
-    if (agent.firstVisitCompletedAt || agent.firstVisitLocationCapturedAt) return res.status(409).json({ error: 'Transfers by a coordinator are allowed only before the first-visit location is captured.' });
+    if (!String(agent.phoneNumber || '').trim()) return res.status(409).json({ error: 'Add the agent’s phone number before requesting a transfer so the receiving TC can call and confirm their location.' });
     const toTerritoryId = String(req.body.toTerritoryId || '');
     const recipientTcId = String(req.body.recipientTcId || '');
     const destination = toTerritoryId ? await prisma.territory.findUnique({ where: { id: toTerritoryId }, select: { id: true, type: true, isActive: true } }) : null;
@@ -287,16 +745,29 @@ router.post('/:id/transfer', authenticateToken, requireTerritoryAccess, requireR
     }
     const receiverAssignment = await prisma.tcTerritoryAssignment.findFirst({ where: { tcId: recipientTcId, territoryId: toTerritoryId, isActive: true, tc: { is: { role: 'TC', isActive: true } } } });
     if (!receiverAssignment) return res.status(400).json({ error: 'Choose an active coordinator assigned to the destination district.' });
-    const existingTransfer = await prisma.agentTransfer.findFirst({ where: { agentId: agent.id, status: 'PENDING' } });
-    if (existingTransfer) return res.status(409).json({ error: 'This agent already has a pending territory transfer.' });
-    const transfer = await prisma.agentTransfer.create({ data: {
-      agentId: agent.id,
-      fromTerritoryId: agent.territoryId,
-      toTerritoryId,
-      requestedByTcId: req.user.id,
-      recipientTcId,
-      reason: String(req.body.reason || '').trim().slice(0, 500) || null,
-    }, include: { toTerritory: true, recipientTc: { select: { id: true, firstName: true, lastName: true } } } });
+    const transfer = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
+      const existingTransfer = await tx.agentTransfer.findFirst({ where: { agentId: agent.id, status: 'PENDING' } });
+      if (existingTransfer) {
+        const conflict = new Error('This agent already has a pending territory transfer.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      const pendingRelocation = await tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'PENDING' }, select: { id: true } });
+      if (pendingRelocation) {
+        const conflict = new Error('This agent already has a relocation request awaiting admin review.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      return tx.agentTransfer.create({ data: {
+        agentId: agent.id,
+        fromTerritoryId: agent.territoryId,
+        toTerritoryId,
+        requestedByTcId: req.user.id,
+        recipientTcId,
+        reason: String(req.body.reason || '').trim().slice(0, 500) || null,
+      }, include: { toTerritory: true, recipientTc: { select: { id: true, firstName: true, lastName: true } } } });
+    }, { maxWait: 10000, timeout: 15000 });
     await logAction(req.user.id, 'REQUEST_AGENT_TRANSFER', 'Agent', agent.id, {
       agentName: agent.name, agentCode: agent.agentId, transferId: transfer.id, fromTerritoryId: agent.territoryId,
       toTerritoryId, toTerritoryName: transfer.toTerritory.name, recipientTcId, recipientTcName: `${transfer.recipientTc.firstName} ${transfer.recipientTc.lastName}`.trim(),
@@ -304,8 +775,218 @@ router.post('/:id/transfer', authenticateToken, requireTerritoryAccess, requireR
     res.status(201).json(transfer);
   } catch (error) {
     console.error('Agent transfer request failed:', error.code || error.name);
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
     if (error.code === 'P2002') return res.status(409).json({ error: 'This agent already has a pending territory transfer.' });
     res.status(500).json({ error: 'Could not send this agent transfer request.' });
+  }
+});
+
+router.get('/transfer-inbox', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  try {
+    const transfers = await prisma.agentTransfer.findMany({
+      where: { recipientTcId: req.user.id, status: 'PENDING', acceptedAt: null },
+      include: {
+        agent: { select: { id: true, agentId: true, name: true, phoneNumber: true, businessName: true, address: true } },
+        fromTerritory: { select: { id: true, name: true, parent: { select: { name: true } } } },
+        toTerritory: { select: { id: true, name: true, parent: { select: { name: true } } } },
+        requestedByTc: { select: { id: true, firstName: true, lastName: true, phoneNumber: true } },
+      },
+      orderBy: { requestedAt: 'asc' },
+    });
+    res.json(transfers);
+  } catch (error) {
+    console.error('Transfer inbox error:', error.code || error.name);
+    res.status(500).json({ error: 'Could not load incoming transfer requests.' });
+  }
+});
+
+router.put('/transfer-requests/:id/review', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  try {
+    const decision = String(req.body.decision || '').toUpperCase();
+    if (!['ACCEPT', 'REJECT'].includes(decision)) return res.status(400).json({ error: 'Choose whether to accept or reject this transfer.' });
+    const reviewNote = String(req.body.note || '').trim().slice(0, 500) || null;
+    const transfer = await prisma.agentTransfer.findUnique({
+      where: { id: req.params.id },
+      include: { agent: { select: { id: true, agentId: true, name: true } } },
+    });
+    if (!transfer) return res.status(404).json({ error: 'Transfer request not found.' });
+    if (transfer.recipientTcId !== req.user.id) return res.status(403).json({ error: 'This transfer was sent to another coordinator.' });
+    if (transfer.status !== 'PENDING' || transfer.acceptedAt) return res.status(409).json({ error: 'This transfer has already been reviewed.' });
+
+    if (decision === 'REJECT') {
+      const rejected = await prisma.agentTransfer.updateMany({
+        where: { id: transfer.id, recipientTcId: req.user.id, status: 'PENDING', acceptedAt: null },
+        data: { status: 'CANCELLED', reviewedAt: new Date(), reviewNote: reviewNote || 'The destination coordinator could not confirm the agent.' },
+      });
+      if (!rejected.count) return res.status(409).json({ error: 'This transfer has already been reviewed.' });
+      await logAction(req.user.id, 'REJECT_AGENT_TRANSFER', 'Agent', transfer.agentId, { agentName: transfer.agent.name, agentCode: transfer.agent.agentId, transferId: transfer.id, note: reviewNote }, req);
+      return res.json({ id: transfer.id, status: 'CANCELLED' });
+    }
+
+    if (!(req.user.assignedTerritories || []).includes(transfer.toTerritoryId)) return res.status(403).json({ error: 'You are no longer assigned to the destination district.' });
+    const accepted = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, transfer.agentId, 'AGENT_MOVE');
+      const pendingRelocation = await tx.agentRelocationRequest.findFirst({ where: { agentId: transfer.agentId, status: 'PENDING' }, select: { id: true } });
+      if (pendingRelocation) {
+        const conflict = new Error('This agent has a relocation request awaiting admin review. Resolve it before accepting the transfer.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      const claimed = await tx.agentTransfer.updateMany({
+        where: { id: transfer.id, recipientTcId: req.user.id, status: 'PENDING', acceptedAt: null },
+        data: { acceptedAt: new Date(), reviewedAt: new Date(), reviewNote },
+      });
+      if (!claimed.count) {
+        const conflict = new Error('This transfer has already been reviewed.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      const moved = await tx.agent.updateMany({ where: { id: transfer.agentId, territoryId: transfer.fromTerritoryId }, data: {
+        territoryId: transfer.toTerritoryId, sectorId: null, cellId: null, villageId: null,
+        address: null, registeredLatitude: null, registeredLongitude: null, gpsAccuracy: null, locationVerified: false,
+      } });
+      if (!moved.count) {
+        const conflict = new Error('The agent’s territory changed before this transfer was accepted. Refresh the request and review again.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      return tx.agentTransfer.findUnique({ where: { id: transfer.id } });
+    });
+    await logAction(req.user.id, 'ACCEPT_AGENT_TRANSFER', 'Agent', transfer.agentId, { agentName: transfer.agent.name, agentCode: transfer.agent.agentId, transferId: transfer.id, toTerritoryId: transfer.toTerritoryId, note: reviewNote }, req);
+    return res.json(accepted);
+  } catch (error) {
+    console.error('Transfer review failed:', error.code || error.name);
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    res.status(500).json({ error: 'Could not review this transfer request.' });
+  }
+});
+
+router.post('/:id/relocation-requests', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  try {
+    const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, agentId: true, name: true, territoryId: true, sectorId: true, cellId: true, villageId: true, firstVisitLocationCapturedAt: true } });
+    if (!agent) return res.status(404).json({ error: 'Agent not found.' });
+    const assignedTerritories = req.user.assignedTerritories || [];
+    if (!assignedTerritories.includes(agent.territoryId)) return res.status(403).json({ error: 'This agent is outside your assigned district.' });
+    if (!agent.firstVisitLocationCapturedAt) return res.status(409).json({ error: 'Use the one-time first-visit location capture before requesting a later relocation.' });
+    const toTerritoryId = String(req.body.territoryId || '').trim();
+    const toSectorId = String(req.body.sectorId || '').trim();
+    const toCellId = String(req.body.cellId || '').trim();
+    const toVillageId = String(req.body.villageId || '').trim();
+    if (!assignedTerritories.includes(toTerritoryId)) return res.status(403).json({ error: 'Relocation requests must stay inside your assigned districts. Use a transfer request for another TC’s district.' });
+    const hierarchyError = await validateAgentHierarchy({ territoryId: toTerritoryId, sectorId: toSectorId, cellId: toCellId, villageId: toVillageId });
+    if (hierarchyError) return res.status(400).json({ error: hierarchyError });
+    if (agent.territoryId === toTerritoryId && agent.sectorId === toSectorId && agent.cellId === toCellId && agent.villageId === toVillageId) {
+      return res.status(400).json({ error: 'Choose a different location before requesting relocation.' });
+    }
+    const request = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
+      const currentAgent = await tx.agent.findUnique({ where: { id: agent.id }, select: { territoryId: true, firstVisitLocationCapturedAt: true } });
+      if (!currentAgent || currentAgent.territoryId !== agent.territoryId || !currentAgent.firstVisitLocationCapturedAt) {
+        const conflict = new Error('The agent changed while this request was being prepared. Reload the profile and try again.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      const [pendingRequest, pendingTransfer] = await Promise.all([
+        tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'PENDING' }, select: { id: true } }),
+        tx.agentTransfer.findFirst({ where: { agentId: agent.id, status: 'PENDING' }, select: { id: true } }),
+      ]);
+      if (pendingRequest || pendingTransfer) {
+        const conflict = new Error(pendingRequest ? 'This agent already has a relocation request awaiting admin review.' : 'Resolve the pending territory transfer before requesting a relocation.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      const previousTcRelocation = await tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'APPROVED' }, select: { id: true } });
+      if (previousTcRelocation) {
+        const conflict = new Error('The TC relocation allowance for this agent has already been used. Ask an administrator to make any further move.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      return tx.agentRelocationRequest.create({ data: {
+        agentId: agent.id, fromTerritoryId: currentAgent.territoryId, toTerritoryId, toSectorId, toCellId, toVillageId,
+        reason: String(req.body.reason || '').trim().slice(0, 500) || null,
+        requestedByTcId: req.user.id,
+      } });
+    }, { maxWait: 10000, timeout: 15000 });
+    await logAction(req.user.id, 'REQUEST_AGENT_RELOCATION', 'Agent', agent.id, { agentName: agent.name, agentCode: agent.agentId, requestId: request.id, fromTerritoryId: agent.territoryId, toTerritoryId }, req);
+    res.status(201).json(request);
+  } catch (error) {
+    console.error('Relocation request failed:', error.code || error.name);
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    if (error.code === 'P2002') return res.status(409).json({ error: 'This agent already has a relocation request awaiting admin review.' });
+    res.status(500).json({ error: 'Could not send this relocation request.' });
+  }
+});
+
+router.get('/relocation-requests', authenticateToken, requireRole('ADMIN'), async (_req, res) => {
+  try {
+    const requests = await prisma.agentRelocationRequest.findMany({
+      where: { status: 'PENDING' },
+      include: {
+        agent: { select: { id: true, agentId: true, name: true, phoneNumber: true, territory: { select: { name: true } } } },
+        fromTerritory: { select: { id: true, name: true } },
+        toTerritory: { select: { id: true, name: true } },
+        requestedByTc: { select: { id: true, firstName: true, lastName: true, phoneNumber: true } },
+      },
+      orderBy: { requestedAt: 'asc' },
+    });
+    const areaIds = [...new Set(requests.flatMap(({ toSectorId, toCellId, toVillageId }) => [toSectorId, toCellId, toVillageId]))];
+    const areas = areaIds.length ? await prisma.territory.findMany({ where: { id: { in: areaIds } }, select: { id: true, name: true, type: true } }) : [];
+    const areaById = new Map(areas.map((area) => [area.id, area]));
+    res.json(requests.map((request) => ({ ...request, destinationPath: [request.toTerritory, areaById.get(request.toSectorId), areaById.get(request.toCellId), areaById.get(request.toVillageId)].filter(Boolean).map(({ name }) => name).join(' · ') })));
+  } catch (error) {
+    console.error('Relocation request inbox error:', error.code || error.name, error.message);
+    if (isDatabaseSchemaError(error)) return res.status(503).json({ error: databaseMigrationMessage });
+    res.status(500).json({ error: 'Could not load relocation requests.' });
+  }
+});
+
+router.put('/relocation-requests/:id/review', authenticateToken, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const decision = String(req.body.decision || '').toUpperCase();
+    if (!['APPROVE', 'REJECT'].includes(decision)) return res.status(400).json({ error: 'Choose whether to approve or reject this relocation.' });
+    const reviewNote = String(req.body.note || '').trim().slice(0, 500) || null;
+    const request = await prisma.agentRelocationRequest.findUnique({ where: { id: req.params.id }, include: { agent: { select: { id: true, agentId: true, name: true, territoryId: true } } } });
+    if (!request) return res.status(404).json({ error: 'Relocation request not found.' });
+    if (request.status !== 'PENDING') return res.status(409).json({ error: 'This relocation request has already been reviewed.' });
+    if (decision === 'REJECT') {
+      const rejected = await prisma.agentRelocationRequest.updateMany({ where: { id: request.id, status: 'PENDING' }, data: { status: 'REJECTED', reviewedById: req.user.id, reviewedAt: new Date(), reviewNote } });
+      if (!rejected.count) return res.status(409).json({ error: 'This relocation request has already been reviewed.' });
+      await logAction(req.user.id, 'REJECT_AGENT_RELOCATION', 'Agent', request.agentId, { agentName: request.agent.name, agentCode: request.agent.agentId, requestId: request.id, note: reviewNote }, req);
+      return res.json({ id: request.id, status: 'REJECTED' });
+    }
+    const moved = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, request.agentId, 'AGENT_MOVE');
+      const claimed = await tx.agentRelocationRequest.updateMany({ where: { id: request.id, status: 'PENDING' }, data: { status: 'APPROVED', reviewedById: req.user.id, reviewedAt: new Date(), reviewNote } });
+      if (!claimed.count) {
+        const conflict = new Error('This relocation request has already been reviewed.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      const hierarchy = { territoryId: request.toTerritoryId, sectorId: request.toSectorId, cellId: request.toCellId, villageId: request.toVillageId };
+      const hierarchyError = await validateAgentHierarchy(hierarchy, true, tx);
+      if (hierarchyError) {
+        const conflict = new Error(`The requested location is no longer valid: ${hierarchyError}`);
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      const address = await areaAddress(hierarchy, tx);
+      const updated = await tx.agent.updateMany({ where: { id: request.agentId, territoryId: request.fromTerritoryId }, data: {
+        ...hierarchy, address, registeredLatitude: null, registeredLongitude: null,
+        gpsAccuracy: null, locationVerified: false,
+      } });
+      if (!updated.count) {
+        const conflict = new Error('The agent’s territory changed after this request was submitted. Refresh and review the current location.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      return tx.agent.findUnique({ where: { id: request.agentId } });
+    });
+    await logAction(req.user.id, 'APPROVE_AGENT_RELOCATION', 'Agent', moved.id, { agentName: request.agent.name, agentCode: request.agent.agentId, requestId: request.id, fromTerritoryId: request.fromTerritoryId, toTerritoryId: request.toTerritoryId, note: reviewNote }, req);
+    return res.json({ id: request.id, status: 'APPROVED', agent: moved });
+  } catch (error) {
+    console.error('Relocation review failed:', error.code || error.name);
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    res.status(500).json({ error: 'Could not review this relocation request.' });
   }
 });
 
@@ -314,32 +995,27 @@ router.post('/:id/location/capture', authenticateToken, requireTerritoryAccess, 
   try {
     const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, include: { sector: true, cell: true, village: true } });
     if (!agent) return res.status(404).json({ error: 'Agent not found.' });
-    if (agent.firstVisitCompletedAt) return res.status(409).json({ error: 'The agent’s first visit is complete. Only an administrator can change the territory or location now.' });
+    const venue = String(req.body.venue || '').trim();
+    if (!venue) return res.status(400).json({ error: 'Enter the agent’s venue before capturing the first-visit location.' });
+    if (venue.length > 200) return res.status(400).json({ error: 'Venue must be 200 characters or fewer.' });
     const territoryId = String(req.body.territoryId || agent.territoryId);
     const sectorId = String(req.body.sectorId || '');
     let cellId = String(req.body.cellId || '');
     let villageId = String(req.body.villageId || '');
-    const cellName = cleanTerritoryName(req.body.cellName);
-    const villageName = cleanTerritoryName(req.body.villageName);
-    if ((!cellId && !cellName) || (!villageId && !villageName)) return res.status(400).json({ error: 'Choose or enter both a cell and village.' });
-    if (cellName.length > 100 || villageName.length > 100) return res.status(400).json({ error: 'Cell and village names must be 100 characters or fewer.' });
+    if (!cellId || !villageId) return res.status(400).json({ error: 'Select a saved cell and village from the official territory list.' });
     const sectorError = await validateAgentHierarchy({ territoryId, sectorId, cellId: '', villageId: '' }, false);
     if (sectorError) return res.status(400).json({ error: sectorError });
 
-    let cell = cellId ? await prisma.territory.findUnique({ where: { id: cellId }, select: { id: true, type: true, parentId: true, isActive: true } }) : await findChildTerritory(prisma, { name: cellName, type: 'CELL', parentId: sectorId });
-    if (cellId && (!cell || cell.type !== 'CELL' || !cell.isActive || cell.parentId !== sectorId)) return res.status(400).json({ error: 'Choose a cell inside the selected sector.' });
-    if (!cellId && cell?.isActive) cellId = cell.id;
-    if (villageId && !cellId) return res.status(400).json({ error: 'Choose a cell before selecting a saved village.' });
-    let village = villageId ? await prisma.territory.findUnique({ where: { id: villageId }, select: { id: true, type: true, parentId: true, isActive: true } }) : cellId ? await findChildTerritory(prisma, { name: villageName, type: 'VILLAGE', parentId: cellId }) : null;
-    if (villageId && (!village || village.type !== 'VILLAGE' || !village.isActive || village.parentId !== cellId)) return res.status(400).json({ error: 'Choose a village inside the selected cell.' });
-    if (!villageId && village?.isActive) villageId = village.id;
-    if (cellId && villageId) {
-      const hierarchyError = await validateAgentHierarchy({ territoryId, sectorId, cellId, villageId });
-      if (hierarchyError) return res.status(400).json({ error: hierarchyError });
-    }
+    const hierarchyError = await validateAgentHierarchy({ territoryId, sectorId, cellId, villageId });
+    if (hierarchyError) return res.status(400).json({ error: hierarchyError });
     const isAssignedHere = (req.user.assignedTerritories || []).includes(territoryId);
-    const pendingTransfer = await prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, toTerritoryId: territoryId, status: 'PENDING' } });
+    const pendingTransfer = await prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, toTerritoryId: territoryId, status: 'PENDING', acceptedAt: { not: null } } });
+    const unreviewedIncomingTransfer = await prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, status: 'PENDING', acceptedAt: null }, select: { id: true } });
+    if (unreviewedIncomingTransfer) return res.status(409).json({ error: 'Review and accept this transfer from the dashboard before recording the agent’s location.' });
     const outgoingTransfer = await prisma.agentTransfer.findFirst({ where: { agentId: agent.id, requestedByTcId: req.user.id, status: 'PENDING' } });
+    if (territoryId !== agent.territoryId && !pendingTransfer) return res.status(409).json({ error: 'The agent’s district can only change through an approved relocation or accepted transfer.' });
+    const needsLocationCapture = agent.registeredLatitude == null || agent.registeredLongitude == null || !agent.locationVerified || (!agent.firstVisitCompletedAt && !agent.firstVisitLocationCapturedAt);
+    if (agent.firstVisitCompletedAt && !needsLocationCapture && !pendingTransfer) return res.status(409).json({ error: 'This agent already has a verified location. Request an administrator-approved relocation before changing it.' });
     if (outgoingTransfer && !pendingTransfer) return res.status(409).json({ error: 'This agent is awaiting the destination coordinator. You cannot record their first-visit location.' });
     if (!isAssignedHere && !pendingTransfer) return res.status(403).json({ error: 'This district is outside your assigned territories.' });
     const sameCapture = agent.territoryId === territoryId && agent.sectorId === sectorId && agent.cellId === cellId && agent.villageId === villageId
@@ -349,33 +1025,51 @@ router.post('/:id/location/capture', authenticateToken, requireTerritoryAccess, 
     if (typeof lat !== 'number' || !Number.isFinite(lat) || lat < -90 || lat > 90 || typeof lon !== 'number' || !Number.isFinite(lon) || lon < -180 || lon > 180 || typeof gpsAccuracy !== 'number' || !Number.isFinite(gpsAccuracy) || gpsAccuracy < 0 || gpsAccuracy > 20) {
       return res.status(400).json({ error: 'A precise GPS reading with accuracy of 20 metres or better is required. Move to an open area and try again.' });
     }
-    if (agent.firstVisitLocationCapturedAt) {
-      if (sameCapture && Math.abs(agent.registeredLatitude - lat) < 1e-7 && Math.abs(agent.registeredLongitude - lon) < 1e-7) return res.json(agent);
+    if (agent.firstVisitLocationCapturedAt && !needsLocationCapture && !pendingTransfer) {
+      if (sameCapture && Math.abs(agent.registeredLatitude - lat) < 1e-7 && Math.abs(agent.registeredLongitude - lon) < 1e-7) {
+        if (agent.venue === venue) return res.json(agent);
+        const claimed = await prisma.agent.updateMany({ where: { id: agent.id, firstVisitCompletedAt: null, firstVisitLocationCapturedAt: { not: null } }, data: { venue } });
+        if (!claimed.count) return res.status(409).json({ error: 'The agent’s first visit is complete. Only an administrator can change the venue now.' });
+        const updated = await prisma.agent.findUnique({ where: { id: agent.id }, include: { territory: true, sector: true, cell: true, village: true } });
+        await logAction(req.user.id, 'UPDATE_FIRST_VISIT_VENUE', 'Agent', agent.id, { venue }, req);
+        return res.json(updated);
+      }
       return res.status(409).json({ error: 'The first-visit territory and GPS capture has already been recorded. Ask an administrator to correct it.' });
     }
     const updated = await prisma.$transaction(async (tx) => {
-      const resolvedCell = cellId ? { id: cellId } : await findOrCreateChildTerritory(tx, { name: cellName, type: 'CELL', parentId: sectorId });
-      const resolvedVillage = villageId ? { id: villageId } : await findOrCreateChildTerritory(tx, { name: villageName, type: 'VILLAGE', parentId: resolvedCell.id });
+      await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
+      const currentAgent = await tx.agent.findUnique({ where: { id: agent.id }, select: { territoryId: true, sectorId: true, cellId: true, villageId: true, registeredLatitude: true, registeredLongitude: true, locationVerified: true, firstVisitLocationCapturedAt: true, firstVisitCompletedAt: true } });
+      if (!currentAgent || currentAgent.territoryId !== agent.territoryId || currentAgent.sectorId !== agent.sectorId || currentAgent.cellId !== agent.cellId || currentAgent.villageId !== agent.villageId || currentAgent.registeredLatitude !== agent.registeredLatitude || currentAgent.registeredLongitude !== agent.registeredLongitude || currentAgent.locationVerified !== agent.locationVerified || currentAgent.firstVisitLocationCapturedAt?.getTime() !== agent.firstVisitLocationCapturedAt?.getTime() || currentAgent.firstVisitCompletedAt?.getTime() !== agent.firstVisitCompletedAt?.getTime()) {
+        const conflict = new Error('The agent location changed while this capture was in progress. Reload the agent before continuing.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      const resolvedCell = { id: cellId };
+      const resolvedVillage = { id: villageId };
       const resolvedCellId = resolvedCell.id;
       const resolvedVillageId = resolvedVillage.id;
       const hierarchyError = await validateAgentHierarchy({ territoryId, sectorId, cellId: resolvedCellId, villageId: resolvedVillageId }, true, tx);
       if (hierarchyError) throw new Error(hierarchyError);
       const currentAddress = await areaAddress({ territoryId, sectorId, cellId: resolvedCellId, villageId: resolvedVillageId }, tx);
       const claimed = await tx.agent.updateMany({
-        where: { id: agent.id, firstVisitCompletedAt: null, firstVisitLocationCapturedAt: null },
-        data: { territoryId, sectorId, cellId: resolvedCellId, villageId: resolvedVillageId, address: currentAddress, registeredLatitude: lat, registeredLongitude: lon, gpsAccuracy, locationVerified: true, firstVisitLocationCapturedAt: new Date() },
+        where: agent.firstVisitCompletedAt || agent.firstVisitLocationCapturedAt ? {
+          id: agent.id, territoryId: agent.territoryId, registeredLatitude: agent.registeredLatitude, registeredLongitude: agent.registeredLongitude, locationVerified: agent.locationVerified,
+        } : { id: agent.id, firstVisitCompletedAt: null, firstVisitLocationCapturedAt: null },
+        data: { territoryId, sectorId, cellId: resolvedCellId, villageId: resolvedVillageId, venue, address: currentAddress, registeredLatitude: lat, registeredLongitude: lon, gpsAccuracy, locationVerified: true, firstVisitLocationCapturedAt: agent.firstVisitLocationCapturedAt || new Date() },
       });
       if (!claimed.count) {
-        const conflict = new Error('The agent’s first visit has already been completed. Reload the agent before continuing.');
+        const conflict = new Error('The agent location changed while this capture was in progress. Reload the agent before continuing.');
         conflict.statusCode = 409;
         throw conflict;
       }
-      await tx.agentLocation.create({ data: { agentId: agent.id, latitude: lat, longitude: lon, accuracy: gpsAccuracy, recordedById: req.user.id, reason: pendingTransfer ? 'FIRST_VISIT_TRANSFER_LOCATION' : 'FIRST_VISIT_LOCATION_CAPTURE' } });
+      const recaptureAfterMove = Boolean(agent.firstVisitCompletedAt || agent.firstVisitLocationCapturedAt);
+      await tx.agentLocation.create({ data: { agentId: agent.id, latitude: lat, longitude: lon, accuracy: gpsAccuracy, recordedById: req.user.id, reason: pendingTransfer ? 'TRANSFER_LOCATION_CAPTURE' : recaptureAfterMove ? 'RELOCATION_LOCATION_CAPTURE' : 'FIRST_VISIT_LOCATION_CAPTURE' } });
+      if (pendingTransfer) await tx.agentTransfer.update({ where: { id: pendingTransfer.id }, data: { status: 'COMPLETED', completedAt: new Date() } });
       return tx.agent.findUnique({ where: { id: agent.id }, include: { territory: true, sector: true, cell: true, village: true } });
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, pendingTransfer ? 'COMPLETE_AGENT_TRANSFER_LOCATION' : 'CAPTURE_FIRST_VISIT_LOCATION', 'Agent', agent.id, {
+    await logAction(req.user.id, pendingTransfer ? 'COMPLETE_AGENT_TRANSFER_LOCATION' : agent.firstVisitCompletedAt || agent.firstVisitLocationCapturedAt ? 'CAPTURE_AGENT_LOCATION' : 'CAPTURE_FIRST_VISIT_LOCATION', 'Agent', agent.id, {
       latitude: lat, longitude: lon, accuracy: gpsAccuracy, territoryId, sectorId, cellId: updated.cellId, villageId: updated.villageId, transferId: pendingTransfer?.id || null,
-      territoryName: updated.territory?.name, sectorName: updated.sector?.name, cellName: updated.cell?.name, villageName: updated.village?.name,
+      venue, territoryName: updated.territory?.name, sectorName: updated.sector?.name, cellName: updated.cell?.name, villageName: updated.village?.name,
     }, req);
     res.status(201).json(updated);
   } catch (error) {
@@ -387,25 +1081,39 @@ router.post('/:id/location/capture', authenticateToken, requireTerritoryAccess, 
 });
 
 router.get('/:id', authenticateToken, requireTerritoryAccess, requireRole('ADMIN', 'MANAGER', 'TC', 'CHAMPION'), async (req, res) => {
-  const agent = await prisma.agent.findUnique({
-    where: { id: req.params.id },
-    include: { territory: true, sector: true, cell: true, village: true, champion: true }
-  });
-  if (!agent) return res.status(404).json({ error: 'Not found' });
-  if (req.user.role === 'TC') {
-    const assignments = await prisma.tcTerritoryAssignment.findMany({ where: { tcId: req.user.id, isActive: true }, select: { territoryId: true } });
-    const pendingTransfer = await prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, status: 'PENDING' } });
-    if (!assignments.some((assignment) => assignment.territoryId === agent.territoryId) && !pendingTransfer) return res.status(403).json({ error: 'Access denied to this agent.' });
+  try {
+    const agent = await prisma.agent.findUnique({
+      where: { id: req.params.id },
+      include: {
+        territory: true, sector: true, cell: true, village: true, champion: true,
+        transfers: { where: { status: 'PENDING' }, select: { id: true, fromTerritoryId: true, toTerritoryId: true, status: true, acceptedAt: true, requestedAt: true, recipientTcId: true, toTerritory: { select: { id: true, name: true } } } },
+        relocationRequests: { where: { status: 'PENDING', ...(req.user.role === 'TC' ? { requestedByTcId: req.user.id } : {}) }, orderBy: { requestedAt: 'desc' }, take: 1, select: { id: true, toTerritoryId: true, status: true, requestedAt: true, toTerritory: { select: { name: true } } } },
+      }
+    });
+    if (!agent) return res.status(404).json({ error: 'Not found' });
+    if (req.user.role === 'TC') {
+      const [assignments, pendingTransfer, approvedRelocation] = await Promise.all([
+        prisma.tcTerritoryAssignment.findMany({ where: { tcId: req.user.id, isActive: true }, select: { territoryId: true } }),
+        prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, status: 'PENDING' }, select: { id: true } }),
+        prisma.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'APPROVED' }, select: { id: true } }),
+      ]);
+      if (!assignments.some((assignment) => assignment.territoryId === agent.territoryId) && !pendingTransfer) return res.status(403).json({ error: 'Access denied to this agent.' });
+      agent.tcRelocationUsed = Boolean(approvedRelocation);
+    }
+    if (req.user.role === 'CHAMPION' && agent.championId !== req.user.id) return res.status(403).json({ error: 'Access denied to this agent.' });
+    res.json({
+      ...agent,
+      ...(req.user.role === 'ADMIN' ? { personalDetails: {
+        nationalId: decryptPii(agent.nationalIdEncrypted),
+        nextOfKinName: decryptPii(agent.nextOfKinNameEncrypted),
+        nextOfKinPhone: decryptPii(agent.nextOfKinPhoneEncrypted),
+      } } : {}),
+    });
+  } catch (error) {
+    console.error('Get agent error:', error.code || error.name);
+    if (isDatabaseSchemaError(error)) return res.status(503).json({ error: databaseMigrationMessage });
+    res.status(500).json({ error: 'Could not load this agent.' });
   }
-  if (req.user.role === 'CHAMPION' && agent.championId !== req.user.id) return res.status(403).json({ error: 'Access denied to this agent.' });
-  res.json({
-    ...agent,
-    ...(req.user.role === 'ADMIN' ? { personalDetails: {
-      nationalId: decryptPii(agent.nationalIdEncrypted),
-      nextOfKinName: decryptPii(agent.nextOfKinNameEncrypted),
-      nextOfKinPhone: decryptPii(agent.nextOfKinPhoneEncrypted),
-    } } : {}),
-  });
 });
 
 router.put('/:id', authenticateToken, requireRole('ADMIN', 'MANAGER'), async (req, res) => {
@@ -414,9 +1122,13 @@ router.put('/:id', authenticateToken, requireRole('ADMIN', 'MANAGER'), async (re
       registeredLatitude, registeredLongitude, gpsAccuracy, locationVerified,
       nationalId, nextOfKinName, nextOfKinPhone,
       nationalIdEncrypted, nextOfKinNameEncrypted, nextOfKinPhoneEncrypted,
-      relocationConfirmed,
       ...profileFields
     } = req.body;
+    if (profileFields.venue !== undefined) {
+      profileFields.venue = String(profileFields.venue || '').trim();
+      if (!profileFields.venue) return res.status(400).json({ error: 'Enter the agent’s venue.' });
+      if (profileFields.venue.length > 200) return res.status(400).json({ error: 'Venue must be 200 characters or fewer.' });
+    }
     const locationFields = ['territoryId', 'sectorId', 'cellId', 'villageId'];
     const existing = await prisma.agent.findUnique({ where: { id: req.params.id } });
     if (!existing) return res.status(404).json({ error: 'Agent not found.' });
@@ -430,16 +1142,10 @@ router.put('/:id', authenticateToken, requireRole('ADMIN', 'MANAGER'), async (re
         villageId: profileFields.villageId !== undefined ? profileFields.villageId : existing.villageId,
       });
       if (hierarchyError) return res.status(400).json({ error: hierarchyError });
-      if (typeof registeredLatitude !== 'number' || !Number.isFinite(registeredLatitude) || registeredLatitude < -90 || registeredLatitude > 90
-        || typeof registeredLongitude !== 'number' || !Number.isFinite(registeredLongitude) || registeredLongitude < -180 || registeredLongitude > 180
-        || typeof gpsAccuracy !== 'number' || !Number.isFinite(gpsAccuracy) || gpsAccuracy < 0 || gpsAccuracy > 20) {
-        return res.status(400).json({ error: 'Capture the agent’s new GPS location with accuracy of 20 metres or better before relocating them.' });
-      }
-      if (relocationConfirmed !== true) return res.status(400).json({ error: 'Capture the new GPS location during this relocation before saving it.' });
-      profileFields.registeredLatitude = registeredLatitude;
-      profileFields.registeredLongitude = registeredLongitude;
-      profileFields.gpsAccuracy = gpsAccuracy;
-      profileFields.locationVerified = true;
+      profileFields.registeredLatitude = null;
+      profileFields.registeredLongitude = null;
+      profileFields.gpsAccuracy = null;
+      profileFields.locationVerified = false;
       profileFields.address = await areaAddress({
         territoryId: profileFields.territoryId !== undefined ? profileFields.territoryId : existing.territoryId,
         sectorId: profileFields.sectorId !== undefined ? profileFields.sectorId : existing.sectorId,
@@ -451,11 +1157,23 @@ router.put('/:id', authenticateToken, requireRole('ADMIN', 'MANAGER'), async (re
     if (nextOfKinName !== undefined) profileFields.nextOfKinNameEncrypted = encryptPii(nextOfKinName);
     if (nextOfKinPhone !== undefined) profileFields.nextOfKinPhoneEncrypted = encryptPii(nextOfKinPhone);
     const agent = await prisma.$transaction(async (tx) => {
-      const updated = await tx.agent.update({ where: { id: req.params.id }, data: profileFields });
-      if (locationChanged) await tx.agentLocation.create({ data: {
-        agentId: updated.id, latitude: registeredLatitude, longitude: registeredLongitude, accuracy: gpsAccuracy,
-        recordedById: req.user.id, reason: String(req.body.reason || '').trim().slice(0, 500) || 'Administrator relocation',
-      } });
+      if (locationChanged) await lockAgentMoveAndCheckPending(tx, existing.id);
+      const updatedCount = await tx.agent.updateMany({
+        where: locationChanged ? {
+          id: req.params.id,
+          territoryId: existing.territoryId,
+          sectorId: existing.sectorId,
+          cellId: existing.cellId,
+          villageId: existing.villageId,
+        } : { id: req.params.id },
+        data: profileFields,
+      });
+      if (!updatedCount.count) {
+        const conflict = new Error('The agent record changed before this update was saved. Reload it and try again.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      const updated = await tx.agent.findUnique({ where: { id: req.params.id } });
       return updated;
     });
     const updatedPersonalData = ['nationalId', 'nextOfKinName', 'nextOfKinPhone'].some((field) => req.body[field] !== undefined);
@@ -472,6 +1190,7 @@ router.put('/:id', authenticateToken, requireRole('ADMIN', 'MANAGER'), async (re
     }, req);
     res.json(agent);
   } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
     res.status(400).json({ error: 'Update failed' });
   }
 });
@@ -481,26 +1200,42 @@ router.patch('/:id/location', authenticateToken, requireRole('ADMIN'), async (re
     const { latitude, longitude, accuracy } = req.body;
     const existing = await prisma.agent.findUnique({ where: { id: req.params.id } });
     if (!existing) return res.status(404).json({ error: 'Agent not found.' });
-    if (typeof latitude !== 'number' || !Number.isFinite(latitude) || latitude < -90 || latitude > 90 || typeof longitude !== 'number' || !Number.isFinite(longitude) || longitude < -180 || longitude > 180 || typeof accuracy !== 'number' || !Number.isFinite(accuracy) || accuracy < 0 || accuracy > 20) {
-      return res.status(400).json({ error: 'A GPS reading with accuracy of 20 metres or better is required.' });
-    }
     
     const nextTerritoryId = req.body.territoryId !== undefined ? req.body.territoryId : existing.territoryId;
     const nextSectorId = req.body.sectorId !== undefined ? req.body.sectorId : existing.sectorId;
     const nextCellId = req.body.cellId !== undefined ? req.body.cellId : existing.cellId;
     const nextVillageId = req.body.villageId !== undefined ? req.body.villageId : existing.villageId;
     const moved = existing.territoryId !== nextTerritoryId || existing.sectorId !== nextSectorId || existing.cellId !== nextCellId || existing.villageId !== nextVillageId;
+    if (!moved && (typeof latitude !== 'number' || !Number.isFinite(latitude) || latitude < -90 || latitude > 90 || typeof longitude !== 'number' || !Number.isFinite(longitude) || longitude < -180 || longitude > 180 || typeof accuracy !== 'number' || !Number.isFinite(accuracy) || accuracy < 0 || accuracy > 20)) {
+      return res.status(400).json({ error: 'A GPS reading with accuracy of 20 metres or better is required for a location correction.' });
+    }
     const hierarchyError = await validateAgentHierarchy({ territoryId: nextTerritoryId, sectorId: nextSectorId, cellId: nextCellId, villageId: nextVillageId }, moved);
     if (hierarchyError) return res.status(400).json({ error: hierarchyError });
     const reason = String(req.body.reason || '').trim().slice(0, 500) || (moved ? 'Administrator relocation' : 'Administrator GPS correction');
     const currentAddress = moved ? await areaAddress({ territoryId: nextTerritoryId, sectorId: nextSectorId, cellId: nextCellId, villageId: nextVillageId }) : undefined;
     const agent = await prisma.$transaction(async (tx) => {
-      const updated = await tx.agent.update({ where: { id: req.params.id }, data: {
+      await lockAgentMoveAndCheckPending(tx, existing.id);
+      const updatedCount = await tx.agent.updateMany({ where: {
+        id: req.params.id,
+        territoryId: existing.territoryId,
+        sectorId: existing.sectorId,
+        cellId: existing.cellId,
+        villageId: existing.villageId,
+      }, data: {
         territoryId: nextTerritoryId, sectorId: nextSectorId, cellId: nextCellId, villageId: nextVillageId,
         ...(currentAddress !== undefined ? { address: currentAddress } : {}),
-        registeredLatitude: latitude, registeredLongitude: longitude, gpsAccuracy: accuracy, locationVerified: true,
+        registeredLatitude: moved ? null : latitude,
+        registeredLongitude: moved ? null : longitude,
+        gpsAccuracy: moved ? null : accuracy,
+        locationVerified: !moved,
       } });
-      await tx.agentLocation.create({ data: { agentId: updated.id, latitude, longitude, accuracy, recordedById: req.user.id, reason } });
+      if (!updatedCount.count) {
+        const conflict = new Error('The agent’s location changed before the relocation was saved. Reload the agent list and try again.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      const updated = await tx.agent.findUnique({ where: { id: req.params.id } });
+      if (!moved) await tx.agentLocation.create({ data: { agentId: updated.id, latitude, longitude, accuracy, recordedById: req.user.id, reason } });
       return updated;
     });
     await logAction(req.user.id, moved ? 'ADMIN_RELOCATE_AGENT' : 'ADMIN_UPDATE_AGENT_LOCATION', 'Agent', agent.id, {
@@ -512,6 +1247,8 @@ router.patch('/:id/location', authenticateToken, requireRole('ADMIN'), async (re
     }, req);
     res.json(agent);
   } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    console.error('Administrator agent relocation failed:', error.code || error.name);
     res.status(400).json({ error: 'Location update failed' });
   }
 });
@@ -537,6 +1274,13 @@ router.get('/:id/location-history', authenticateToken, requireTerritoryAccess, r
     include: { recordedBy: { select: { id: true, username: true } } }
   });
   res.json({ data: history, meta: { total, page, limit, pages } });
+});
+
+router.use((error, _req, res, next) => {
+  console.error('Unhandled agent request error:', error.code || error.name);
+  if (res.headersSent) return next(error);
+  if (isDatabaseSchemaError(error)) return res.status(503).json({ error: databaseMigrationMessage });
+  return res.status(500).json({ error: 'Could not complete the agent request.' });
 });
 
 module.exports = router;

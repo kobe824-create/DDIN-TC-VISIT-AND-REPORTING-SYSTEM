@@ -7,14 +7,7 @@ import {
 import api from '../api';
 import { useAuth } from '../AuthContext';
 import { ErrorState, ListPagination, LoadingState, StatusBadge } from '../components';
-
-const periods = [
-  { key: 'today', label: 'Today' },
-  { key: 'yesterday', label: 'Yesterday' },
-  { key: 'thisWeek', label: 'This week' },
-  { key: 'thisMonth', label: 'This month' },
-  { key: 'customDate', label: 'Choose a date…' },
-];
+import FieldPerformance from '../components/FieldPerformance';
 
 const formatDate = (value, options) => value ? new Intl.DateTimeFormat('en-GB', options).format(new Date(value)) : '—';
 const localDateValue = (date) => {
@@ -34,8 +27,8 @@ function MetricCard({ index, label, value, caption }) {
 export default function Dashboard() {
   const { user } = useAuth();
   const navigate = useNavigate();
-  const [period, setPeriod] = useState('today');
-  const [selectedDate, setSelectedDate] = useState(() => localDateValue(new Date()));
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate] = useState('');
   const [dashboard, setDashboard] = useState(null);
   const [visits, setVisits] = useState([]);
   const [visitTotal, setVisitTotal] = useState(0);
@@ -48,29 +41,30 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const initialDashboardLoad = useRef(true);
+  const dashboardRequest = useRef(0);
   const role = user?.role?.toUpperCase();
   const canStartVisit = role === 'TC';
 
   const loadDashboard = useCallback(async () => {
+    const requestId = ++dashboardRequest.current;
     if (initialDashboardLoad.current) setLoading(true);
     setError('');
     try {
-      const params = { period, ...(period === 'customDate' ? { date: selectedDate } : {}) };
+      const params = { fromDate: fromDate || undefined, toDate: toDate || undefined };
       const { data } = await api.get('/api/v1/reports/dashboard', { params });
+      if (requestId !== dashboardRequest.current) return;
       setDashboard(data);
       initialDashboardLoad.current = false;
     } catch (err) {
-      setError(err.response?.data?.error || err.message || 'The dashboard could not be loaded.');
+      if (requestId === dashboardRequest.current) setError(err.response?.data?.error || err.message || 'The dashboard could not be loaded.');
     } finally {
-      setLoading(false);
+      if (requestId === dashboardRequest.current) setLoading(false);
     }
-  }, [period, selectedDate]);
+  }, [fromDate, toDate]);
 
   useEffect(() => { loadDashboard(); }, [loadDashboard]);
 
-  const activeRange = period === 'customDate' && dashboard?.selectedDate !== selectedDate
-    ? null
-    : dashboard?.dateRanges?.[period];
+  const activeRange = dashboard?.selectedRange;
 
   useEffect(() => {
     if (!activeRange?.fromDate || !activeRange?.toDate) return undefined;
@@ -96,23 +90,15 @@ export default function Dashboard() {
     if (visitPage > Math.max(visitPages, 1)) setVisitPage(Math.max(visitPages, 1));
   }, [visitPage, visitPages]);
 
-  const stats = period === 'customDate' && dashboard?.selectedDate !== selectedDate
-    ? {}
-    : dashboard?.stats?.[period] || {};
+  const stats = dashboard?.stats?.selected || {};
   const flagged = Number(stats.flaggedVisitsCount || 0);
   const verifiedRate = valueOrZero(stats.verifiedVisitRate);
   const greetingName = user?.firstName || user?.name || user?.username || 'there';
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
-  const activityDescription = period === 'yesterday'
-    ? 'Showing activity recorded yesterday.'
-    : period === 'thisWeek'
-      ? 'Showing activity recorded this week.'
-      : period === 'thisMonth'
-        ? 'Showing activity recorded this month.'
-        : period === 'customDate'
-          ? `Showing activity recorded on ${formatDate(`${selectedDate}T00:00:00`, { day: 'numeric', month: 'long', year: 'numeric' })}.`
-          : 'Showing activity recorded today.';
+  const activityDescription = dashboard?.selectedRange
+    ? `Showing activity from ${formatDate(`${dashboard.selectedRange.fromDate}T00:00:00`, { day: 'numeric', month: 'short', year: 'numeric' })} through ${formatDate(`${dashboard.selectedRange.toDate}T00:00:00`, { day: 'numeric', month: 'short', year: 'numeric' })}.`
+    : 'Choose a date range for dashboard activity.';
 
   if (loading) return <div className="dashboard-page"><LoadingState type="cards" message="Loading your operations overview…" /></div>;
   if (error && !dashboard) return <div className="dashboard-page"><ErrorState message={error} onRetry={loadDashboard} /></div>;
@@ -124,16 +110,13 @@ export default function Dashboard() {
         <h2>{greeting}, {greetingName}</h2>
         <p>{activityDescription} Data covers your authorized areas.</p>
       </div>
-      <div className={`welcome-actions${period === 'customDate' ? ' has-custom-date' : ''}`}>
-        <label className="period-select-wrap" htmlFor="dashboard-period"><span className="sr-only">Reporting period</span>
-          <select id="dashboard-period" className="period-select" value={period} onChange={(event) => { setPeriod(event.target.value); setVisitPage(1); }}>
-            {periods.map((item) => <option value={item.key} key={item.key}>{item.label}</option>)}
-          </select>
+      <div className="welcome-actions dashboard-range-controls">
+        <label className="dashboard-date-wrap" htmlFor="dashboard-from"><span>From (optional)</span>
+          <input id="dashboard-from" className="period-select period-date-input" type="date" value={fromDate} max={toDate || localDateValue(new Date())} onChange={(event) => { setFromDate(event.target.value); setVisitPage(1); }} />
         </label>
-        {period === 'customDate' && <label className="dashboard-date-wrap" htmlFor="dashboard-date">
-          <span className="sr-only">Choose activity date</span>
-          <input id="dashboard-date" className="period-select period-date-input" type="date" value={selectedDate} max={localDateValue(new Date())} onChange={(event) => { if (event.target.value) { setSelectedDate(event.target.value); setVisitPage(1); } }} />
-        </label>}
+        <label className="dashboard-date-wrap" htmlFor="dashboard-through"><span>Through (optional)</span>
+          <input id="dashboard-through" className="period-select period-date-input" type="date" value={toDate} min={fromDate || undefined} max={localDateValue(new Date())} onChange={(event) => { setToDate(event.target.value); setVisitPage(1); }} />
+        </label>
         {canStartVisit && <button className="btn btn-primary" onClick={() => navigate('/visits/new')}><Plus size={17} />Start a visit</button>}
       </div>
     </section>
@@ -145,6 +128,8 @@ export default function Dashboard() {
       <MetricCard index="03" label="Verified visits" value={`${verifiedRate.toFixed(0)}%`} caption="Location checks passed" />
       <MetricCard index="04" label="Needs review" value={flagged} caption="Outside the allowed radius" />
     </section>
+
+    {['TC', 'ADMIN', 'MANAGER'].includes(role) && <FieldPerformance role={role} fromDate={dashboard?.selectedRange?.fromDate} toDate={dashboard?.selectedRange?.toDate} />}
 
     <section className="surface-card field-activity-card" aria-label="First visit and territory changes">
       <div className="surface-heading">

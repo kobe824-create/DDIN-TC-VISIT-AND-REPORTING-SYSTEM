@@ -7,7 +7,7 @@ import PageHeader from '../components/PageHeader';
 import FormField from '../components/FormField';
 import { LoadingState } from '../components';
 
-const emptyForm = { agentId: '', name: '', phoneNumber: '', businessName: '', address: '', nationalId: '', nextOfKinName: '', nextOfKinPhone: '', territoryId: '', sectorId: '', cellId: '', villageId: '', championId: '', status: 'ACTIVE', registeredLatitude: '', registeredLongitude: '', gpsAccuracy: '' };
+const emptyForm = { agentId: '', name: '', phoneNumber: '', businessName: '', venue: '', address: '', nationalId: '', nextOfKinName: '', nextOfKinPhone: '', territoryId: '', sectorId: '', cellId: '', villageId: '', championId: '', status: 'ACTIVE', registeredLatitude: '', registeredLongitude: '', gpsAccuracy: '' };
 
 export default function AgentForm() {
   const { id } = useParams();
@@ -44,7 +44,7 @@ export default function AgentForm() {
           const agent = agentResponse.data;
           setForm({
             agentId: agent.agentId || '', name: agent.name || '', phoneNumber: agent.phoneNumber || '',
-            businessName: agent.businessName || '', address: agent.address || '', territoryId: agent.territoryId || '',
+            businessName: agent.businessName || '', venue: agent.venue || '', address: agent.address || '', territoryId: agent.territoryId || '',
             nationalId: agent.personalDetails?.nationalId || '', nextOfKinName: agent.personalDetails?.nextOfKinName || '', nextOfKinPhone: agent.personalDetails?.nextOfKinPhone || '',
             sectorId: agent.sectorId || '', cellId: agent.cellId || '', villageId: agent.villageId || '', championId: agent.championId || '', status: agent.status || 'ACTIVE',
             registeredLatitude: agent.registeredLatitude ?? '', registeredLongitude: agent.registeredLongitude ?? '', gpsAccuracy: agent.gpsAccuracy ?? '',
@@ -78,15 +78,15 @@ export default function AgentForm() {
   const submit = async (event) => {
     event.preventDefault();
     setError('');
-    if (!form.agentId.trim() || !form.name.trim() || !form.phoneNumber.trim() || !form.territoryId || !form.sectorId) {
-      setError('Complete the agent identity, phone, district and sector. GPS can be captured during the first visit.');
+    if (!form.agentId.trim() || !form.name.trim() || !form.phoneNumber.trim() || !form.venue.trim() || !form.territoryId || !form.sectorId) {
+      setError('Complete the agent identity, phone, venue, district and sector. GPS can be captured during the first visit.');
       return;
     }
     setSaving(true);
     try {
       const payload = {
         agentId: form.agentId.trim(), name: form.name.trim(), phoneNumber: form.phoneNumber.trim(),
-        businessName: form.businessName.trim() || null, address: form.address.trim() || null,
+        businessName: form.businessName.trim() || null, venue: form.venue.trim(), address: form.address.trim() || null,
         ...(user?.role === 'ADMIN' ? { nationalId: form.nationalId.trim() || null, nextOfKinName: form.nextOfKinName.trim() || null, nextOfKinPhone: form.nextOfKinPhone.trim() || null } : {}),
         territoryId: form.territoryId, sectorId: form.sectorId || null, cellId: form.cellId || null, villageId: form.villageId || null, championId: form.championId || null,
         status: form.status, registeredLatitude: form.registeredLatitude === '' ? null : Number(form.registeredLatitude), registeredLongitude: form.registeredLongitude === '' ? null : Number(form.registeredLongitude),
@@ -95,10 +95,9 @@ export default function AgentForm() {
       if (isEdit) {
         const existing = await api.get(`/api/v1/agents/${id}`);
         const territoryMoved = ['territoryId', 'sectorId', 'cellId', 'villageId'].some((field) => (payload[field] || null) !== (existing.data[field] || null));
-        if (territoryMoved && user?.role === 'ADMIN' && !gpsRecaptured) throw new Error('Capture the agent’s new GPS position before changing their territory.');
         await api.put(`/api/v1/agents/${id}`, {
           ...payload,
-          ...(territoryMoved ? { relocationConfirmed: gpsRecaptured, reason: locationReason.trim() } : {
+          ...(territoryMoved ? { reason: locationReason.trim() } : {
             registeredLatitude: existing.data.registeredLatitude, registeredLongitude: existing.data.registeredLongitude,
             gpsAccuracy: existing.data.gpsAccuracy, locationVerified: existing.data.locationVerified,
           }),
@@ -131,6 +130,7 @@ export default function AgentForm() {
             <FormField.Input label="Full name" value={form.name} onChange={(event) => update('name', event.target.value)} required placeholder="Agent’s full name" />
             <FormField.Input type="tel" label="Phone number" value={form.phoneNumber} onChange={(event) => update('phoneNumber', event.target.value)} required placeholder="+250 …" />
             <FormField.Input label="Business name" value={form.businessName} onChange={(event) => update('businessName', event.target.value)} placeholder="Optional" />
+            <FormField.Input label="Venue" value={form.venue} onChange={(event) => update('venue', event.target.value)} required maxLength={200} placeholder="Market, building or business centre" />
             <div className="form-span-two"><FormField.Textarea label="Business address" value={form.address} onChange={(event) => update('address', event.target.value)} rows={2} placeholder="Street, landmark or directions" /></div>
             {user?.role === 'ADMIN' && <>
               <FormField.Input label="National ID" value={form.nationalId} onChange={(event) => update('nationalId', event.target.value)} placeholder="Stored encrypted" />
@@ -151,12 +151,12 @@ export default function AgentForm() {
           </div>
         </section>
         <section className="surface-card form-section">
-          <div className="form-section-heading"><span className="detail-icon photo-icon"><MapPin size={17} /></span><div><h2>Registered GPS location</h2><p>This is the location used to verify in-person visits.</p></div></div>
+          <div className="form-section-heading"><span className="detail-icon photo-icon"><MapPin size={17} /></span><div><h2>Registered GPS location</h2><p>This point verifies in-person visits. After a relocation, the TC records a fresh point during the next visit.</p></div></div>
           <div className="gps-capture-row"><div className="form-grid-two gps-fields">
             <FormField.Input type="number" step="any" label="Latitude" value={form.registeredLatitude} readOnly placeholder="Captured from GPS" />
             <FormField.Input type="number" step="any" label="Longitude" value={form.registeredLongitude} readOnly placeholder="Captured from GPS" />
           </div>{canEditAgentTerritory && <button type="button" className="btn btn-secondary capture-location-button" onClick={captureLocation}><LocateFixed size={16} />Use my location</button>}</div>
-          {form.gpsAccuracy !== '' ? <p className="gps-accuracy-note">GPS accuracy at capture: ±{form.gpsAccuracy} m</p> : <p className="gps-accuracy-note">GPS can be recorded here or captured by the TC on the agent’s first visit.</p>}
+          {form.gpsAccuracy !== '' ? <p className="gps-accuracy-note">GPS accuracy at capture: ±{form.gpsAccuracy} m</p> : <p className="gps-accuracy-note">Use this for initial registration or a GPS correction without moving territory. Relocations clear GPS; the TC captures it during the next visit.</p>}
           {isEdit && <div className="form-reason-field"><FormField.Input label="Reason for changing registered location" value={locationReason} onChange={(event) => setLocationReason(event.target.value)} placeholder="For example, agent moved to a new storefront" /></div>}
         </section>
         <div className="form-submit-row"><button type="button" className="btn btn-secondary" onClick={() => navigate(isEdit ? `/agents/${id}` : '/agents')}>Cancel</button><button type="submit" className="btn btn-primary" disabled={saving}><Save size={16} />{saving ? 'Saving agent…' : isEdit ? 'Save changes' : 'Register agent'}</button></div>

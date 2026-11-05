@@ -1,10 +1,14 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { CheckCircle2, ChevronLeft, ChevronRight, MapPin, Plus, Search, UsersRound } from 'lucide-react';
+import { ArrowRightLeft, CheckCircle2, ChevronLeft, ChevronRight, MapPin, Plus, Search, UsersRound } from 'lucide-react';
 import { useAuth } from '../AuthContext';
 import api from '../api';
 import PageHeader from '../components/PageHeader';
 import { EmptyState, ErrorState, LoadingState, StatusBadge } from '../components';
+import AdminAgentRelocation from '../components/AdminAgentRelocation';
+
+const hasPendingRelocation = (agent) => Boolean(agent.relocationRequests?.length);
+const activeTransfer = (agent) => agent.transfers?.find((transfer) => transfer.status === 'PENDING');
 
 export default function AgentList() {
   const { user } = useAuth();
@@ -20,8 +24,11 @@ export default function AgentList() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
   const [retryKey, setRetryKey] = useState(0);
+  const [relocationAgent, setRelocationAgent] = useState(null);
+  const [notice, setNotice] = useState('');
   const role = user?.role?.toUpperCase();
   const canCreate = ['ADMIN', 'MANAGER', 'TC'].includes(role);
+  const canRelocate = role === 'ADMIN';
 
   const loadAgents = useCallback(async (signal) => {
     setLoading(true);
@@ -81,7 +88,7 @@ export default function AgentList() {
         <input
           value={search}
           onChange={(event) => { setSearch(event.target.value); setPage(1); }}
-          placeholder="Search name, phone, agent ID or business"
+          placeholder="Search name, phone, agent ID, business or venue"
           aria-label="Search agents"
         />
       </label>
@@ -103,16 +110,24 @@ export default function AgentList() {
       <span className="agent-result-count">{total.toLocaleString()} agents</span>
     </section>
 
+    {notice && <p className="admin-relocation-toast" role="status">{notice}</p>}
     {error && <ErrorState message={error} onRetry={() => setRetryKey((key) => key + 1)} />}
     {loading ? <LoadingState message="Loading agents…" /> : !error && <section className="surface-card agent-table-card">
       {agents.length ? <>
-        <div className="table-scroll"><table className="data-table agent-table"><thead><tr><th>Agent</th><th>Business</th><th>Territory</th><th>Champion</th><th>Status</th><th>Registered GPS</th></tr></thead><tbody>{agents.map((agent) => <tr key={agent.id} onClick={() => navigate(`/agents/${agent.id}`)} tabIndex="0" onKeyDown={(event) => event.target === event.currentTarget && event.key === 'Enter' && navigate(`/agents/${agent.id}`)}>
+        <div className="table-scroll"><table className="data-table agent-table"><thead><tr><th>Agent</th><th>Business</th><th>Venue</th><th>Territory</th><th>Champion</th><th>Status</th><th>Registered GPS</th>{canRelocate && <th>Admin action</th>}</tr></thead><tbody>{agents.map((agent) => <tr key={agent.id} onClick={() => navigate(`/agents/${agent.id}`)} tabIndex="0" onKeyDown={(event) => event.target === event.currentTarget && event.key === 'Enter' && navigate(`/agents/${agent.id}`)}>
           <td><div className="table-person"><span className="table-avatar">{(agent.name || 'A').slice(0, 1).toUpperCase()}</span><span><strong>{agent.name}</strong><small>{agent.agentId}</small>{agent.phoneNumber && <a className="agent-phone-link" href={`tel:${agent.phoneNumber.replace(/[^\d+]/g, '')}`} aria-label={`Call ${agent.name}`} onClick={(event) => event.stopPropagation()}>{agent.phoneNumber}</a>}</span></div></td>
           <td>{agent.businessName || <span className="muted-dash">—</span>}</td>
+          <td>{agent.venue || <span className="muted-dash">—</span>}</td>
           <td>{agent.territory?.name || '—'}{agent.sector?.name ? <small className="visit-subtext">{agent.sector.name}</small> : null}</td>
           <td>{agent.champion ? `${agent.champion.firstName || ''} ${agent.champion.lastName || ''}`.trim() : <span className="muted-dash">Unassigned</span>}</td>
           <td><StatusBadge status={agent.status} /></td>
           <td><span className={`location-result ${agent.locationVerified ? 'verified' : 'needs-review'}`}><span />{agent.locationVerified ? 'Verified' : 'Unverified'}</span></td>
+          {canRelocate && <td>{hasPendingRelocation(agent)
+            ? <button type="button" className="agent-relocate-button" onClick={(event) => { event.stopPropagation(); navigate('/dashboard'); }}>Review request</button>
+            : activeTransfer(agent)
+              ? <span className="agent-move-pending">{activeTransfer(agent).acceptedAt ? 'Accepted · first visit GPS pending' : 'Awaiting TC review'}</span>
+              : <button type="button" className="agent-relocate-button" onClick={(event) => { event.stopPropagation(); setNotice(''); setRelocationAgent(agent); }} aria-label={`Relocate ${agent.name}`}><ArrowRightLeft size={15} />Relocate</button>}
+          </td>}
         </tr>)}</tbody></table></div>
         <div className="agent-pagination">
           <span className="agent-pagination-range">Showing {firstResult.toLocaleString()}–{lastResult.toLocaleString()} of {total.toLocaleString()}</span>
@@ -123,7 +138,8 @@ export default function AgentList() {
           </div>
         </div>
       </> : <EmptyState icon={UsersRound} title="No agents found" message={search || status ? 'Try changing your filters.' : 'Agents registered in your assigned areas will appear here.'} actionLabel={canCreate ? 'Register an agent' : undefined} action={canCreate ? () => navigate('/agents/new') : undefined} />}
-      <div className="card-footnote"><MapPin size={14} /><span>Agent GPS is stored as the registered visit location and updated with a location history record.</span></div>
+      <div className="card-footnote"><MapPin size={14} /><span>Agent GPS is stored as the registered visit location and updated with a location history record.{canRelocate ? ' Use Relocate to update an agent’s territory and capture a fresh GPS point.' : ''}</span></div>
     </section>}
+    {relocationAgent && <AdminAgentRelocation agent={relocationAgent} onClose={() => setRelocationAgent(null)} onSaved={() => { setRelocationAgent(null); setNotice(`${relocationAgent.name} was relocated and the agent list is being refreshed.`); setRetryKey((key) => key + 1); }} />}
   </div>;
 }

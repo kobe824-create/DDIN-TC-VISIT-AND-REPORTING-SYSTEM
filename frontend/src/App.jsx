@@ -21,6 +21,7 @@ import ConfigPage from './pages/ConfigPage';
 import AuditLogs from './pages/AuditLogs';
 import ProfilePage from './pages/ProfilePage';
 import BulkImport from './pages/BulkImport';
+import SectorGroups from './pages/SectorGroups';
 
 const ProtectedRoute = ({ children, allowedRoles }) => {
   const { isAuthenticated, user } = useAuth();
@@ -53,6 +54,7 @@ const AppRoutes = () => {
 
         {/* Agents */}
         <Route path="/agents" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER', 'TC', 'CHAMPION']}><AgentList /></ProtectedRoute>} />
+        <Route path="/sector-groups" element={<ProtectedRoute allowedRoles={['TC']}><SectorGroups /></ProtectedRoute>} />
         <Route path="/agents/new" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER', 'TC']}><AgentForm /></ProtectedRoute>} />
         <Route path="/agents/:id" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER', 'TC', 'CHAMPION']}><AgentDetail /></ProtectedRoute>} />
         <Route path="/agents/:id/edit" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER']}><AgentForm /></ProtectedRoute>} />

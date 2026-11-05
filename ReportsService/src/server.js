@@ -21,6 +21,7 @@ app.get('/ready', async (req, res) => {
   }
 });
 app.use('/api/v1/reports', require('./routes/reports'));
+app.use('/api/v1/reports/field-progress', require('./routes/fieldProgress'));
 app.use('/api/v1/config', require('./routes/config'));
 
 const PORT = process.env.PORT || 3004;

@@ -15,9 +15,9 @@ async function visitScope(user) {
 function dateFilter(fromDate, toDate) {
   if (!fromDate && !toDate) return undefined;
   const filter = {};
-  if (fromDate) filter.gte = new Date(`${fromDate}T00:00:00.000Z`);
+  if (fromDate) filter.gte = new Date(`${fromDate}T00:00:00.000+02:00`);
   if (toDate) {
-    const exclusiveEnd = new Date(`${toDate}T00:00:00.000Z`);
+    const exclusiveEnd = new Date(`${toDate}T00:00:00.000+02:00`);
     exclusiveEnd.setUTCDate(exclusiveEnd.getUTCDate() + 1);
     filter.lt = exclusiveEnd;
   }
@@ -45,6 +45,23 @@ function kigaliDayRange(dateKey) {
   return { gte: start, lt: end };
 }
 
+function validDateKey(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+function selectedDateWindow(fromValue, toValue, todayKey) {
+  const toDate = toValue || todayKey;
+  const fromDate = fromValue || `${toDate.slice(0, 7)}-01`;
+  if (!validDateKey(fromDate) || !validDateKey(toDate) || fromDate > toDate || toDate > todayKey) {
+    return { error: 'Choose a valid date range ending today or earlier.' };
+  }
+  const days = Math.floor((new Date(`${toDate}T00:00:00Z`) - new Date(`${fromDate}T00:00:00Z`)) / 86400000) + 1;
+  if (days > 366) return { error: 'Choose a date range of 366 days or less.' };
+  return { fromDate, toDate, range: { ...kigaliDayRange(fromDate), lt: kigaliDayRange(addCalendarDays(toDate, 1)).lt } };
+}
+
 function serializableRange(range) {
   return {
     fromDate: range.gte.toISOString(),
@@ -64,52 +81,45 @@ router.get('/dashboard', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC'
       ? { territoryId: scope.territoryId }
       : req.user.role === 'CHAMPION' ? { championId: req.user.id } : {};
     const todayKey = kigaliDateKey(new Date());
-    const utcCalendarToday = new Date(`${todayKey}T00:00:00.000Z`);
-    const weekStartKey = addCalendarDays(todayKey, -utcCalendarToday.getUTCDay());
-    const monthStartKey = `${todayKey.slice(0, 7)}-01`;
-    const timeFilters = {
-      today: kigaliDayRange(todayKey),
-      yesterday: kigaliDayRange(addCalendarDays(todayKey, -1)),
-      thisWeek: { ...kigaliDayRange(weekStartKey), lt: kigaliDayRange(addCalendarDays(todayKey, 1)).lt },
-      thisMonth: { ...kigaliDayRange(monthStartKey), lt: kigaliDayRange(addCalendarDays(todayKey, 1)).lt },
-    };
-    const dateRanges = Object.fromEntries(Object.entries(timeFilters).map(([period, range]) => [period, serializableRange(range)]));
-    let selectedDate = null;
-    if (req.query.date !== undefined) {
-      selectedDate = String(req.query.date);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) return res.status(400).json({ error: 'Choose a valid calendar date.' });
-      const selectedCalendarDate = new Date(`${selectedDate}T00:00:00.000Z`);
-      if (Number.isNaN(selectedCalendarDate.getTime()) || selectedCalendarDate.toISOString().slice(0, 10) !== selectedDate) {
-        return res.status(400).json({ error: 'Choose a valid calendar date.' });
-      }
-      timeFilters.customDate = kigaliDayRange(selectedDate);
-      dateRanges.customDate = serializableRange(timeFilters.customDate);
-    }
-    const totalActiveAgents = await prisma.agent.count({ where: { ...agentScope, status: 'ACTIVE' } });
-    const stats = {};
-
-    for (const [period, visitDate] of Object.entries(timeFilters)) {
-      const visits = await prisma.visit.findMany({ where: { ...scope, visitDate } });
-      const completedVisits = visits.filter(({ visitStatus }) => ['COMPLETED', 'FLAGGED'].includes(visitStatus));
-      const uniqueAgentsVisited = new Set(visits.map(({ agentId }) => agentId)).size;
-      const verifiedVisits = completedVisits.filter(({ locationStatus }) => locationStatus === 'VERIFIED').length;
-      const flaggedVisitsCount = visits.filter(({ locationStatus }) => locationStatus !== 'VERIFIED').length;
-      const distances = visits.map(({ distanceMeters }) => distanceMeters).filter(Number.isFinite);
-      stats[period] = {
-        totalVisits: visits.length,
-        completedVisits: completedVisits.length,
-        totalActiveAgents,
-        coverageRate: totalActiveAgents ? `${(uniqueAgentsVisited / totalActiveAgents * 100).toFixed(2)}%` : '0%',
-        verifiedVisitRate: completedVisits.length ? `${(verifiedVisits / completedVisits.length * 100).toFixed(2)}%` : '0%',
-        flaggedVisitsCount,
-        averageDistance: distances.length ? `${(distances.reduce((sum, distance) => sum + distance, 0) / distances.length).toFixed(2)}m` : '0m',
-      };
-    }
-
-    const activityPeriod = req.query.period === 'customDate' && timeFilters.customDate
-      ? 'customDate'
-      : Object.hasOwn(timeFilters, req.query.period) ? req.query.period : 'today';
-    const activityRange = timeFilters[activityPeriod];
+    const selected = selectedDateWindow(String(req.query.fromDate || ''), String(req.query.toDate || ''), todayKey);
+    if (selected.error) return res.status(400).json({ error: selected.error });
+    const range = selected.range;
+    const dateRanges = { selected: serializableRange(range) };
+    const [totalActiveAgents, row] = await Promise.all([
+      prisma.agent.count({ where: { ...agentScope, status: 'ACTIVE' } }),
+      prisma.$queryRaw`
+          SELECT
+            COUNT(*) AS "totalVisits",
+            COUNT(*) FILTER (WHERE v."visitStatus"::text IN ('COMPLETED', 'FLAGGED')) AS "completedVisits",
+            COUNT(DISTINCT v."agentId") AS "uniqueAgentsVisited",
+            COUNT(*) FILTER (WHERE v."visitStatus"::text IN ('COMPLETED', 'FLAGGED') AND v."locationStatus"::text = 'VERIFIED') AS "verifiedVisits",
+            COUNT(*) FILTER (WHERE v."locationStatus"::text IS DISTINCT FROM 'VERIFIED') AS "flaggedVisitsCount",
+            AVG(v."distanceMeters") AS "averageDistance"
+          FROM "Visit" v
+          WHERE v."visitDate" >= ${range.gte} AND v."visitDate" < ${range.lt}
+            AND (${req.user.role !== 'TC'} OR v."territoryId" IN (
+              SELECT assignment."territoryId"
+              FROM "TcTerritoryAssignment" assignment
+              WHERE assignment."tcId" = ${req.user.id}::uuid AND assignment."isActive" = TRUE
+            ))
+            AND (${req.user.role !== 'CHAMPION'} OR EXISTS (
+              SELECT 1 FROM "Agent" a
+              WHERE a."id" = v."agentId" AND a."championId" = ${req.user.id}::uuid
+            ))
+        `,
+    ]);
+    const totalVisits = Number(row.totalVisits);
+    const completedVisits = Number(row.completedVisits);
+    const uniqueAgentsVisited = Number(row.uniqueAgentsVisited);
+    const verifiedVisits = Number(row.verifiedVisits);
+    const averageDistance = row.averageDistance == null ? null : Number(row.averageDistance);
+    const stats = { selected: {
+      totalVisits, completedVisits, totalActiveAgents,
+      coverageRate: totalActiveAgents ? `${(uniqueAgentsVisited / totalActiveAgents * 100).toFixed(2)}%` : '0%',
+      verifiedVisitRate: completedVisits ? `${(verifiedVisits / completedVisits * 100).toFixed(2)}%` : '0%',
+      flaggedVisitsCount: Number(row.flaggedVisitsCount),
+      averageDistance: averageDistance == null || !Number.isFinite(averageDistance) ? '0m' : `${averageDistance.toFixed(2)}m`,
+    } };
     const fieldActivity = [];
     if (['TC', 'ADMIN'].includes(req.user.role)) {
       const actionNames = [
@@ -118,7 +128,7 @@ router.get('/dashboard', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC'
       ];
       const auditLogs = await prisma.auditLog.findMany({
         where: {
-          action: { in: actionNames }, resourceType: 'Agent', createdAt: activityRange,
+          action: { in: actionNames }, resourceType: 'Agent', createdAt: range,
           ...(req.user.role === 'TC' ? { userId: req.user.id } : { user: { is: { role: 'TC' } } }),
         },
         include: { user: { select: { id: true, firstName: true, lastName: true, username: true, role: true } } },
@@ -167,7 +177,7 @@ router.get('/dashboard', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC'
       }
     }
 
-    res.json({ stats, dateRanges, selectedDate, fieldActivity, activityPeriod });
+    res.json({ stats, dateRanges, selectedRange: { fromDate: selected.fromDate, toDate: selected.toDate }, fieldActivity });
   } catch (error) {
     console.error('Dashboard error:', error);
     res.status(500).json({ error: 'Could not load dashboard data.' });
@@ -194,7 +204,19 @@ router.get('/visits', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC', '
     const pages = Math.ceil(total / limit);
     const page = Math.min(safePage, Math.max(pages, 1));
     const [data, completedCount, verifiedCount, flaggedCount, photoCount] = await Promise.all([
-      prisma.visit.findMany({ where, skip: (page - 1) * limit, take: limit, include: { agent: true, tc: true, report: true, photos: true, territory: true }, orderBy: [{ visitDate: 'desc' }, { id: 'desc' }] }),
+      prisma.visit.findMany({
+        where,
+        skip: (page - 1) * limit,
+        take: limit,
+        select: {
+          id: true, visitId: true, agentId: true, tcId: true, territoryId: true,
+          visitDate: true, checkInTime: true, distanceMeters: true, gpsAccuracyMeters: true,
+          locationStatus: true, visitStatus: true,
+          agent: { select: { id: true, agentId: true, name: true } },
+          tc: { select: { id: true, firstName: true, lastName: true, username: true } },
+        },
+        orderBy: [{ visitDate: 'desc' }, { id: 'desc' }],
+      }),
       prisma.visit.count({ where: { AND: [baseWhere, { visitStatus: { in: ['COMPLETED', 'FLAGGED'] } }] } }),
       prisma.visit.count({ where: { AND: [baseWhere, { visitStatus: { in: ['COMPLETED', 'FLAGGED'] }, locationStatus: 'VERIFIED' }] } }),
       prisma.visit.count({ where: { AND: [baseWhere, { OR: [{ visitStatus: 'FLAGGED' }, { locationStatus: { not: 'VERIFIED' } }] }] } }),
@@ -208,6 +230,102 @@ router.get('/visits', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC', '
   } catch (error) {
     console.error('Visits report error:', error);
     res.status(500).json({ error: 'Could not load visit report data.' });
+  }
+});
+
+router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const todayKey = kigaliDateKey(new Date());
+    const selected = selectedDateWindow(String(req.query.fromDate || ''), String(req.query.toDate || ''), todayKey);
+    if (selected.error) return res.status(400).json({ error: selected.error });
+    const requestedAt = { gte: selected.range.gte, lt: selected.range.lt };
+    const transferWhere = { requestedAt };
+    const relocationWhere = { requestedAt };
+    const auditWhere = { action: 'ADMIN_RELOCATE_AGENT', resourceType: 'Agent', createdAt: requestedAt };
+    const [transfers, relocations, transferStatusCounts, acceptedTransfers, relocationStatusCounts, adminRelocationCount, adminMoves] = await Promise.all([
+      prisma.agentTransfer.findMany({
+        where: transferWhere, orderBy: [{ requestedAt: 'desc' }, { id: 'desc' }], take: 500,
+        include: {
+          agent: { select: { id: true, agentId: true, name: true, phoneNumber: true } },
+          fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } },
+          requestedByTc: { select: { firstName: true, lastName: true, username: true } },
+          recipientTc: { select: { firstName: true, lastName: true, username: true } },
+        },
+      }),
+      prisma.agentRelocationRequest.findMany({
+        where: relocationWhere, orderBy: [{ requestedAt: 'desc' }, { id: 'desc' }], take: 500,
+        include: {
+          agent: { select: { id: true, agentId: true, name: true, phoneNumber: true } },
+          fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } },
+          requestedByTc: { select: { firstName: true, lastName: true, username: true } },
+          reviewedBy: { select: { firstName: true, lastName: true, username: true } },
+        },
+      }),
+      prisma.agentTransfer.groupBy({ by: ['status'], where: transferWhere, _count: { _all: true } }),
+      prisma.agentTransfer.count({ where: { ...transferWhere, status: 'PENDING', acceptedAt: { not: null } } }),
+      prisma.agentRelocationRequest.groupBy({ by: ['status'], where: relocationWhere, _count: { _all: true } }),
+      prisma.auditLog.count({ where: auditWhere }),
+      prisma.auditLog.findMany({ where: auditWhere, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 500, include: { user: { select: { firstName: true, lastName: true, username: true } } } }),
+    ]);
+    const transferCounts = Object.fromEntries(transferStatusCounts.map((row) => [row.status, row._count._all]));
+    const relocationCounts = Object.fromEntries(relocationStatusCounts.map((row) => [row.status, row._count._all]));
+    const moveAgentIds = [...new Set(adminMoves.map(({ resourceId }) => resourceId).filter(Boolean))];
+    const detailTerritoryIds = [...new Set(adminMoves.flatMap(({ details }) => [details?.fromTerritoryId, details?.toTerritoryId, details?.fromSectorId, details?.toSectorId, details?.fromCellId, details?.toCellId, details?.fromVillageId, details?.toVillageId]).filter(Boolean))];
+    const [moveAgents, moveTerritories] = await Promise.all([
+      moveAgentIds.length ? prisma.agent.findMany({ where: { id: { in: moveAgentIds } }, select: { id: true, agentId: true, name: true, phoneNumber: true } }) : [],
+      detailTerritoryIds.length ? prisma.territory.findMany({ where: { id: { in: detailTerritoryIds } }, select: { id: true, name: true } }) : [],
+    ]);
+    const agentById = new Map(moveAgents.map((agent) => [agent.id, agent]));
+    const territoryById = new Map(moveTerritories.map((territory) => [territory.id, territory.name]));
+    const personName = (person) => [person?.firstName, person?.lastName].filter(Boolean).join(' ') || person?.username || '—';
+    const rows = [
+      ...transfers.map((item) => ({
+        id: `transfer-${item.id}`, kind: 'TRANSFER', agentName: item.agent.name, agentNumber: item.agent.agentId,
+        phoneNumber: item.agent.phoneNumber, from: item.fromTerritory.name, to: item.toTerritory.name,
+        requestedBy: personName(item.requestedByTc), reviewedBy: item.acceptedAt ? personName(item.recipientTc) : '—',
+        status: item.status === 'COMPLETED' ? 'COMPLETED' : item.acceptedAt ? 'ACCEPTED_GPS_PENDING' : item.status,
+        requestedAt: item.requestedAt, reviewedAt: item.acceptedAt || item.reviewedAt, completedAt: item.completedAt, reason: item.reason || '',
+      })),
+      ...relocations.map((item) => ({
+        id: `relocation-${item.id}`, kind: 'RELOCATION', agentName: item.agent.name, agentNumber: item.agent.agentId,
+        phoneNumber: item.agent.phoneNumber, from: item.fromTerritory.name, to: item.toTerritory.name,
+        requestedBy: personName(item.requestedByTc), reviewedBy: item.reviewedBy ? personName(item.reviewedBy) : '—',
+        status: item.status, requestedAt: item.requestedAt, reviewedAt: item.reviewedAt, completedAt: item.reviewedAt, reason: item.reason || '',
+      })),
+      ...adminMoves.map((entry) => {
+        const details = entry.details || {};
+        const agent = agentById.get(entry.resourceId) || {};
+        const actor = personName(entry.user);
+        const path = (prefix) => [details[`${prefix}TerritoryId`], details[`${prefix}SectorId`], details[`${prefix}CellId`], details[`${prefix}VillageId`]].map((id) => territoryById.get(id)).filter(Boolean).join(' · ');
+        return {
+          id: `admin-${entry.id}`, kind: 'ADMIN_RELOCATION', agentName: details.agentName || agent.name || 'Agent', agentNumber: details.agentCode || agent.agentId || '',
+          phoneNumber: agent.phoneNumber || '', from: path('from') || territoryById.get(details.fromTerritoryId) || '—', to: path('to') || territoryById.get(details.toTerritoryId) || '—',
+          requestedBy: actor, reviewedBy: actor, status: 'COMPLETED', requestedAt: entry.createdAt, reviewedAt: entry.createdAt, completedAt: entry.createdAt, reason: details.reason || '',
+        };
+      }),
+    ].sort((a, b) => new Date(b.requestedAt) - new Date(a.requestedAt));
+    const transferTotal = Object.values(transferCounts).reduce((sum, value) => sum + value, 0);
+    const transferCompleted = transferCounts.COMPLETED || 0;
+    const acceptedTotal = transferCompleted + acceptedTransfers;
+    const relocationTotal = Object.values(relocationCounts).reduce((sum, value) => sum + value, 0);
+    const reviewedRelocations = (relocationCounts.APPROVED || 0) + (relocationCounts.REJECTED || 0);
+    res.json({
+      selectedRange: { fromDate: selected.fromDate, toDate: selected.toDate },
+      summary: {
+        transferRequests: transferTotal, transfersAccepted: acceptedTotal, transfersCompleted: transferCompleted,
+        transfersAwaitingReview: Math.max(0, (transferCounts.PENDING || 0) - acceptedTransfers),
+        transferAcceptanceRate: transferTotal ? Number((acceptedTotal / transferTotal * 100).toFixed(1)) : 0,
+        transferCompletionRate: acceptedTotal ? Number((transferCompleted / acceptedTotal * 100).toFixed(1)) : 0,
+        relocationRequests: relocationTotal, relocationsApproved: relocationCounts.APPROVED || 0,
+        relocationsRejected: relocationCounts.REJECTED || 0, relocationsAwaitingReview: relocationCounts.PENDING || 0,
+        relocationApprovalRate: reviewedRelocations ? Number(((relocationCounts.APPROVED || 0) / reviewedRelocations * 100).toFixed(1)) : 0,
+        adminRelocations: adminRelocationCount,
+      },
+      events: rows.slice(0, 1000), eventLimitReached: rows.length > 1000,
+    });
+  } catch (error) {
+    console.error('Movement report error:', error.code || error.name);
+    res.status(500).json({ error: 'Could not load transfer and relocation activity.' });
   }
 });
 

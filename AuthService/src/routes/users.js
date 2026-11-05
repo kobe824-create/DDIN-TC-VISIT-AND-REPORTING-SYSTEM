@@ -187,6 +187,7 @@ router.get('/', authenticateToken, requireRole('ADMIN', 'MANAGER'), async (req, 
   const safePage = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
   const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 100) : 25;
   const where = {};
+  if (req.query.includeInactive !== 'true') where.isActive = true;
   if (req.query.role) where.role = req.query.role;
   const search = String(req.query.search || '').trim();
   if (search) {
@@ -277,7 +278,7 @@ router.patch('/:id/status', authenticateToken, requireRole('ADMIN'), async (req,
     const { isActive } = req.body;
     const user = await prisma.user.update({
       where: { id: req.params.id },
-      data: { isActive },
+      data: { isActive, ...(isActive === false ? { tokenVersion: { increment: 1 } } : {}) },
       select: { id: true, username: true, isActive: true }
     });
     await logAction(req.user.id, 'CHANGE_USER_STATUS', 'User', user.id, { isActive }, req);

@@ -29,6 +29,12 @@ enum AgentTransferStatus {
   CANCELLED
 }
 
+enum AgentRelocationRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 enum AgentStatus {
   ACTIVE
   INACTIVE
@@ -73,6 +79,7 @@ model User {
   updatedAt             DateTime                 @updatedAt
   tcTerritoryAssignments TcTerritoryAssignment[]  @relation("TcToAssignment")
   tcTerritoryAssignmentsAssignedBy TcTerritoryAssignment[]  @relation("AssignedBy")
+  visitPlans            VisitPlan[]              @relation("VisitPlanTc")
   agentsCreated         Agent[]                  @relation("AgentCreatedBy")
   championAgents        Agent[]                  @relation("AgentChampion")
   agentLocationsRecorded AgentLocation[]         @relation("AgentLocationRecordedBy")
@@ -81,6 +88,8 @@ model User {
   systemConfigsUpdated  SystemConfig[]           @relation("ConfigUpdatedBy")
   requestedAgentTransfers AgentTransfer[]        @relation("AgentTransferRequester")
   receivedAgentTransfers  AgentTransfer[]        @relation("AgentTransferRecipient")
+  relocationRequestsCreated AgentRelocationRequest[] @relation("RelocationRequestCreator")
+  relocationRequestsReviewed AgentRelocationRequest[] @relation("RelocationRequestReviewer")
 }
 
 model Territory {
@@ -101,7 +110,10 @@ model Territory {
   agentsVillage   Agent[]                  @relation("AgentVillage")
   transfersFrom   AgentTransfer[]          @relation("AgentTransferFromTerritory")
   transfersTo     AgentTransfer[]          @relation("AgentTransferToTerritory")
+  relocationRequestsFrom AgentRelocationRequest[] @relation("RelocationFromTerritory")
+  relocationRequestsTo AgentRelocationRequest[]   @relation("RelocationToTerritory")
   visits          Visit[]                  @relation("VisitTerritory")
+  visitPlans      VisitPlan[]               @relation("VisitPlanTerritory")
 
   @@index([type, parentId])
 }
@@ -128,6 +140,7 @@ model Agent {
   name               String
   phoneNumber        String?
   businessName       String?
+  venue              String?          @db.VarChar(200)
   address            String?
   nationalIdEncrypted String?
   nextOfKinNameEncrypted String?
@@ -156,8 +169,10 @@ model Agent {
   locations          AgentLocation[]
   visits             Visit[]          @relation("VisitAgent")
   transfers          AgentTransfer[]
+  relocationRequests AgentRelocationRequest[]
 
   @@index([territoryId, status])
+  @@index([name, id])
   @@index([sectorId])
   @@index([cellId])
   @@index([villageId])
@@ -179,11 +194,42 @@ model AgentTransfer {
   reason            String?
   status            AgentTransferStatus @default(PENDING)
   requestedAt       DateTime            @default(now())
+  acceptedAt        DateTime?
+  reviewedAt        DateTime?
+  reviewNote        String?             @db.VarChar(500)
   completedAt       DateTime?
 
   @@index([agentId, status])
   @@index([recipientTcId, status])
   @@index([requestedByTcId, requestedAt])
+}
+
+model AgentRelocationRequest {
+  id                String   @id @default(uuid()) @db.Uuid
+  agentId           String   @db.Uuid
+  agent             Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  fromTerritoryId   String   @db.Uuid
+  fromTerritory     Territory @relation("RelocationFromTerritory", fields: [fromTerritoryId], references: [id])
+  toTerritoryId     String   @db.Uuid
+  toTerritory       Territory @relation("RelocationToTerritory", fields: [toTerritoryId], references: [id])
+  toSectorId        String   @db.Uuid
+  toCellId          String   @db.Uuid
+  toVillageId       String   @db.Uuid
+  latitude          Float?
+  longitude         Float?
+  accuracy          Float?
+  reason            String?  @db.VarChar(500)
+  requestedByTcId   String   @db.Uuid
+  requestedByTc     User     @relation("RelocationRequestCreator", fields: [requestedByTcId], references: [id])
+  reviewedById      String?  @db.Uuid
+  reviewedBy        User?    @relation("RelocationRequestReviewer", fields: [reviewedById], references: [id])
+  status            AgentRelocationRequestStatus @default(PENDING)
+  requestedAt       DateTime @default(now())
+  reviewedAt        DateTime?
+  reviewNote        String?  @db.VarChar(500)
+
+  @@index([requestedByTcId, status, requestedAt])
+  @@index([status, requestedAt])
 }
 
 model AgentLocation {
@@ -231,6 +277,7 @@ model Visit {
   @@index([tcId, visitDate])
   @@index([agentId, visitDate])
   @@index([territoryId, visitDate])
+  @@index([visitDate])
 }
 
 model VisitReport {
@@ -251,6 +298,22 @@ model VisitReport {
   checklistData              Json?
   createdAt                  DateTime @default(now())
   updatedAt                  DateTime @updatedAt
+}
+
+model VisitPlan {
+  id                String    @id @default(uuid()) @db.Uuid
+  tcId              String    @db.Uuid
+  tc                User      @relation("VisitPlanTc", fields: [tcId], references: [id], onDelete: Cascade)
+  planDate          DateTime  @db.Date
+  territoryId       String    @db.Uuid
+  territory         Territory @relation("VisitPlanTerritory", fields: [territoryId], references: [id], onDelete: Cascade)
+  targetAgents      Int
+  notes             String?   @db.VarChar(500)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([tcId, planDate, territoryId])
+  @@index([tcId, planDate])
 }
 
 model VisitPhoto {

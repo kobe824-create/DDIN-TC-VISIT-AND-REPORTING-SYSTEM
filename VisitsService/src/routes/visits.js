@@ -7,8 +7,18 @@ const { performance } = require('node:perf_hooks');
 const { authenticateToken, requireRole, requireTerritoryAccess } = require('../middleware/auth');
 const prisma = require('../utils/prisma');
 const { logAction } = require('../utils/auditLog');
+const { advisoryTransactionLock } = require('../../../shared/advisory-locks');
 const { calculateDistance } = require('../utils/gps');
-const { cleanTerritoryName, findChildTerritory, findOrCreateChildTerritory } = require('../../../shared/territory-capture');
+
+const normalizeReportQuestion = (text) => String(text || '').trim().toLocaleLowerCase().replace(/[?.]+$/, '');
+const builtInIremboQuestions = new Set([
+  'How many agents are in a shop?',
+  'Is the agent the owner of the account/User name?',
+  'Does the agent have the branding materials?',
+  'Do you follow the Irembo Agents WhatsApp Channel for essential updates?',
+  'Do you have any other difficulties/recommendation to Irembo?',
+  'If yes, describe',
+].map(normalizeReportQuestion));
 
 const router = express.Router();
 const storage = multer.diskStorage({
@@ -48,6 +58,16 @@ const verifyPhotoVisit = async (req, res, next) => {
 };
 
 const makeVisitId = () => `VIS-${new Date().getFullYear()}-${randomUUID().slice(0, 8).toUpperCase()}`;
+function kigaliMonthWindow(value = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Kigali', year: 'numeric', month: '2-digit' }).formatToParts(value);
+  const values = Object.fromEntries(parts.map(({ type, value: part }) => [type, part]));
+  const month = `${values.year}-${values.month}`;
+  const monthStartUtc = new Date(`${month}-01T00:00:00.000Z`);
+  const nextStartUtc = new Date(Date.UTC(monthStartUtc.getUTCFullYear(), monthStartUtc.getUTCMonth() + 1, 1));
+  const nextMonth = `${nextStartUtc.getUTCFullYear()}-${String(nextStartUtc.getUTCMonth() + 1).padStart(2, '0')}`;
+  return { month, start: new Date(`${month}-01T00:00:00.000+02:00`), end: new Date(`${nextMonth}-01T00:00:00.000+02:00`) };
+}
+function conflict(message) { const error = new Error(message); error.statusCode = 409; return error; }
 const visitWhereForUser = (user, query = {}) => {
   const where = {};
   if (query.agentId) where.agentId = query.agentId;
@@ -99,9 +119,12 @@ router.post('/check-in', authenticateToken, requireTerritoryAccess, requireRole(
       },
     });
     if (!agent) return res.status(404).json({ error: 'Agent not found.' });
-    const [pendingTransfer, config, existingVisit] = await Promise.all([
+    const [pendingTransfer, unreviewedIncomingTransfer, config, existingVisit] = await Promise.all([
       req.user.role === 'TC'
-        ? prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, status: 'PENDING', toTerritoryId: agent.territoryId } })
+        ? prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, status: 'PENDING', acceptedAt: { not: null }, toTerritoryId: agent.territoryId } })
+        : null,
+      req.user.role === 'TC'
+        ? prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, status: 'PENDING', acceptedAt: null }, select: { id: true } })
         : null,
       prisma.systemConfig.findUnique({ where: { key: 'GEOFENCE_RADIUS_METERS' } }),
       requestedVisitId
@@ -109,6 +132,7 @@ router.post('/check-in', authenticateToken, requireTerritoryAccess, requireRole(
         : null,
     ]);
     const radiusMeters = config ? Number.parseInt(config.value, 10) : 100;
+    if (unreviewedIncomingTransfer) return res.status(409).json({ error: 'Review and accept this transfer from the dashboard before visiting the agent.' });
     if (req.user.role === 'TC' && !(req.user.assignedTerritories || []).includes(agent.territoryId) && !pendingTransfer) {
       return res.status(403).json({ error: 'This agent is outside your assigned territory.' });
     }
@@ -116,9 +140,14 @@ router.post('/check-in', authenticateToken, requireTerritoryAccess, requireRole(
       if (existingVisit.tcId !== req.user.id || existingVisit.agentId !== agent.id) return res.status(409).json({ error: 'This client visit ID already belongs to another visit.' });
       return res.json({ ...existingVisit, radiusMeters });
     }
+    if (req.user.role === 'TC') {
+      const outgoingTransfer = await prisma.agentTransfer.findFirst({ where: { agentId: agent.id, requestedByTcId: req.user.id, status: 'PENDING' }, select: { id: true } });
+      if (outgoingTransfer && !pendingTransfer) return res.status(409).json({ error: 'This agent is awaiting review by the destination coordinator. You cannot start a visit until the transfer is resolved.' });
+    }
     const sector = agent.sector;
     if (!sector || sector.type !== 'SECTOR' || sector.parentId !== agent.territoryId || (!agent.firstVisitCompletedAt && !sector.isActive)) return res.status(400).json({ error: 'The agent must be assigned to an active sector in their district before a first visit can start.' });
     if (!agent.firstVisitCompletedAt) {
+      if (!String(agent.venue || '').trim()) return res.status(400).json({ error: 'Record the agent’s venue during the first visit before checking in.' });
       const cell = agent.cell;
       const village = agent.village;
       if (!cell || cell.type !== 'CELL' || !cell.isActive || cell.parentId !== agent.sectorId || !village || village.type !== 'VILLAGE' || !village.isActive || village.parentId !== agent.cellId) {
@@ -135,11 +164,24 @@ router.post('/check-in', authenticateToken, requireTerritoryAccess, requireRole(
     if (distanceMeters > radiusMeters) return res.status(403).json({ error: `You are ${Math.round(distanceMeters)} m from the agent. Check-in is allowed within ${radiusMeters} m.` });
     const locationStatus = 'VERIFIED';
     const firstVisit = !agent.firstVisitCompletedAt;
+    const checkInTime = new Date();
+    const monthWindow = kigaliMonthWindow(checkInTime);
     const visit = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
+      const currentAgent = await tx.agent.findUnique({ where: { id: agent.id }, select: { territoryId: true, registeredLatitude: true, registeredLongitude: true, locationVerified: true } });
+      if (!currentAgent || currentAgent.territoryId !== agent.territoryId || currentAgent.registeredLatitude !== agent.registeredLatitude || currentAgent.registeredLongitude !== agent.registeredLongitude || currentAgent.locationVerified !== agent.locationVerified) {
+        throw conflict('The agent location changed before check-in. Reload the agent and capture its current location first.');
+      }
+      await advisoryTransactionLock(tx, agent.id, monthWindow.month);
+      const existingMonthVisit = await tx.visit.findFirst({
+        where: { agentId: agent.id, visitDate: { gte: monthWindow.start, lt: monthWindow.end } },
+        select: { id: true, visitDate: true, visitStatus: true },
+      });
+      if (existingMonthVisit) throw conflict(`This agent already has a visit recorded for ${monthWindow.month}. Agents may only be visited once each month.`);
       const created = await tx.visit.create({
         data: {
           visitId: requestedVisitId || makeVisitId(), agentId: agent.id, tcId: req.user.id, territoryId: agent.territoryId,
-          visitDate: new Date(), checkInTime: new Date(), agentLatitude: agent.registeredLatitude,
+          visitDate: checkInTime, checkInTime, agentLatitude: agent.registeredLatitude,
           agentLongitude: agent.registeredLongitude, tcLatitude: tcLatitudeValue, tcLongitude: tcLongitudeValue,
           distanceMeters, gpsAccuracyMeters: accuracy, locationStatus, visitStatus: 'STARTED', isOffline: false,
         },
@@ -157,6 +199,7 @@ router.post('/check-in', authenticateToken, requireTerritoryAccess, requireRole(
     res.status(201).json({ ...visit, radiusMeters });
   } catch (error) {
     console.error('Check-in error:', error);
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
     res.status(500).json({ error: 'Could not start the visit.' });
   }
 });
@@ -166,7 +209,7 @@ router.put('/:id/photo', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC'
   try {
     if (!req.file) return res.status(400).json({ error: 'A visit photo is required.' });
     const photoResult = await prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${req.visit.id}))::text`;
+      await advisoryTransactionLock(tx, req.visit.id);
       const existingPhoto = await tx.visitPhoto.findFirst({ where: { visitId: req.visit.id, originalFilename: req.file.originalname } });
       if (existingPhoto) return { photo: existingPhoto, created: false };
       const photo = await tx.visitPhoto.create({
@@ -196,6 +239,39 @@ router.post('/:id/report', authenticateToken, requireRole('ADMIN', 'MANAGER', 'T
     const visit = await prisma.visit.findUnique({ where: { id: req.params.id } });
     if (!visit) return res.status(404).json({ error: 'Visit not found.' });
     if (req.user.role === 'TC' && visit.tcId !== req.user.id) return res.status(403).json({ error: 'You cannot edit this visit.' });
+    const checklistData = req.body.checklistData;
+    if (!checklistData || typeof checklistData !== 'object' || Array.isArray(checklistData)) return res.status(400).json({ error: 'Complete Section A · IREMBO before submitting the report.' });
+    const answerFor = (id) => {
+      const value = checklistData[id];
+      return value && typeof value === 'object' && !Array.isArray(value) ? value.answer : value;
+    };
+    const requiredBase = ['agents_in_shop', 'account_owner', 'branding_materials', 'whatsapp_updates', 'difficulties'];
+    if (requiredBase.some((id) => String(answerFor(id) ?? '').trim() === '')) return res.status(400).json({ error: 'Complete every required Section A · IREMBO question before submitting.' });
+    const agentsInShop = Number(answerFor('agents_in_shop'));
+    if (!Number.isInteger(agentsInShop) || agentsInShop < 0) return res.status(400).json({ error: 'The number of agents in the shop must be a whole number of zero or more.' });
+    if (!['Yes', 'No'].includes(String(answerFor('account_owner'))) || !['Yes', 'No'].includes(String(answerFor('whatsapp_updates'))) || !['Yes', 'No'].includes(String(answerFor('difficulties')))) {
+      return res.status(400).json({ error: 'Choose Yes or No for each required IREMBO question.' });
+    }
+    if (answerFor('difficulties') === 'Yes' && !String(answerFor('difficulties_description') ?? '').trim()) return res.status(400).json({ error: 'Describe the difficulty or recommendation selected in Section A · IREMBO.' });
+    const questionConfig = await prisma.systemConfig.findUnique({ where: { key: 'VISIT_CHECKLIST_SCHEMA' }, select: { value: true } });
+    if (questionConfig?.value) {
+      const parsed = JSON.parse(questionConfig.value);
+      const questions = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.questions) ? parsed.questions : [];
+      for (const item of questions) {
+        if ((item.section || 'DDIN') === 'IREMBO' && builtInIremboQuestions.has(normalizeReportQuestion(item.text))) continue;
+        const answer = answerFor(item.id);
+        const textAnswer = String(answer ?? '').trim();
+        const required = (item.section || 'DDIN') === 'IREMBO';
+        if (!textAnswer) {
+          if (required) return res.status(400).json({ error: `Answer the required IREMBO question: ${item.text}` });
+          continue;
+        }
+        if (item.type === 'NUMBER' && !Number.isFinite(Number(textAnswer))) return res.status(400).json({ error: `Enter a number for: ${item.text}` });
+        if (item.type === 'YES_NO' && !['Yes', 'No'].includes(textAnswer)) return res.status(400).json({ error: `Choose Yes or No for: ${item.text}` });
+        if (item.type === 'MULTIPLE_CHOICE' && !(item.options || []).includes(textAnswer)) return res.status(400).json({ error: `Choose one of the listed options for: ${item.text}` });
+        if (item.type === 'TEXT' && typeof answer !== 'string') return res.status(400).json({ error: `Enter a written response for: ${item.text}` });
+      }
+    }
     const fields = {
       operatingStatus: req.body.operatingStatus,
       servicesOffered: req.body.servicesOffered || '', productsOffered: req.body.productsOffered || '',
@@ -203,7 +279,7 @@ router.post('/:id/report', authenticateToken, requireRole('ADMIN', 'MANAGER', 'T
       customerQualityObservations: req.body.customerQualityObservations || '', challengesFaced: req.body.challengesFaced || '',
       supportNeeds: req.body.supportNeeds || '', trainingNeeds: req.body.trainingNeeds || '',
       followUpActions: req.body.followUpActions || '', additionalRemarks: req.body.additionalRemarks || '',
-      checklistData: req.body.checklistData || {},
+      checklistData,
     };
     const report = await prisma.visitReport.upsert({
       where: { visitId: visit.id }, update: fields, create: { visitId: visit.id, ...fields },
@@ -241,11 +317,35 @@ router.get('/', authenticateToken, requireTerritoryAccess, async (req, res) => {
     const where = visitWhereForUser(req.user, req.query);
     const [total, firstPage] = await Promise.all([
       prisma.visit.count({ where }),
-      prisma.visit.findMany({ where, skip: (safePage - 1) * limit, take: limit, include: { agent: true, tc: true }, orderBy: [{ visitDate: 'desc' }, { id: 'desc' }] }),
+      prisma.visit.findMany({
+        where,
+        skip: (safePage - 1) * limit,
+        take: limit,
+        select: {
+          id: true, visitId: true, agentId: true, tcId: true, territoryId: true,
+          visitDate: true, checkInTime: true, checkOutTime: true, distanceMeters: true,
+          gpsAccuracyMeters: true, locationStatus: true, visitStatus: true, isOffline: true, syncStatus: true,
+          agent: { select: { id: true, agentId: true, name: true, businessName: true } },
+          tc: { select: { id: true, firstName: true, lastName: true, username: true } },
+        },
+        orderBy: [{ visitDate: 'desc' }, { id: 'desc' }],
+      }),
     ]);
     const pages = Math.ceil(total / limit);
     const page = Math.min(safePage, Math.max(pages, 1));
-    const data = page === safePage ? firstPage : await prisma.visit.findMany({ where, skip: (page - 1) * limit, take: limit, include: { agent: true, tc: true }, orderBy: [{ visitDate: 'desc' }, { id: 'desc' }] });
+    const data = page === safePage ? firstPage : await prisma.visit.findMany({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      select: {
+        id: true, visitId: true, agentId: true, tcId: true, territoryId: true,
+        visitDate: true, checkInTime: true, checkOutTime: true, distanceMeters: true,
+        gpsAccuracyMeters: true, locationStatus: true, visitStatus: true, isOffline: true, syncStatus: true,
+        agent: { select: { id: true, agentId: true, name: true, businessName: true } },
+        tc: { select: { id: true, firstName: true, lastName: true, username: true } },
+      },
+      orderBy: [{ visitDate: 'desc' }, { id: 'desc' }],
+    });
     res.json({ data, meta: { total, page, limit, pages } });
   } catch (error) {
     console.error('List visits error:', error);
@@ -285,10 +385,13 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
       if (!agent) return res.status(400).json({ error: 'An offline visit references an unknown agent.' });
       const assignedTerritories = req.user.assignedTerritories || [];
       const transfer = await prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, status: 'PENDING' } });
+      if (transfer && !transfer.acceptedAt) return res.status(409).json({ error: 'The destination coordinator must review this transfer before a visit can be synced.' });
+      const outgoingTransfer = await prisma.agentTransfer.findFirst({ where: { agentId: agent.id, requestedByTcId: req.user.id, status: 'PENDING' }, select: { id: true } });
+      if (outgoingTransfer && !transfer) return res.status(409).json({ error: 'This agent is awaiting review by the destination coordinator. Sync will be available after the transfer is resolved.' });
       if (!assignedTerritories.includes(agent.territoryId) && (!transfer || !assignedTerritories.includes(transfer.toTerritoryId))) return res.status(403).json({ error: 'An offline visit references an agent outside your assigned district.' });
       const tcLatitude = item.tcLatitude; const tcLongitude = item.tcLongitude; const accuracy = item.gpsAccuracyMeters;
       if ([tcLatitude, tcLongitude, accuracy].some((value) => typeof value !== 'number' || !Number.isFinite(value)) || tcLatitude < -90 || tcLatitude > 90 || tcLongitude < -180 || tcLongitude > 180 || accuracy < 0 || accuracy > 50) return res.status(400).json({ error: 'An offline visit needs a valid, accurate GPS reading.' });
-      const needsLocationCapture = !agent.firstVisitCompletedAt && !agent.firstVisitLocationCapturedAt;
+      const needsLocationCapture = Boolean(agent.registeredLatitude == null || agent.registeredLongitude == null || !agent.locationVerified || (!agent.firstVisitCompletedAt && !agent.firstVisitLocationCapturedAt));
       let registeredLatitude = agent.registeredLatitude;
       let registeredLongitude = agent.registeredLongitude;
       let registeredAccuracy = agent.gpsAccuracy;
@@ -296,21 +399,21 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
       let sectorId = agent.sectorId;
       let cellId = agent.cellId;
       let villageId = agent.villageId;
-      let cellName = '';
-      let villageName = '';
+      let venue = String(agent.venue || '').trim();
       if (needsLocationCapture) {
         const captured = item.agentLocation;
         if (!captured || typeof captured.latitude !== 'number' || typeof captured.longitude !== 'number' || typeof captured.accuracy !== 'number' || !Number.isFinite(captured.latitude) || !Number.isFinite(captured.longitude) || !Number.isFinite(captured.accuracy) || captured.latitude < -90 || captured.latitude > 90 || captured.longitude < -180 || captured.longitude > 180 || captured.accuracy < 0 || captured.accuracy > 20) {
           return res.status(400).json({ error: 'Capture the agent’s cell, village and GPS location with accuracy of 20 metres or better before syncing the first visit.' });
         }
+        venue = String(captured.venue || '').trim();
+        if (!venue) return res.status(400).json({ error: 'The offline first-visit record needs the agent’s venue.' });
+        if (venue.length > 200) return res.status(400).json({ error: 'Venue must be 200 characters or fewer.' });
         territoryId = String(captured.territoryId || agent.territoryId);
         sectorId = String(captured.sectorId || '');
         cellId = String(captured.cellId || '');
         villageId = String(captured.villageId || '');
-        cellName = cleanTerritoryName(captured.cellName);
-        villageName = cleanTerritoryName(captured.villageName);
-        if ((!cellId && !cellName) || (!villageId && !villageName)) return res.status(400).json({ error: 'The offline first-visit location needs both a cell and village name.' });
-        if (cellName.length > 100 || villageName.length > 100) return res.status(400).json({ error: 'Cell and village names must be 100 characters or fewer.' });
+        if (!transfer?.acceptedAt && territoryId !== agent.territoryId) return res.status(409).json({ error: 'The offline location uses a different district. Refresh the agent package after the approved relocation.' });
+        if (!cellId || !villageId) return res.status(409).json({ error: 'Refresh your offline territory list and select an official cell and village before syncing this first visit.' });
         const [district, sector] = await Promise.all([
           prisma.territory.findUnique({ where: { id: territoryId }, select: { type: true, isActive: true } }),
           prisma.territory.findUnique({ where: { id: sectorId }, select: { type: true, parentId: true, isActive: true } }),
@@ -318,18 +421,22 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
         if (!district || district.type !== 'DISTRICT' || !district.isActive || !sector || sector.type !== 'SECTOR' || !sector.isActive || sector.parentId !== territoryId) {
           return res.status(400).json({ error: 'The offline first-visit district, sector, cell and village do not form a valid territory path.' });
         }
-        let cell = cellId ? await prisma.territory.findUnique({ where: { id: cellId }, select: { type: true, parentId: true, isActive: true } }) : await findChildTerritory(prisma, { name: cellName, type: 'CELL', parentId: sectorId });
-        if (cellId && (!cell || cell.type !== 'CELL' || !cell.isActive || cell.parentId !== sectorId)) return res.status(400).json({ error: 'The offline cell must belong to the selected sector.' });
-        if (!cellId && cell?.isActive) cellId = cell.id;
+        const cell = await prisma.territory.findUnique({ where: { id: cellId }, select: { type: true, parentId: true, isActive: true } });
+        if (!cell || cell.type !== 'CELL' || !cell.isActive || cell.parentId !== sectorId) return res.status(400).json({ error: 'Choose an official cell inside the selected sector.' });
         if (villageId && !cellId) return res.status(400).json({ error: 'Choose a cell before selecting a saved village.' });
-        let village = villageId ? await prisma.territory.findUnique({ where: { id: villageId }, select: { type: true, parentId: true, isActive: true } }) : cellId ? await findChildTerritory(prisma, { name: villageName, type: 'VILLAGE', parentId: cellId }) : null;
-        if (villageId && (!village || village.type !== 'VILLAGE' || !village.isActive || village.parentId !== cellId)) return res.status(400).json({ error: 'The offline village must belong to the selected cell.' });
-        if (!villageId && village?.isActive) villageId = village.id;
+        const village = await prisma.territory.findUnique({ where: { id: villageId }, select: { type: true, parentId: true, isActive: true } });
+        if (!village || village.type !== 'VILLAGE' || !village.isActive || village.parentId !== cellId) return res.status(400).json({ error: 'Choose an official village inside the selected cell.' });
         if (!assignedTerritories.includes(territoryId) && (!transfer || transfer.toTerritoryId !== territoryId)) return res.status(403).json({ error: 'An offline location change must use your assigned territory or a transfer routed to your account.' });
         if (calculateDistance(tcLatitude, tcLongitude, captured.latitude, captured.longitude) > 20) return res.status(400).json({ error: 'The first location capture and visit check-in must be within 20 metres of each other.' });
         registeredLatitude = captured.latitude;
         registeredLongitude = captured.longitude;
         registeredAccuracy = captured.accuracy;
+      } else if (!agent.firstVisitCompletedAt && !venue) {
+        const captured = item.agentLocation;
+        venue = String(captured?.venue || '').trim();
+        if (!venue) return res.status(400).json({ error: 'The offline first-visit record needs the agent’s venue.' });
+        if (venue.length > 200) return res.status(400).json({ error: 'Venue must be 200 characters or fewer.' });
+        if (captured?.latitude !== agent.registeredLatitude || captured?.longitude !== agent.registeredLongitude) return res.status(400).json({ error: 'The offline venue update must use the agent’s saved first-visit location.' });
       }
       const sector = sectorId ? await prisma.territory.findUnique({ where: { id: sectorId }, select: { type: true, parentId: true, isActive: true } }) : null;
       if (!sector || sector.type !== 'SECTOR' || sector.parentId !== territoryId || (!agent.firstVisitCompletedAt && !sector.isActive)) return res.status(400).json({ error: 'The agent must have a valid active sector before their first visit.' });
@@ -348,12 +455,17 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
       if (Number.isNaN(visitDate.getTime()) || Number.isNaN(checkInTime.getTime())) return res.status(400).json({ error: 'An offline visit has an invalid visit time.' });
       const existingVisit = await prisma.visit.findUnique({ where: { visitId: item.visitId }, select: { id: true, tcId: true, agentId: true } });
       if (existingVisit && (existingVisit.tcId !== req.user.id || existingVisit.agentId !== agent.id)) return res.status(409).json({ error: 'This client visit ID already belongs to another visit.' });
-      validated.push({ item, agent, territoryId, sectorId, cellId, villageId, cellName, villageName, transfer, tcLatitude, tcLongitude, accuracy, distanceMeters, registeredLatitude, registeredLongitude, registeredAccuracy, needsLocationCapture, existingVisit, visitDate, checkInTime });
+      if (!existingVisit) {
+        const visitMonth = kigaliMonthWindow(visitDate);
+        const existingMonthVisit = await prisma.visit.findFirst({ where: { agentId: agent.id, visitDate: { gte: visitMonth.start, lt: visitMonth.end } }, select: { id: true } });
+        if (existingMonthVisit) return res.status(409).json({ error: `This agent already has a visit recorded for ${visitMonth.month}. Agents may only be visited once each month.` });
+      }
+      validated.push({ item, agent, territoryId, sectorId, cellId, villageId, venue, transfer, tcLatitude, tcLongitude, accuracy, distanceMeters, registeredLatitude, registeredLongitude, registeredAccuracy, needsLocationCapture, existingVisit, visitDate, checkInTime });
     }
     const syncedVisits = await prisma.$transaction(async (tx) => {
       const results = [];
       for (const record of validated) {
-        const { item, agent, territoryId, sectorId, transfer, tcLatitude, tcLongitude, accuracy, distanceMeters, registeredLatitude, registeredLongitude, registeredAccuracy, needsLocationCapture, visitDate, checkInTime } = record;
+        const { item, agent, territoryId, sectorId, transfer, tcLatitude, tcLongitude, accuracy, distanceMeters, registeredLatitude, registeredLongitude, registeredAccuracy, venue, needsLocationCapture, visitDate, checkInTime } = record;
         let { cellId, villageId } = record;
         let existing = await tx.visit.findUnique({ where: { visitId: item.visitId }, select: { id: true, visitId: true, tcId: true, agentId: true } });
         if (existing) {
@@ -361,9 +473,15 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
           results.push({ clientVisitId: item.visitId, id: existing.id, visitId: existing.visitId, created: false });
           continue;
         }
+        const visitMonth = kigaliMonthWindow(visitDate);
+        await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
+        const currentAgent = await tx.agent.findUnique({ where: { id: agent.id }, select: { territoryId: true, registeredLatitude: true, registeredLongitude: true, locationVerified: true } });
+        if (!currentAgent || currentAgent.territoryId !== agent.territoryId || currentAgent.registeredLatitude !== agent.registeredLatitude || currentAgent.registeredLongitude !== agent.registeredLongitude || currentAgent.locationVerified !== agent.locationVerified) throw new Error('The agent location changed before the offline visit synced. Refresh the agent package and retry.');
+        await advisoryTransactionLock(tx, agent.id, visitMonth.month);
+        const existingMonthVisit = await tx.visit.findFirst({ where: { agentId: agent.id, visitDate: { gte: visitMonth.start, lt: visitMonth.end } }, select: { id: true } });
+        if (existingMonthVisit) throw conflict(`This agent already has a visit recorded for ${visitMonth.month}. Agents may only be visited once each month.`);
         if (needsLocationCapture) {
-          if (!cellId) cellId = (await findOrCreateChildTerritory(tx, { name: record.cellName, type: 'CELL', parentId: sectorId })).id;
-          if (!villageId) villageId = (await findOrCreateChildTerritory(tx, { name: record.villageName, type: 'VILLAGE', parentId: cellId })).id;
+          if (!cellId || !villageId) throw conflict('Refresh your offline territory list and select an official cell and village before syncing this first visit.');
           const [district, sector, cell, village] = await Promise.all([
             tx.territory.findUnique({ where: { id: territoryId }, select: { type: true, isActive: true } }),
             tx.territory.findUnique({ where: { id: sectorId }, select: { type: true, parentId: true, isActive: true } }),
@@ -374,12 +492,14 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
             throw new Error('The offline first-visit district, sector, cell and village do not form a valid territory path.');
           }
           const claimed = await tx.agent.updateMany({
-            where: { id: agent.id, firstVisitCompletedAt: null, firstVisitLocationCapturedAt: null },
-            data: { territoryId, sectorId, cellId, villageId, registeredLatitude, registeredLongitude, gpsAccuracy: registeredAccuracy, locationVerified: true, firstVisitLocationCapturedAt: checkInTime },
+            where: agent.firstVisitCompletedAt || agent.firstVisitLocationCapturedAt
+              ? { id: agent.id, territoryId: agent.territoryId, registeredLatitude: agent.registeredLatitude, registeredLongitude: agent.registeredLongitude, locationVerified: agent.locationVerified }
+              : { id: agent.id, firstVisitCompletedAt: null, firstVisitLocationCapturedAt: null },
+            data: { territoryId, sectorId, cellId, villageId, venue, registeredLatitude, registeredLongitude, gpsAccuracy: registeredAccuracy, locationVerified: true, firstVisitLocationCapturedAt: agent.firstVisitLocationCapturedAt || checkInTime },
           });
           if (!claimed.count) {
             const current = await tx.agent.findUnique({ where: { id: agent.id }, select: { territoryId: true, sectorId: true, cellId: true, villageId: true, registeredLatitude: true, registeredLongitude: true, locationVerified: true, firstVisitCompletedAt: true, firstVisitLocationCapturedAt: true } });
-            if (current?.firstVisitCompletedAt || current?.firstVisitLocationCapturedAt || current?.territoryId !== territoryId || current?.sectorId !== sectorId || current?.cellId !== cellId || current?.villageId !== villageId || !current?.locationVerified || current.registeredLatitude !== registeredLatitude || current.registeredLongitude !== registeredLongitude) throw new Error('Another coordinator recorded this agent’s first-visit location. Refresh the agent record before syncing.');
+            if (current?.territoryId !== territoryId || current?.sectorId !== sectorId || current?.cellId !== cellId || current?.villageId !== villageId || !current?.locationVerified || current.registeredLatitude !== registeredLatitude || current.registeredLongitude !== registeredLongitude) throw new Error('Another coordinator recorded this agent’s location. Refresh the agent record before syncing.');
           } else {
             await tx.agentLocation.create({ data: {
               agentId: agent.id,
@@ -387,9 +507,12 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
               longitude: registeredLongitude,
               accuracy: registeredAccuracy,
               recordedById: req.user.id,
-              reason: transfer ? 'OFFLINE_FIRST_VISIT_TRANSFER' : 'OFFLINE_FIRST_VISIT_CAPTURE',
+              reason: transfer?.acceptedAt ? 'OFFLINE_TRANSFER_LOCATION_CAPTURE' : agent.firstVisitCompletedAt || agent.firstVisitLocationCapturedAt ? 'OFFLINE_RELOCATION_LOCATION_CAPTURE' : 'OFFLINE_FIRST_VISIT_CAPTURE',
             } });
+            if (transfer?.acceptedAt) await tx.agentTransfer.update({ where: { id: transfer.id }, data: { status: 'COMPLETED', completedAt: checkInTime } });
           }
+        } else if (!agent.firstVisitCompletedAt && venue !== agent.venue) {
+          await tx.agent.updateMany({ where: { id: agent.id, firstVisitCompletedAt: null }, data: { venue } });
         }
         const visit = await tx.visit.create({
           data: {
@@ -415,20 +538,20 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
         });
         const firstVisit = !agent.firstVisitCompletedAt;
         if (firstVisit) await tx.agent.updateMany({ where: { id: agent.id, firstVisitCompletedAt: null }, data: { firstVisitCompletedAt: checkInTime } });
-        if (firstVisit && transfer) await tx.agentTransfer.update({ where: { id: transfer.id }, data: { status: 'COMPLETED', completedAt: checkInTime } });
-        results.push({ clientVisitId: item.visitId, id: visit.id, visitId: visit.visitId, agentId: agent.id, agentName: agent.name, agentCode: agent.agentId, territoryId, sectorId, cellId, villageId, firstVisit: !agent.firstVisitCompletedAt, transferId: transfer?.id || null, created: true });
+        if (firstVisit && transfer && !transfer.acceptedAt) await tx.agentTransfer.update({ where: { id: transfer.id }, data: { status: 'COMPLETED', completedAt: checkInTime } });
+        results.push({ clientVisitId: item.visitId, id: visit.id, visitId: visit.visitId, agentId: agent.id, agentName: agent.name, agentCode: agent.agentId, territoryId, sectorId, cellId, villageId, firstVisit: !agent.firstVisitCompletedAt, transferId: transfer?.id || null, transferLocationCaptured: Boolean(transfer?.acceptedAt && needsLocationCapture), created: true });
       }
       return results;
     }, { maxWait: 10000, timeout: 30000 });
     await Promise.all(syncedVisits.filter((visit) => visit.created).map((visit) => logAction(req.user.id, 'SYNC_OFFLINE_VISIT', 'Visit', visit.id, { visitId: visit.visitId }, req)));
-    await Promise.all(syncedVisits.filter((visit) => visit.created && visit.firstVisit).map((visit) => logAction(req.user.id, visit.transferId ? 'COMPLETE_AGENT_TRANSFER' : 'COMPLETE_AGENT_FIRST_VISIT', 'Agent', visit.agentId, {
+    await Promise.all(syncedVisits.filter((visit) => visit.created && (visit.firstVisit || visit.transferLocationCaptured)).map((visit) => logAction(req.user.id, visit.transferId ? 'COMPLETE_AGENT_TRANSFER' : 'COMPLETE_AGENT_FIRST_VISIT', 'Agent', visit.agentId, {
       agentName: visit.agentName, agentCode: visit.agentCode, territoryId: visit.territoryId, sectorId: visit.sectorId,
       cellId: visit.cellId, villageId: visit.villageId, transferId: visit.transferId,
     }, req)));
     res.json({ syncedCount: syncedVisits.length, syncedVisits, needsCompletion: syncedVisits.length > 0 });
   } catch (error) {
     console.error('Visit sync error:', error);
-    res.status(error.message?.includes('client visit ID') || error.message?.includes('registered this agent') ? 409 : 500).json({ error: error.message || 'Could not synchronize offline visits.' });
+    res.status(error.statusCode || (error.message?.includes('client visit ID') || error.message?.includes('registered this agent') ? 409 : 500)).json({ error: error.message || 'Could not synchronize offline visits.' });
   }
 });
 
