@@ -1,4 +1,4 @@
-# DDIN TC Agent Visit & Reporting System
+# DDIN TC Daily Tool
 
 This application manages TC assignments, agent registration, GPS-verified field visits, photo evidence and visit reports. PostgreSQL stores the operational data. The browser application is a PWA for TC field work and can save visits to a device while disconnected.
 
@@ -6,14 +6,14 @@ This application manages TC assignments, agent registration, GPS-verified field 
 
 | Service | Responsibility | Local port |
 | --- | --- | ---: |
-| API Gateway | Routes authenticated API traffic | 3000 |
-| AuthService | Login, token refresh, users, roles and audit events | 3001 |
-| AgentsService | Agents, territories, TC assignments and location history | 3002 |
-| VisitsService | GPS check-in, photos, reports, check-out and visit history | 3003 |
-| ReportsService | Dashboards, reports, CSV exports, audit logs and system settings | 3004 |
-| Frontend | React PWA served by Nginx | 5173 |
+| API Gateway (`backend/ApiGateway`) | Routes authenticated API traffic | 3000 |
+| AuthService (`backend/AuthService`) | Login, token refresh, users, roles and audit events | 3001 |
+| AgentsService (`backend/AgentsService`) | Agents, territories, TC assignments and location history | 3002 |
+| VisitsService (`backend/VisitsService`) | GPS check-in, photos, reports, check-out and visit history | 3003 |
+| ReportsService (`backend/ReportsService`) | Dashboards, reports, CSV exports, audit logs and system settings | 3004 |
+| Frontend (`frontend/`) | React PWA served by Nginx | 5173 (dev) / 8080 (Compose) |
 
-All application services use the shared schema in `prisma/schema.prisma`. PostgreSQL is external to Compose. The current visit-photo volume is local to one Docker host.
+All backend services, shared code, scripts and the schema in `backend/prisma/schema.prisma` live under `backend/`; the frontend remains independently buildable from `frontend/`. The root `compose.yaml` orchestrates both folders. PostgreSQL is external to Compose. The current visit-photo volume is local to one Docker host.
 
 ## Offline field workflow
 
@@ -23,7 +23,13 @@ The offline agent package is refreshed at login and when a connection returns. A
 
 ## Field progress and official territory data
 
-The dashboard uses one optional From/Through date range for its visit cards, field analysis, location activity and recent visits. Coverage counts distinct active agents with a completed or flagged visit in that period. Each agent can have only one visit record per Kigali calendar month, enforced for both online check-in and offline synchronization. The system shows each TC's minimum weekday target by dividing their active assigned agents across the working days in the next three months. Weekday averages include dates with no completed agent visits so teams can compare both route volume and consistency.
+The Overview navigation contains Irembo and Moola Plus network views. The selected network stays active while users open Agents, Visits and Reports. Irembo visits and field agents remain in this system's database; ReportsService keeps district, franchisee and transaction-count fields from the Irembo feed in a short-lived cache. Activity status is derived from the transaction count. Set `IREMBO_ACTIVITY_FEED_URL` in the local `.env` and the ReportsService deployment environment. Moola Plus agents are fetched read-only from the DDIN registry and enriched with counts from its per-agent manual-deposit report. ReportsService does not copy Moola Plus agents into the Irembo database. Existing Irembo rows must be kept because visits, location history, territory assignments and reports reference them. Configure `DDIN_REPORTS_API_BASE_URL`, `DDIN_AGENT_LIST_API_URL`, `DDIN_AGENT_DEPOSITS_API_URL`, `DDIN_FLOAT_BALANCE_API_URL`, `DDIN_API_KEY` (if required) and `DDIN_AGENT_LIST_CACHE_MS` for ReportsService. The DDIN API key is used only by ReportsService.
+
+Both network overviews use the transaction thresholds: Active 80+, Transacting 30–79, Dormant 1–29 and Inactive 0. The Irembo feed includes `Total Transactions` but does not identify the count's date window. The Moola Plus API currently provides `countDeposit`, which counts manual deposits rather than all agent transactions, and does not expose a selectable month. Both views identify the source and avoid claiming a monthly total where the API does not specify one.
+
+The Irembo dashboard uses one optional From/Through date range for its visit cards, field analysis, location activity and recent visits. A TC may record repeat visits at any time, online or offline. Only one visit per agent in a rolling three-month period counts toward performance and coverage metrics; additional visits stay in visit history and are marked as excluded. The system shows each TC's minimum weekday target by dividing their active assigned agents across the working days in the next three months. Weekday averages include dates with no completed agent visits so teams can compare both route volume and consistency.
+
+The three-month visit metric rule requires the `20261109100000_three_month_visit_metrics` Prisma migration before deploying VisitsService and ReportsService. It marks existing repeat records as excluded while preserving them in history.
 
 TCs can save a date, territory, agent target and optional route note as a field plan. The daily target starts from the TC's calculated minimum. The dashboard compares each planned day with unique agents reached in that area on that date. Plan records are scoped to the owning TC and require the `20261102100000_tc_visit_planning` Prisma migration to be applied before deploying the updated ReportsService.
 
@@ -31,7 +37,7 @@ Administrators can configure typed visit-report questions in Section A (IREMBO, 
 
 Dashboard totals use database aggregates instead of loading every visit into the ReportsService process. Agent and visit list responses select only fields used by those screens. The `20261103140000_read_path_performance` migration adds date and sort indexes for those queries.
 
-The supplied territory register is stored in `data/rwanda-territory-catalog.json` (30 districts, 416 sectors, 2,148 cells and 14,834 distinct village labels). Preview before importing with `npm run import:rwanda-territories:preview`; apply with `npm run import:rwanda-territories` after reviewing the preview. The importer reuses matched territory records, adds missing official sectors/cells/villages, standardizes known spelling variants, merges duplicate cell/village rows onto their official matches, removes cells and villages absent from the register, and redirects affected agent/plan references before cleanup. It deactivates the named demo TC accounts while preserving historical audit records. AgentsService and VisitsService reject ad hoc cell/village creation during online/offline field capture and bulk agent imports use only saved territories.
+The supplied territory register is stored in `backend/data/rwanda-territory-catalog.json` (30 districts, 416 sectors, 2,148 cells and 14,834 distinct village labels). Preview before importing with `npm --prefix backend run import:rwanda-territories:preview`; apply with `npm --prefix backend run import:rwanda-territories` after reviewing the preview. The importer reuses matched territory records, adds missing official sectors/cells/villages, standardizes known spelling variants, merges duplicate cell/village rows onto their official matches, removes cells and villages absent from the register, and redirects affected agent/plan references before cleanup. It deactivates the named demo TC accounts while preserving historical audit records. AgentsService and VisitsService reject ad hoc cell/village creation during online/offline field capture and bulk agent imports use only saved territories.
 
 TCs can organize agents by assigned sector in **Sector WhatsApp groups**. The manual workflow opens WhatsApp for group setup, stores its invite link and prepares a phone-number-specific invite for each agent. Agents join through the WhatsApp invite link.
 
@@ -51,34 +57,33 @@ docker compose logs -f --tail=200 api-gateway visits-service
 
 Gateway log entries include the request ID, upstream service, status, duration and request size. VisitsService adds the photo byte count and separate time spent receiving the upload, looking up the visit and saving photo metadata. For larger deployments, replace the host-local `visit-photos` volume with shared object storage and serve images through a CDN before scaling VisitsService across hosts.
 
-Compose container checks use the lightweight `/health` liveness endpoints so repeated probes do not compete with application traffic for PostgreSQL connections. The `/ready` endpoints remain available when an operator or load balancer needs a database-readiness check.
+Compose runs the one-shot `db-migrate` service before starting the API services. It retries temporary database connection failures and blocks app startup if migrations cannot be applied. This prevents a new application image from serving requests against an old schema. Compose container checks use the lightweight `/health` liveness endpoints; the `/ready` endpoints remain available for database-readiness checks.
 
 ## Local setup
 
 1. Copy `.env.example` to `.env` and set `DATABASE_URL`, `JWT_SECRET`, `JWT_REFRESH_SECRET`, `PII_ENCRYPTION_KEY` and the browser-facing `FRONTEND_URL`. Generate the PII key with `openssl rand -base64 32`, store it in a secrets manager and keep a secure backup. Use separate random JWT secrets outside development. Ensure the database hostname is reachable from the containers, and enable TLS for hosted PostgreSQL.
-2. Install dependencies in the repository root, each service directory and `frontend` with `npm ci`.
+2. Install the shared backend dependencies with `npm ci --prefix backend`, then install each service package and the frontend package with `npm ci --prefix backend/ApiGateway`, `npm ci --prefix backend/AuthService`, `npm ci --prefix backend/AgentsService`, `npm ci --prefix backend/VisitsService`, `npm ci --prefix backend/ReportsService` and `npm ci --prefix frontend`.
 3. Apply pending migrations to the selected database:
 
    ```bash
-   npx prisma migrate deploy
+   cd backend && npx prisma migrate deploy
    ```
 
 4. Start the services with `./start-dev.sh`. It uses ports 3000–3004 and 5173 and exits if a port is occupied.
 
-The demo seed script is blocked when `NODE_ENV=production`. It creates two demo TCs, each with a separate demo district and agent, plus the demo Admin if one does not exist. Run it only against a database reserved for demos: `DEMO_SEED_ENABLED=true npm run seed:demo`. New TC accounts use `TC_INITIAL_PASSWORD`, must change it at first sign-in, and the temporary password expires after 24 hours.
+The demo seed script is blocked when `NODE_ENV=production`. It creates two demo TCs, each with a separate demo district and agent, plus the demo Admin if one does not exist. Run it only against a database reserved for demos: `DEMO_SEED_ENABLED=true npm --prefix backend run seed:demo`. New TC accounts use `TC_INITIAL_PASSWORD`, must change it at first sign-in, and the temporary password expires after 24 hours.
 
-`npm run reset:demo` defaults to a dry run. It reports the demo records in scope and stops if another active TC or visit is linked to a demo territory. To apply a reviewed reset in a non-production demo environment, set `DEMO_RESET_ENABLED=true`, pass `--apply`, and set `DEMO_PHOTO_STORAGE_DIR` to the visit-photo volume path. The reset keeps `demo-admin`, removes the old demo records and photo files, then creates two new TC accounts with different territories and agents. Never run it against a shared or production database.
+`npm --prefix backend run reset:demo` defaults to a dry run. It reports the demo records in scope and stops if another active TC or visit is linked to a demo territory. To apply a reviewed reset in a non-production demo environment, set `DEMO_RESET_ENABLED=true`, pass `--apply`, and set `DEMO_PHOTO_STORAGE_DIR` to the visit-photo volume path. The reset keeps `demo-admin`, removes the old demo records and photo files, then creates two new TC accounts with different territories and agents. Never run it against a shared or production database.
 
 ## Docker Compose
 
-Set `.env` with a PostgreSQL URL reachable from the containers. Compose binds the frontend to `127.0.0.1:${FRONTEND_PORT:-5173}` and the gateway to `127.0.0.1:3000`; neither is exposed to the public interface by default.
+Set `.env` with a PostgreSQL URL reachable from the containers. Compose reads backend build context from `backend/` and the frontend build context from `frontend/`.
 
 ```bash
-npx prisma migrate deploy
 docker compose up --build -d
 ```
 
-Open `http://localhost:5173`. Compose includes service health checks, restart policies and a persistent visit-photo volume. A one-shot initializer repairs the volume directory ownership before VisitsService starts; application containers run as non-root users. Keep the app behind an HTTPS reverse proxy or load balancer for field devices; point `FRONTEND_URL` at the public origin and restrict direct access to the host ports.
+Open `http://localhost:8080`. Compose includes service health checks, restart policies and a persistent visit-photo volume. A one-shot initializer repairs the volume directory ownership before VisitsService starts; application containers run as non-root users. Keep the app behind an HTTPS reverse proxy or load balancer for field devices; point `FRONTEND_URL` at the public origin and restrict direct access to the host ports.
 
 ## Bulk registration and source workbook notes
 

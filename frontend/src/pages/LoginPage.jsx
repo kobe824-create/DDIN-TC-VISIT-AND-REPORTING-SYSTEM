@@ -43,10 +43,10 @@ export default function LoginPage() {
       </div>
       <div className="login-story-copy">
         <p className="login-overline">DDIN TC VISIT SYSTEM</p>
-        <h1>Territory visit reporting</h1>
-        <p>Check in with agents, document each visit, and keep follow-up details together.</p>
+        <h1>TC Daily Tool</h1>
+        <p>Record field activity and track agent coverage across your assigned areas.</p>
       </div>
-      <footer className="login-story-foot">DDIN · TC visit and reporting</footer>
+      <footer className="login-story-foot">DDIN · TC Daily Tool</footer>
     </section>
     <section className="login-form-panel"><div className="login-form-wrap">
       <h1>Sign in</h1><p className="login-intro">Use your DDIN account to continue.</p>

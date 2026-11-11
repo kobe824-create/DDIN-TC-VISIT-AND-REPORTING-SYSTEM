@@ -3,6 +3,7 @@ import { Copy, ExternalLink, MessageCircle, RefreshCw, UsersRound } from 'lucide
 import api from '../api';
 import PageHeader from '../components/PageHeader';
 import { ErrorState, LoadingState } from '../components';
+import { MOOLA_PLUS_NETWORK, useNetwork } from '../NetworkContext';
 
 const phoneDigits = (value) => {
   const digits = String(value || '').replace(/\D/g, '');
@@ -10,6 +11,9 @@ const phoneDigits = (value) => {
 };
 
 export default function SectorGroups() {
+  const { network } = useNetwork();
+  const isMoolaPlus = network === MOOLA_PLUS_NETWORK;
+  const groupsEndpoint = isMoolaPlus ? '/api/v1/agents/moola-plus-sector-groups' : '/api/v1/agents/sector-groups';
   const [sectors, setSectors] = useState([]);
   const [links, setLinks] = useState({});
   const [loading, setLoading] = useState(true);
@@ -23,13 +27,13 @@ export default function SectorGroups() {
     setLoading(true);
     setError('');
     try {
-      const { data } = await api.get('/api/v1/agents/sector-groups');
+      const { data } = await api.get(groupsEndpoint);
       setSectors(Array.isArray(data) ? data : []);
       setLinks(Object.fromEntries((Array.isArray(data) ? data : []).map((sector) => [sector.id, sector.inviteUrl || ''])));
     } catch (err) {
       setError(err.response?.data?.error || 'Could not load your assigned sectors.');
     } finally { setLoading(false); }
-  }, []);
+  }, [groupsEndpoint]);
 
   useEffect(() => { loadSectors(); }, [loadSectors]);
 
@@ -37,7 +41,7 @@ export default function SectorGroups() {
     setSavingSector(sector.id);
     setError(''); setNotice('');
     try {
-      const { data } = await api.put(`/api/v1/agents/sector-groups/${sector.id}`, { inviteUrl: links[sector.id] });
+      const { data } = await api.put(`${groupsEndpoint}/${sector.id}`, { inviteUrl: links[sector.id] });
       setLinks((current) => ({ ...current, [sector.id]: data.inviteUrl }));
       setNotice(data.inviteUrl ? `WhatsApp invite saved for ${sector.name}.` : `Saved invite link removed for ${sector.name}.`);
     } catch (err) {
@@ -49,7 +53,7 @@ export default function SectorGroups() {
     setSavingSector(sector.id);
     setError(''); setNotice('');
     try {
-      await api.put(`/api/v1/agents/sector-groups/${sector.id}`, { inviteUrl: '' });
+      await api.put(`${groupsEndpoint}/${sector.id}`, { inviteUrl: '' });
       setLinks((current) => ({ ...current, [sector.id]: '' }));
       setNotice(`Saved invite link removed for ${sector.name}.`);
     } catch (err) {
@@ -61,7 +65,7 @@ export default function SectorGroups() {
     setProcessingSector(sector.id);
     setError(''); setNotice('');
     try {
-      const { data } = await api.post(`/api/v1/agents/sector-groups/${sector.id}/create`, { confirmAgentConsent: consents[sector.id] === true });
+      const { data } = await api.post(`${groupsEndpoint}/${sector.id}/create`, { confirmAgentConsent: consents[sector.id] === true });
       if (data.inviteUrl) setLinks((current) => ({ ...current, [sector.id]: data.inviteUrl }));
       const counts = `Added ${data.addedCount} of ${data.attemptedCount} phone number${data.attemptedCount === 1 ? '' : 's'}.`;
       const skipped = data.missingPhoneCount || data.invalidPhoneCount || data.failedCount
@@ -96,7 +100,7 @@ export default function SectorGroups() {
   const inviteHref = (sector, phone) => `https://wa.me/${phoneDigits(phone)}?text=${encodeURIComponent(inviteMessage(sector))}`;
 
   return <div className="sector-groups-page page">
-    <PageHeader title="Sector WhatsApp groups" subtitle="Organize agents by your assigned sectors and send each person a group invitation." actions={<button className="btn btn-secondary" type="button" onClick={loadSectors}><RefreshCw size={15} />Refresh</button>} />
+    <PageHeader title={`${isMoolaPlus ? 'Moola Plus' : 'Irembo'} sector WhatsApp groups`} subtitle={`Organize ${isMoolaPlus ? 'Moola Plus' : 'Irembo'} agents by assigned sector and invite them to the right group.`} actions={<button className="btn btn-secondary" type="button" onClick={loadSectors}><RefreshCw size={15} />Refresh</button>} />
     <div className="sector-groups-guidance"><MessageCircle size={19} /><div><strong>Set up a group for each assigned sector</strong><p>Use automatic setup if the provider is configured and every agent has agreed, or create a group in WhatsApp and save its invite link here. Agents who cannot be added automatically can join through that link.</p></div></div>
     <div className="sector-groups-provider-note"><strong>Automatic group setup</strong><p>When an administrator configures the optional Whapi.Cloud connection, you can create a group and add agents with valid phone numbers. This sends those numbers to an external provider and can reveal them to everyone in the group. Get each agent’s permission first. If WhatsApp blocks an addition, use the invite link so that agent can choose to join.</p><small>Whapi.Cloud uses a linked WhatsApp device session. Review <a href="https://www.whatsapp.com/legal/terms-of-service" target="_blank" rel="noreferrer">WhatsApp’s terms</a> and <a href="https://faq.whatsapp.com/361005896189245/?locale=en_US" target="_blank" rel="noreferrer">group consent guidance</a> before using automated setup.</small></div>
     {notice && <p className="sector-groups-notice" role="status">{notice}</p>}

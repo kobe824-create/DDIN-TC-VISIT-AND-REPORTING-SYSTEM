@@ -1,0 +1,9 @@
+**/.env
+**/.env.*
+!**/.env.example
+**/node_modules
+**/uploads
+**/dist
+data/*credential*
+data/*demo*
+npm-debug.log*

@@ -30,21 +30,21 @@ done
 
 # Start backend services
 echo "Starting AuthService on port 3001..."
-(cd "$PROJECT_DIR/AuthService" && PORT=3001 node src/server.js) &
+(cd "$PROJECT_DIR/backend/AuthService" && PORT=3001 node src/server.js) &
 
 echo "Starting AgentsService on port 3002..."
-(cd "$PROJECT_DIR/AgentsService" && PORT=3002 node src/server.js) &
+(cd "$PROJECT_DIR/backend/AgentsService" && PORT=3002 node src/server.js) &
 
 echo "Starting VisitsService on port 3003..."
-(cd "$PROJECT_DIR/VisitsService" && PORT=3003 node src/server.js) &
+(cd "$PROJECT_DIR/backend/VisitsService" && PORT=3003 node src/server.js) &
 
 echo "Starting ReportsService on port 3004..."
-(cd "$PROJECT_DIR/ReportsService" && PORT=3004 node src/server.js) &
+(cd "$PROJECT_DIR/backend/ReportsService" && PORT=3004 node src/server.js) &
 
 sleep 2
 
 echo "Starting ApiGateway on port 3000..."
-(cd "$PROJECT_DIR/ApiGateway" && PORT=3000 node src/server.js) &
+(cd "$PROJECT_DIR/backend/ApiGateway" && PORT=3000 node src/server.js) &
 
 sleep 1
 

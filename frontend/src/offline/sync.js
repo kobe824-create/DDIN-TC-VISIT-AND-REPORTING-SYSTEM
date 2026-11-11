@@ -19,6 +19,7 @@ async function syncOne(draft) {
       tcLatitude: current.tcLatitude,
       tcLongitude: current.tcLongitude,
       gpsAccuracyMeters: current.gpsAccuracyMeters,
+      locationMethod: current.locationMethod || current.gpsData?.locationMethod || 'GPS',
       visitDate: current.visitDate,
       checkInTime: current.checkInTime,
       agentLocation: current.agentLocation || null,

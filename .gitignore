@@ -13,7 +13,7 @@ frontend/dist/
 
 # Uploaded visit evidence and runtime output
 **/uploads/
-data/*credential*
-data/*demo*
+**/data/*credential*
+**/data/*demo*
 *.log
 npm-debug.log*

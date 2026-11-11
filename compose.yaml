@@ -1,6 +1,14 @@
 services:
+  db-migrate:
+    build:
+      context: ./backend
+      dockerfile: prisma/migrate.Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    restart: "no"
+
   api-gateway:
-    build: ./ApiGateway
+    build: ./backend/ApiGateway
     environment:
       PORT: 3000
       AUTH_SERVICE_URL: http://auth-service:3001
@@ -29,7 +37,7 @@ services:
 
   auth-service:
     build:
-      context: .
+      context: ./backend
       dockerfile: AuthService/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL}
@@ -38,6 +46,9 @@ services:
       TC_INITIAL_PASSWORD: ${TC_INITIAL_PASSWORD:-}
       PORT: 3001
     restart: unless-stopped
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 5s
@@ -46,14 +57,19 @@ services:
 
   agents-service:
     build:
-      context: .
+      context: ./backend
       dockerfile: AgentsService/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL}
       JWT_SECRET: ${JWT_SECRET}
       PII_ENCRYPTION_KEY: ${PII_ENCRYPTION_KEY}
+      REPORTS_SERVICE_URL: http://reports-service:3004
+      WHAPI_API_TOKEN: ${WHAPI_API_TOKEN:-}
       PORT: 3002
     restart: unless-stopped
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3002/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 5s
@@ -72,17 +88,20 @@ services:
 
   visits-service:
     build:
-      context: .
+      context: ./backend
       dockerfile: VisitsService/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL}
       JWT_SECRET: ${JWT_SECRET}
+      REPORTS_SERVICE_URL: http://reports-service:3004
       PORT: 3003
     restart: unless-stopped
     volumes:
       - visit-photos:/app/VisitsService/uploads
     depends_on:
       visits-uploads-init:
+        condition: service_completed_successfully
+      db-migrate:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3003/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
@@ -92,13 +111,23 @@ services:
 
   reports-service:
     build:
-      context: .
+      context: ./backend
       dockerfile: ReportsService/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL}
       JWT_SECRET: ${JWT_SECRET}
+      IREMBO_ACTIVITY_FEED_URL: ${IREMBO_ACTIVITY_FEED_URL:-}
+      DDIN_REPORTS_API_BASE_URL: ${DDIN_REPORTS_API_BASE_URL:-https://core-api.ddin.rw/v1/agency/thirdpartyagency/services/reports}
+      DDIN_AGENT_LIST_API_URL: ${DDIN_AGENT_LIST_API_URL:-https://core-api.ddin.rw/v1/agency/thirdpartyagency/services/reports/agents/list}
+      DDIN_AGENT_DEPOSITS_API_URL: ${DDIN_AGENT_DEPOSITS_API_URL:-https://core-api.ddin.rw/v1/agency/thirdpartyagency/services/reports/float/manual-deposit/per-agent}
+      DDIN_FLOAT_BALANCE_API_URL: ${DDIN_FLOAT_BALANCE_API_URL:-https://core-api.ddin.rw/v1/agency/thirdpartyagency/services/reports/float/balance}
+      DDIN_API_KEY: ${DDIN_API_KEY:-}
+      DDIN_AGENT_LIST_CACHE_MS: ${DDIN_AGENT_LIST_CACHE_MS:-300000}
       PORT: 3004
     restart: unless-stopped
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3004/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 5s

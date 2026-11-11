@@ -6,13 +6,13 @@ import {
   KeyRound, MessageCircle, UserRound, UsersRound, X
 } from 'lucide-react';
 import { useAuth } from '../AuthContext';
+import { IREMBO_NETWORK, MOOLA_PLUS_NETWORK, useNetwork } from '../NetworkContext';
 import OfflineBanner from './OfflineBanner';
 import RequestNotifications from './RequestNotifications';
 import { getVisitDrafts } from '../offline/store';
 import { syncPendingVisits } from '../offline/sync';
 
 const primaryNav = [
-  { label: 'Overview', path: '/dashboard', icon: LayoutDashboard, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
   { label: 'Visits', path: '/visits', icon: MapPinned, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
   { label: 'Agents', path: '/agents', icon: UsersRound, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
   { label: 'Sector groups', path: '/sector-groups', icon: MessageCircle, roles: ['TC'] },
@@ -32,6 +32,7 @@ const systemNav = [
 
 export default function Layout() {
   const { user, logout } = useAuth();
+  const { network, setNetwork } = useNetwork();
   const location = useLocation();
   const navigate = useNavigate();
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -190,6 +191,39 @@ export default function Layout() {
     );
   };
 
+  const renderWorkspace = () => (
+    <section className="nav-section" key="Workspace">
+      <p className="nav-section-label">Workspace</p>
+      <div className="nav-items">
+        <NavLink to="/dashboard" className={({ isActive }) => `nav-link${isActive ? ' is-active' : ''}`}>
+          <LayoutDashboard size={18} strokeWidth={1.8} aria-hidden="true" />
+          <span>Overview</span>
+        </NavLink>
+        <div className="network-nav-subitems" aria-label="Overview networks">
+          {[{ value: IREMBO_NETWORK, label: 'Irembo' }, { value: MOOLA_PLUS_NETWORK, label: 'Moola Plus' }].map(({ value, label }) => (
+            <button key={value} type="button" className={`network-nav-item${network === value ? ' is-selected' : ''}`} aria-current={network === value ? 'true' : undefined}
+              onClick={() => { setNetwork(value); navigate('/dashboard'); setDrawerOpen(false); }}>
+              <span>{label}</span>
+            </button>
+          ))}
+        </div>
+        {primaryNav.filter((item) => item.roles.includes(role)).map(({ label: itemLabel, path, icon: Icon }) => (
+          <React.Fragment key={path}>
+            <NavLink to={path} end={path === '/visits'} className={({ isActive }) => `nav-link${isActive ? ' is-active' : ''}`}>
+              <Icon size={18} strokeWidth={1.8} aria-hidden="true" />
+              <span>{itemLabel}</span>
+            </NavLink>
+            {path === '/visits' && role === 'TC' && <div className="network-nav-subitems" aria-label="Visit pages">
+              <NavLink to="/visits/plans" className={({ isActive }) => `network-nav-item workspace-subnav-link${isActive ? ' is-selected' : ''}`}>
+                Field plans
+              </NavLink>
+            </div>}
+          </React.Fragment>
+        ))}
+      </div>
+    </section>
+  );
+
   const Sidebar = () => (
     <div className="sidebar-inner">
       <div className="brand-lockup">
@@ -199,7 +233,7 @@ export default function Layout() {
 
       <nav className="side-navigation" aria-label="Main navigation">
         {mustChangePassword ? renderGroup('Account security', changePasswordNav) : <>
-          {renderGroup('Workspace', primaryNav)}
+          {renderWorkspace()}
           {renderGroup('Management', managementNav)}
           {renderGroup('Administration', systemNav)}
         </>}
@@ -237,10 +271,11 @@ export default function Layout() {
             <button className="icon-button menu-toggle" onClick={() => setDrawerOpen(true)} aria-label="Open navigation" aria-expanded={drawerOpen} aria-controls="mobile-navigation"><Menu size={20} /></button>
             <div className="topbar-brand-lockup">
               <img src="/logo.png" alt="" />
-              <span><strong>DDIN</strong><small>TC visit system</small></span>
+              <span><strong>DDIN</strong><small>TC Daily Tool</small></span>
             </div>
           </div>
           <div className="topbar-actions">
+            <span className={`active-network-chip ${network === MOOLA_PLUS_NETWORK ? 'moola' : ''}`}>{network === MOOLA_PLUS_NETWORK ? 'Moola Plus' : 'Irembo'}</span>
             <div className="profile-menu-wrap">
               <button className="topbar-profile" onClick={() => setProfileOpen((value) => !value)} aria-expanded={profileOpen}>
                 <span className="avatar">{initials}</span><span className="topbar-profile-copy"><strong>{fullName}</strong><small>{role}</small></span><ChevronDown size={15} />
@@ -260,7 +295,8 @@ export default function Layout() {
       </div>
       <nav className={`mobile-tabs${mustChangePassword ? ' mobile-tabs-single' : ''}`} aria-label="Quick navigation">
         {mustChangePassword ? <NavLink to="/profile" className={({ isActive }) => `mobile-tab${isActive ? ' is-active' : ''}`}><KeyRound size={19} /><span>Change password</span></NavLink> : <>
-          {primaryNav.map(({ label, path, icon: Icon }) => <NavLink key={path} to={path} className={({ isActive }) => `mobile-tab${isActive ? ' is-active' : ''}`}><Icon size={19} /><span>{label}</span></NavLink>)}
+          <NavLink to="/dashboard" className={({ isActive }) => `mobile-tab${isActive ? ' is-active' : ''}`}><LayoutDashboard size={19} /><span>Overview</span></NavLink>
+          {primaryNav.filter(({ label }) => label !== 'Sector groups').map(({ label, path, icon: Icon }) => <NavLink key={path} to={path} className={({ isActive }) => `mobile-tab${isActive ? ' is-active' : ''}`}><Icon size={19} /><span>{label}</span></NavLink>)}
         </>}
       </nav>
     </div>

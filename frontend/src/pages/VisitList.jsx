@@ -6,11 +6,12 @@ import api from '../api';
 import PageHeader from '../components/PageHeader';
 import { ErrorState, ListPagination, LoadingState, StatusBadge } from '../components';
 import { getVisitDrafts } from '../offline/store';
+import { MOOLA_PLUS_NETWORK, useNetwork } from '../NetworkContext';
 
 const nameOf = (person) => [person?.firstName, person?.lastName].filter(Boolean).join(' ') || person?.username || '—';
 const dateOf = (value) => value ? new Intl.DateTimeFormat('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value)) : '—';
 
-export default function VisitList() {
+function IremboVisitList({ network = 'IREMBO' }) {
   const { user } = useAuth();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -29,12 +30,13 @@ export default function VisitList() {
   const [showingDeviceVisits, setShowingDeviceVisits] = useState(false);
   const canCreate = user?.role?.toUpperCase() === 'TC';
   const canExport = ['ADMIN', 'MANAGER'].includes(user?.role?.toUpperCase());
+  const isMoolaPlus = network === MOOLA_PLUS_NETWORK;
 
   const loadVisits = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      const params = { page, limit: pageSize };
+      const params = { page, limit: pageSize, network };
       if (search.trim()) params.search = search.trim();
       if (status) params.status = status;
       if (fromDate) params.fromDate = fromDate;
@@ -46,7 +48,7 @@ export default function VisitList() {
       setPage(data.meta?.page ?? page);
       setShowingDeviceVisits(false);
     } catch (err) {
-      if (user?.role?.toUpperCase() === 'TC') {
+      if (!isMoolaPlus && user?.role?.toUpperCase() === 'TC') {
         try {
           const drafts = (await getVisitDrafts(user.id)).filter((draft) => draft.completed);
           const localVisits = drafts.map((draft) => ({
@@ -70,7 +72,7 @@ export default function VisitList() {
     } finally {
       setLoading(false);
     }
-  }, [page, pageSize, search, status, fromDate, toDate, user]);
+  }, [page, pageSize, search, status, fromDate, toDate, user, network, isMoolaPlus]);
 
   useEffect(() => {
     const timer = window.setTimeout(loadVisits, search.trim() ? 250 : 0);
@@ -84,7 +86,7 @@ export default function VisitList() {
   const exportCsv = async () => {
     setExporting(true);
     try {
-      const { data } = await api.get('/api/v1/reports/export', { params: { fromDate, toDate }, responseType: 'blob' });
+      const { data } = await api.get('/api/v1/reports/export', { params: { fromDate, toDate, network }, responseType: 'blob' });
       const link = document.createElement('a');
       link.href = URL.createObjectURL(data);
       link.download = 'ddin-visits.csv';
@@ -99,16 +101,16 @@ export default function VisitList() {
 
   const openVisit = (visit) => navigate(visit.offlineDraft ? '/visits/new' : `/visits/${visit.id}`);
   const visitRows = visits.map((visit) => <tr key={visit.id} onClick={() => openVisit(visit)} tabIndex="0" onKeyDown={(event) => event.key === 'Enter' && openVisit(visit)}>
-    <td><div className="table-person"><span className="table-avatar"><MapPin size={14} /></span><span><strong>{visit.visitId}</strong><small>{visit.agent?.agentId || 'Agent'}</small></span></div></td>
-    <td><strong className="visit-agent-name">{visit.agent?.name || 'Unknown agent'}</strong><small className="visit-subtext">{visit.agent?.businessName || '—'}</small></td>
+    <td><div className="table-person"><span className="table-avatar"><MapPin size={14} /></span><span><strong>{visit.visitId}</strong><small>{visit.agent?.agentId || visit.externalAgentCode || 'Agent'}</small></span></div></td>
+    <td><strong className="visit-agent-name">{visit.agent?.name || visit.externalAgentName || 'Unknown agent'}</strong><small className="visit-subtext">{visit.agent?.businessName || (isMoolaPlus ? 'Moola Plus' : '—')}</small></td>
     <td>{nameOf(visit.tc)}</td>
-    <td>{visit.offlineDraft ? <StatusBadge status="pending" /> : <StatusBadge status={visit.visitStatus} />}</td>
+    <td>{visit.offlineDraft ? <StatusBadge status="pending" /> : <><StatusBadge status={visit.visitStatus} />{visit.countsForMetrics === false && <small className="metric-exclusion-note">Follow-up · excluded from metrics</small>}</>}</td>
     <td><span className={`location-result ${visit.locationStatus === 'VERIFIED' ? 'verified' : 'needs-review'}`}><span />{(visit.locationStatus || 'UNKNOWN').replaceAll('_', ' ')}</span><small className="visit-subtext">{Math.round(visit.distanceMeters || 0)} m from agent</small></td>
     <td>{dateOf(visit.checkInTime || visit.visitDate)}</td>
   </tr>);
 
   return <div className="visit-list-page page">
-    <PageHeader title="Visits" subtitle="Review field check-ins, GPS verification and submitted reports." actions={<div className="flex gap-2">{canExport && <button className="btn btn-secondary" onClick={exportCsv} disabled={exporting}><Download size={16} />{exporting ? 'Preparing…' : 'Export CSV'}</button>}{canCreate && <button className="btn btn-primary" onClick={() => navigate('/visits/new')}><Plus size={16} />Start a visit</button>}</div>} />
+    <PageHeader title={isMoolaPlus ? 'Moola Plus visits' : 'Irembo visits'} subtitle={`Review ${isMoolaPlus ? 'Moola Plus' : 'Irembo'} field check-ins, GPS verification and submitted reports.`} actions={<div className="flex gap-2">{canExport && <button className="btn btn-secondary" onClick={exportCsv} disabled={exporting}><Download size={16} />{exporting ? 'Preparing…' : 'Export CSV'}</button>}{canCreate && <button className="btn btn-primary" onClick={() => navigate('/visits/new')}><Plus size={16} />Start a visit</button>}</div>} />
     {showingDeviceVisits && <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">Showing completed visits saved on this device. They will appear in the shared visit history after synchronization.</div>}
     {error && <ErrorState message={error} onRetry={() => loadVisits()} />}
     <section className="visit-filters surface-card">
@@ -124,4 +126,9 @@ export default function VisitList() {
       <div className="card-footnote"><MapPin size={14} /><span>GPS distance and verification status are calculated by the Visits service.</span></div>
     </section>}
   </div>;
+}
+
+export default function VisitList() {
+  const { network } = useNetwork();
+  return <IremboVisitList network={network} />;
 }

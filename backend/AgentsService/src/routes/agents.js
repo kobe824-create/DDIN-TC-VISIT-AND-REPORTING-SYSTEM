@@ -1,16 +1,21 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('node:crypto');
 const prisma = require('../utils/prisma');
 const { authenticateToken, requireRole, requireTerritoryAccess } = require('../middleware/auth');
 const { logAction } = require('../utils/auditLog');
 const { decryptPii, encryptPii } = require('../../../shared/pii');
 const { advisoryTransactionLock } = require('../../../shared/advisory-locks');
+const { coverageState, kigaliDateKey, latestQualifiedVisits } = require('../../../shared/visit-coverage');
 
 const queryIds = (value) => (Array.isArray(value) ? value : value ? [value] : []).map(String).filter(Boolean);
 const isDatabaseSchemaError = (error) => ['P2021', 'P2022'].includes(error?.code);
 const databaseMigrationMessage = 'The database is missing an application update. Apply the pending Prisma migrations and restart the services.';
 const sectorWhatsAppGroupKey = (sectorId) => `SECTOR_WHATSAPP_GROUP:${sectorId}`;
 const sectorWhatsAppInviteKey = (sectorId) => `SECTOR_WHATSAPP_INVITE:${sectorId}`;
+const moolaGroupId = (district, sector) => crypto.createHash('sha256').update(`${String(district || '').trim().toLocaleLowerCase()}\u0000${String(sector || '').trim().toLocaleLowerCase()}`).digest('hex').slice(0, 24);
+const moolaWhatsAppGroupKey = (groupId) => `MOOLA_PLUS_WHATSAPP_GROUP:${groupId}`;
+const moolaWhatsAppInviteKey = (groupId) => `MOOLA_PLUS_WHATSAPP_INVITE:${groupId}`;
 
 function normalizeWhatsAppNumber(value) {
   let digits = String(value || '').trim().split('@')[0].replace(/\D/g, '');
@@ -21,6 +26,18 @@ function normalizeWhatsAppNumber(value) {
 
 function parseSystemConfigJson(value) {
   try { return JSON.parse(value); } catch { return null; }
+}
+
+async function createAgentMovementNotices(tx, { agent, fromTerritoryId, toTerritoryId, noticeType }) {
+  const territories = await tx.territory.findMany({ where: { id: { in: [...new Set([fromTerritoryId, toTerritoryId].filter(Boolean))] } }, select: { id: true, name: true } });
+  const nameById = new Map(territories.map((territory) => [territory.id, territory.name]));
+  const assignments = await tx.tcTerritoryAssignment.findMany({ where: { territoryId: { in: [...nameById.keys()] }, isActive: true, tc: { is: { role: 'TC', isActive: true } } }, select: { tcId: true } });
+  const recipientTcIds = [...new Set(assignments.map(({ tcId }) => tcId))];
+  if (!recipientTcIds.length) return;
+  await tx.agentMovementNotice.createMany({ data: recipientTcIds.map((recipientTcId) => ({
+    recipientTcId, agentId: agent.id, network: 'IREMBO', agentName: agent.name, agentCode: agent.agentId, noticeType,
+    fromTerritoryName: nameById.get(fromTerritoryId) || null, toTerritoryName: nameById.get(toTerritoryId) || null,
+  })) });
 }
 
 function whatsAppProviderReady() {
@@ -119,6 +136,73 @@ async function saveSectorWhatsAppGroup(client, sector, groupData, userId) {
   });
 }
 
+async function getMoolaPlusGroups(req) {
+  const base = String(process.env.REPORTS_SERVICE_URL || 'http://reports-service:3004').replace(/\/$/, '');
+  const agents = [];
+  let pages = 1;
+  for (let page = 1; page <= pages && page <= 500; page += 1) {
+    const query = new URLSearchParams({ page: String(page), limit: '100' });
+    const response = await fetch(`${base}/api/v1/reports/moola-plus/agents?${query}`, {
+      headers: { authorization: req.headers.authorization || '', accept: 'application/json' },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) {
+      const error = new Error('Could not load Moola Plus agents for WhatsApp groups.');
+      error.statusCode = response.status >= 500 ? 502 : response.status;
+      throw error;
+    }
+    const payload = await response.json();
+    agents.push(...(Array.isArray(payload.data) ? payload.data : []));
+    pages = Math.max(1, Number(payload.pages) || 1);
+  }
+
+  const groups = new Map();
+  for (const agent of agents) {
+    const districtName = String(agent.fieldLocation?.district || agent.district || '').trim() || 'Unassigned district';
+    const sectorName = String(agent.fieldLocation?.sector || agent.sector || '').trim() || 'Unspecified sector';
+    const id = moolaGroupId(districtName, sectorName);
+    const group = groups.get(id) || { id, name: sectorName, districtName, agents: [] };
+    group.agents.push({
+      id: String(agent.id),
+      agentId: String(agent.loginName || agent.id),
+      name: String(agent.name || agent.loginName || 'Moola Plus agent'),
+      phoneNumber: String(agent.phone || ''),
+    });
+    groups.set(id, group);
+  }
+
+  const result = [...groups.values()].sort((a, b) => a.districtName.localeCompare(b.districtName) || a.name.localeCompare(b.name));
+  const keys = result.flatMap(({ id }) => [moolaWhatsAppGroupKey(id), moolaWhatsAppInviteKey(id)]);
+  const configs = keys.length ? await prisma.systemConfig.findMany({ where: { key: { in: keys } }, select: { key: true, value: true } }) : [];
+  const configByKey = new Map(configs.map((row) => [row.key, row.value]));
+  return result.map((group) => {
+    const stored = parseSystemConfigJson(configByKey.get(moolaWhatsAppGroupKey(group.id)));
+    return {
+      ...group,
+      inviteUrl: stored?.inviteUrl || configByKey.get(moolaWhatsAppInviteKey(group.id)) || '',
+      group: stored ? {
+        status: stored.status || 'active',
+        groupName: stored.groupName || `DDIN ${group.name}`,
+        createdAt: stored.createdAt || null,
+        attemptedCount: Number.isInteger(stored.attemptedCount) ? stored.attemptedCount : (stored.attemptedAgentIds || []).length,
+        addedCount: Number.isInteger(stored.addedCount) ? stored.addedCount : (stored.addedAgentIds || []).length,
+        failedCount: Number.isInteger(stored.failedCount) ? stored.failedCount : (stored.failedAgentIds || []).length,
+      } : null,
+      providerAvailable: whatsAppProviderReady(),
+    };
+  });
+}
+
+async function saveMoolaWhatsAppGroup(client, group, groupData, userId) {
+  const key = moolaWhatsAppGroupKey(group.id);
+  const value = JSON.stringify(groupData);
+  await client.systemConfig.upsert({
+    where: { key },
+    create: { key, value, description: `WhatsApp group for Moola Plus ${group.name}, ${group.districtName}`, updatedById: userId },
+    update: { value, description: `WhatsApp group for Moola Plus ${group.name}, ${group.districtName}`, updatedById: userId },
+  });
+}
+
 // Express 4 does not forward rejected async route promises. Wrap async handlers
 // so an unexpected database/query error becomes a request error instead of
 // terminating the Agents service process.
@@ -149,6 +233,74 @@ async function validateAgentHierarchy({ territoryId, sectorId, cellId, villageId
   if (!cell || cell.type !== 'CELL' || !cell.isActive || cell.parentId !== sector.id) return 'Choose an active cell inside the selected sector.';
   if (!village || village.type !== 'VILLAGE' || !village.isActive || village.parentId !== cell.id) return 'Choose an active village inside the selected cell.';
   return null;
+}
+
+function normalizeAreaLabel(value) {
+  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').trim().toLocaleLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ');
+}
+
+async function fetchIremboSourceAgent(req, agentCode) {
+  const base = String(process.env.REPORTS_SERVICE_URL || 'http://reports-service:3004').replace(/\/$/, '');
+  let response;
+  try {
+    response = await fetch(`${base}/api/v1/reports/irembo/agents/${encodeURIComponent(agentCode)}`, {
+      headers: { authorization: req.headers.authorization || '', accept: 'application/json' },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch {
+    throw Object.assign(new Error('Could not reach the Irembo activity feed. Try again when online.'), { statusCode: 502 });
+  }
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.data) throw Object.assign(new Error(payload.error || 'Irembo agent not found in the feed.'), { statusCode: response.status || 502 });
+  return payload.data;
+}
+
+async function ensureIremboFieldAgent(req, agentCode) {
+  const code = String(agentCode || '').trim();
+  if (!code || code.startsWith('irembo-')) throw Object.assign(new Error('This feed row has no Irembo agent code and cannot be linked to field actions.'), { statusCode: 409 });
+  const source = await fetchIremboSourceAgent(req, code);
+  if (source.localAgentId) {
+    const linked = await prisma.agent.findUnique({ where: { id: source.localAgentId } });
+    if (linked) return linked;
+  }
+  const existing = await prisma.agent.findFirst({ where: { agentId: { equals: String(source.agentId || code), mode: 'insensitive' } } });
+  if (existing) {
+    if (req.user.role === 'TC' && !(req.user.assignedTerritories || []).includes(existing.territoryId)) throw Object.assign(new Error('This Irembo agent is outside your assigned district.'), { statusCode: 403 });
+    return existing;
+  }
+
+  const allAreas = await prisma.territory.findMany({
+    where: { isActive: true },
+    select: { id: true, name: true, type: true, parentId: true },
+  });
+  const province = allAreas.find((area) => area.type === 'PROVINCE' && normalizeAreaLabel(area.name) === normalizeAreaLabel(source.province));
+  const districtMatches = allAreas.filter((area) => area.type === 'DISTRICT'
+    && normalizeAreaLabel(area.name) === normalizeAreaLabel(source.district)
+    && (!province || area.parentId === province.id));
+  if (districtMatches.length !== 1) throw Object.assign(new Error('This Irembo record is not linked because its district does not match one active system district.'), { statusCode: 409 });
+  const territory = districtMatches[0];
+  if (req.user.role === 'TC' && !(req.user.assignedTerritories || []).includes(territory.id)) throw Object.assign(new Error('This Irembo agent is outside your assigned district.'), { statusCode: 403 });
+  const findChild = (type, parentId, name) => allAreas.find((area) => area.type === type && area.parentId === parentId && normalizeAreaLabel(area.name) === normalizeAreaLabel(name));
+  const sector = findChild('SECTOR', territory.id, source.sector);
+  const cell = sector && findChild('CELL', sector.id, source.cell);
+  const village = cell && findChild('VILLAGE', cell.id, source.village);
+  try {
+    return await prisma.agent.create({
+      data: {
+        agentId: String(source.agentId || code), name: String(source.name || source.agentId || code),
+        phoneNumber: source.phoneNumber || null, businessName: source.franchisee || source.businessName || null,
+        address: [source.province, source.district, source.sector, source.cell, source.village].filter(Boolean).join(' · ') || null,
+        territoryId: territory.id, sectorId: sector?.id || null, cellId: cell?.id || null, villageId: village?.id || null,
+        status: source.activityStatus === 'Active' ? 'ACTIVE' : 'INACTIVE', createdById: req.user.id,
+      },
+    });
+  } catch (error) {
+    if (error.code === 'P2002') {
+      const linked = await prisma.agent.findFirst({ where: { agentId: { equals: String(source.agentId || code), mode: 'insensitive' } } });
+      if (linked) return linked;
+    }
+    throw error;
+  }
 }
 
 async function areaAddress({ villageId }, client = prisma) {
@@ -194,7 +346,7 @@ router.get('/sector-groups', authenticateToken, requireTerritoryAccess, requireR
     const sectorIds = sectors.map(({ id }) => id);
     const [agents, configs] = await Promise.all([
       sectorIds.length ? prisma.agent.findMany({
-        where: { sectorId: { in: sectorIds }, status: 'ACTIVE' },
+        where: { sectorId: { in: sectorIds }, status: 'ACTIVE', isOnHold: false },
         select: { id: true, agentId: true, name: true, phoneNumber: true, sectorId: true },
         orderBy: [{ name: 'asc' }, { id: 'asc' }],
       }) : [],
@@ -286,7 +438,7 @@ router.post('/sector-groups/:sectorId/create', authenticateToken, requireTerrito
     if (!sector) return res.status(404).json({ error: 'This sector is not in your assigned districts.' });
 
     const agents = await prisma.agent.findMany({
-      where: { sectorId: sector.id, status: 'ACTIVE' },
+      where: { sectorId: sector.id, status: 'ACTIVE', isOnHold: false },
       select: { id: true, phoneNumber: true },
       orderBy: [{ id: 'asc' }],
     });
@@ -470,6 +622,122 @@ router.post('/sector-groups/:sectorId/create', authenticateToken, requireTerrito
   }
 });
 
+router.get('/moola-plus-sector-groups', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  try { res.json(await getMoolaPlusGroups(req)); }
+  catch (error) {
+    console.error('Moola Plus WhatsApp groups error:', error.statusCode || error.code || error.name);
+    res.status(error.statusCode || 502).json({ error: error.message || 'Could not load Moola Plus sector groups.' });
+  }
+});
+
+router.put('/moola-plus-sector-groups/:groupId', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  try {
+    const group = (await getMoolaPlusGroups(req)).find((item) => item.id === String(req.params.groupId));
+    if (!group) return res.status(404).json({ error: 'This Moola Plus sector is not in your assigned districts.' });
+    const inviteUrl = String(req.body.inviteUrl || '').trim();
+    let normalizedUrl = '';
+    if (inviteUrl) {
+      const url = new URL(inviteUrl);
+      if (url.protocol !== 'https:' || url.hostname !== 'chat.whatsapp.com' || !/^\/[A-Za-z0-9_-]+\/?$/.test(url.pathname)) return res.status(400).json({ error: 'Paste a valid WhatsApp group invite link from chat.whatsapp.com.' });
+      normalizedUrl = url.toString();
+    }
+    const key = moolaWhatsAppInviteKey(group.id);
+    const saved = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, group.id, 'WHATSAPP_MOOLA_PLUS_GROUP');
+      const current = await tx.systemConfig.findUnique({ where: { key: moolaWhatsAppGroupKey(group.id) }, select: { value: true } });
+      if (parseSystemConfigJson(current?.value)?.groupId) {
+        const conflict = new Error('This sector already has a provider-managed group. Its invite link is managed by the group integration.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      if (!normalizedUrl) { await tx.systemConfig.deleteMany({ where: { key } }); return ''; }
+      await tx.systemConfig.upsert({ where: { key }, create: { key, value: normalizedUrl, description: `WhatsApp invite for Moola Plus ${group.name}, ${group.districtName}`, updatedById: req.user.id }, update: { value: normalizedUrl, description: `WhatsApp invite for Moola Plus ${group.name}, ${group.districtName}`, updatedById: req.user.id } });
+      return normalizedUrl;
+    }, { timeout: 10000 });
+    await logAction(req.user.id, saved ? 'SAVE_MOOLA_PLUS_WHATSAPP_INVITE' : 'REMOVE_MOOLA_PLUS_WHATSAPP_INVITE', 'MoolaPlusWhatsAppGroup', group.id, { sectorName: group.name, districtName: group.districtName }, req);
+    res.json({ groupId: group.id, inviteUrl: saved });
+  } catch (error) {
+    if (error instanceof TypeError) return res.status(400).json({ error: 'Paste a valid WhatsApp group invite link.' });
+    if (error.statusCode === 409) return res.status(409).json({ error: error.message });
+    console.error('Save Moola Plus WhatsApp invite failed:', error.statusCode || error.code || error.name);
+    res.status(error.statusCode || 500).json({ error: error.message || 'Could not save the WhatsApp group invite link.' });
+  }
+});
+
+router.post('/moola-plus-sector-groups/:groupId/create', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  if (req.body?.confirmAgentConsent !== true) return res.status(400).json({ error: 'Confirm that every agent being added agreed to join this group and share their phone number with the WhatsApp provider.' });
+  if (!whatsAppProviderReady()) return res.status(503).json({ error: 'Automatic WhatsApp group creation is not configured. An administrator must set WHAPI_API_TOKEN for AgentsService.' });
+  try {
+    const group = (await getMoolaPlusGroups(req)).find((item) => item.id === String(req.params.groupId));
+    if (!group) return res.status(404).json({ error: 'This Moola Plus sector is not in your assigned districts.' });
+    const byNumber = new Map();
+    let missingPhoneCount = 0;
+    let invalidPhoneCount = 0;
+    for (const agent of group.agents) {
+      if (!agent.phoneNumber.trim()) { missingPhoneCount += 1; continue; }
+      const number = normalizeWhatsAppNumber(agent.phoneNumber);
+      if (!number) { invalidPhoneCount += 1; continue; }
+      if (!byNumber.has(number)) byNumber.set(number, []);
+      byNumber.get(number).push(agent.id);
+    }
+    if (!byNumber.size) return res.status(400).json({ error: 'No Moola Plus agents in this sector have a valid phone number.', missingPhoneCount, invalidPhoneCount });
+    if (byNumber.size > 1023) return res.status(400).json({ error: 'This sector has more numbers than one WhatsApp group can hold. Split the group or use its manual invite link.' });
+
+    const key = moolaWhatsAppGroupKey(group.id);
+    const reserved = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, group.id, 'WHATSAPP_MOOLA_PLUS_GROUP');
+      const existing = await tx.systemConfig.findUnique({ where: { key }, select: { value: true } });
+      const current = parseSystemConfigJson(existing?.value);
+      if (current) return { group: current, created: false };
+      const invite = await tx.systemConfig.findUnique({ where: { key: moolaWhatsAppInviteKey(group.id) }, select: { value: true } });
+      if (invite?.value) { const conflict = new Error('A manual WhatsApp group link is already saved for this sector. Remove it before creating a provider-managed group.'); conflict.statusCode = 409; throw conflict; }
+      const pending = { provider: 'whapi', status: 'creating', requestId: crypto.randomUUID(), groupName: `DDIN ${group.name} ${group.districtName}`.slice(0, 25), createdAt: new Date().toISOString(), createdById: req.user.id, attemptedAgentIds: [], addedAgentIds: [], failedAgentIds: [], attemptedCount: 0, addedCount: 0, failedCount: 0 };
+      await saveMoolaWhatsAppGroup(tx, group, pending, req.user.id);
+      return { group: pending, created: true };
+    }, { timeout: 10000 });
+    if (reserved.group.status === 'creating' && !reserved.created) return res.status(409).json({ error: 'A previous group creation may still be in progress. Check the provider account before trying again.' });
+    if (reserved.group.status === 'needs_review') return res.status(409).json({ error: 'An administrator needs to review the WhatsApp provider account before retrying this group.' });
+
+    if (reserved.created) {
+      let providerGroup;
+      try { providerGroup = await whapiRequest('/groups', { method: 'POST', body: { subject: reserved.group.groupName, participants: [...byNumber.keys()] } }); }
+      catch (error) {
+        if (error.ambiguous) await saveMoolaWhatsAppGroup(prisma, group, { ...reserved.group, status: 'needs_review' }, req.user.id);
+        else await prisma.systemConfig.deleteMany({ where: { key } });
+        throw error;
+      }
+      const groupId = extractWhapiGroupId(providerGroup);
+      if (!groupId) { await saveMoolaWhatsAppGroup(prisma, group, { ...reserved.group, status: 'needs_review' }, req.user.id); return res.status(502).json({ error: 'The provider did not return a usable group ID. Ask an administrator to review the provider account before retrying.' }); }
+      const requested = new Set(byNumber.keys());
+      const { addedNumbers, failedNumbers } = getProviderParticipantResult(providerGroup, requested);
+      let inviteUrl = '';
+      try { inviteUrl = await getWhapiInviteUrl(groupId); } catch (error) { console.error('Moola Plus invite lookup failed:', error.statusCode || error.name); }
+      const activeGroup = { ...reserved.group, status: 'active', groupId, inviteUrl, attemptedAgentIds: [...new Set([...requested].flatMap((number) => byNumber.get(number) || []))], addedAgentIds: [...new Set([...addedNumbers].flatMap((number) => byNumber.get(number) || []))], failedAgentIds: [...new Set([...failedNumbers].flatMap((number) => byNumber.get(number) || []))], attemptedCount: requested.size, addedCount: addedNumbers.size, failedCount: failedNumbers.size };
+      await saveMoolaWhatsAppGroup(prisma, group, activeGroup, req.user.id);
+      await logAction(req.user.id, 'CREATE_MOOLA_PLUS_WHATSAPP_GROUP', 'MoolaPlusWhatsAppGroup', group.id, { sectorName: group.name, districtName: group.districtName, consentConfirmed: true, requestedCount: requested.size, addedCount: addedNumbers.size, failedCount: failedNumbers.size, missingPhoneCount, invalidPhoneCount }, req);
+      return res.status(201).json({ groupId: group.id, groupName: activeGroup.groupName, inviteUrl, created: true, attemptedCount: requested.size, addedCount: addedNumbers.size, failedCount: failedNumbers.size, missingPhoneCount, invalidPhoneCount, message: inviteUrl ? 'WhatsApp group created.' : 'WhatsApp group created, but no invite link was returned. Ask an administrator to refresh it.' });
+    }
+
+    const stored = reserved.group;
+    if (!stored.groupId || stored.status !== 'active') return res.status(409).json({ error: 'This group is not ready for member updates. Ask an administrator to review its provider status.' });
+    const attempted = new Set(stored.attemptedAgentIds || []);
+    const newNumbers = [...byNumber.entries()].filter(([, ids]) => !ids.every((id) => attempted.has(id))).map(([number]) => number);
+    if (!newNumbers.length) return res.json({ groupId: group.id, groupName: stored.groupName, inviteUrl: stored.inviteUrl || '', created: false, attemptedCount: 0, addedCount: 0, failedCount: stored.failedCount || 0, missingPhoneCount, invalidPhoneCount, message: 'This group already includes all recorded Moola Plus agent numbers.' });
+    const requested = new Set(newNumbers);
+    const providerResult = await whapiRequest(`/groups/${encodeURIComponent(stored.groupId)}/participants`, { method: 'POST', body: { participants: newNumbers } });
+    const { addedNumbers, failedNumbers } = getProviderParticipantResult(providerResult, requested);
+    const updated = { ...stored, attemptedAgentIds: [...new Set([...attempted, ...newNumbers.flatMap((number) => byNumber.get(number) || [])])], addedAgentIds: [...new Set([...(stored.addedAgentIds || []), ...[...addedNumbers].flatMap((number) => byNumber.get(number) || [])])], failedAgentIds: [...new Set([...(stored.failedAgentIds || []), ...[...failedNumbers].flatMap((number) => byNumber.get(number) || [])])], attemptedCount: (stored.attemptedCount || 0) + newNumbers.length, addedCount: (stored.addedCount || 0) + addedNumbers.size, failedCount: (stored.failedCount || 0) + failedNumbers.size };
+    await saveMoolaWhatsAppGroup(prisma, group, updated, req.user.id);
+    await logAction(req.user.id, 'ADD_MOOLA_PLUS_WHATSAPP_GROUP_MEMBERS', 'MoolaPlusWhatsAppGroup', group.id, { sectorName: group.name, districtName: group.districtName, consentConfirmed: true, requestedCount: newNumbers.length, addedCount: addedNumbers.size, failedCount: failedNumbers.size, missingPhoneCount, invalidPhoneCount }, req);
+    res.json({ groupId: group.id, groupName: updated.groupName, inviteUrl: updated.inviteUrl || '', created: false, attemptedCount: newNumbers.length, addedCount: addedNumbers.size, failedCount: failedNumbers.size, missingPhoneCount, invalidPhoneCount, message: 'New Moola Plus agents were processed for the WhatsApp group.' });
+  } catch (error) {
+    if ([409, 503].includes(error.statusCode)) return res.status(error.statusCode).json({ error: error.message });
+    if (error.statusCode && error.statusCode < 500) return res.status(error.statusCode).json({ error: 'The WhatsApp provider could not complete this group action.' });
+    console.error('Moola Plus WhatsApp group operation failed:', error.statusCode || error.code || error.name);
+    res.status(error.statusCode || 502).json({ error: error.message || 'Could not complete the Moola Plus WhatsApp group operation.' });
+  }
+});
+
 async function lockAgentMoveAndCheckPending(tx, agentId) {
   await advisoryTransactionLock(tx, agentId, 'AGENT_MOVE');
   const [pendingTransfer, pendingRelocation] = await Promise.all([
@@ -502,6 +770,22 @@ router.get('/', authenticateToken, requireTerritoryAccess, async (req, res) => {
     return res.status(403).json({ error: 'Choose a district assigned to your account.' });
   }
   if (requestedTerritoryId && req.user.role !== 'TC') where.territoryId = requestedTerritoryId;
+  const planId = String(req.query.planId || '').trim();
+  if (planId) {
+    if (req.user.role !== 'TC') return res.status(403).json({ error: 'Only the assigned coordinator can load agents from this plan.' });
+    const plan = await prisma.visitPlan.findUnique({ where: { id: planId }, include: { territory: { select: { id: true, type: true, parentId: true } } } });
+    if (!plan || plan.tcId !== req.user.id) return res.status(404).json({ error: 'Field plan not found.' });
+    const today = kigaliDateKey();
+    if (today < plan.planDate.toISOString().slice(0, 10) || today > plan.endDate.toISOString().slice(0, 10)) return res.status(409).json({ error: 'This plan is not active today. Choose an active plan or browse agents without a plan.' });
+    const areaField = { DISTRICT: 'territoryId', SECTOR: 'sectorId', CELL: 'cellId', VILLAGE: 'villageId' }[plan.territory.type];
+    if (areaField) where.AND = [...(where.AND || []), { [areaField]: plan.territory.id }];
+    else if (plan.territory.type === 'PROVINCE') {
+      const provinceDistricts = await prisma.territory.findMany({ where: { type: 'DISTRICT', parentId: plan.territory.id, isActive: true, id: { in: assignedTerritories } }, select: { id: true } });
+      where.AND = [...(where.AND || []), { territoryId: { in: provinceDistricts.map(({ id }) => id) } }];
+    }
+  }
+  const priorityAgentIds = queryIds(req.query.priorityAgentIds);
+  if (priorityAgentIds.length) where.id = { in: priorityAgentIds };
   const search = String(req.query.search || '').trim();
   if (search) {
     where.OR = [
@@ -513,13 +797,25 @@ router.get('/', authenticateToken, requireTerritoryAccess, async (req, res) => {
     ];
   }
 
+  if (req.user.role === 'TC') {
+    where.AND = [...(where.AND || []), { OR: [
+      { isOnHold: false },
+      { isOnHold: true, transfers: { some: { recipientTcId: req.user.id, status: 'PENDING' } } },
+    ] }];
+  } else {
+    where.isOnHold = false;
+  }
+
   // Coordinators see their districts and transfer requests routed to them.
   if (req.user.role === 'TC') {
     const territoryScope = requestedTerritoryId
       ? [{ territoryId: requestedTerritoryId }, { transfers: { some: { recipientTcId: req.user.id, status: 'PENDING', toTerritoryId: requestedTerritoryId } } }]
       : [{ territoryId: { in: assignedTerritories } }, pendingTransferScope];
     where.AND = [...(where.AND || []), { OR: territoryScope }];
-    where.NOT = { transfers: { some: { status: 'PENDING', requestedByTcId: req.user.id } } };
+    where.AND.push({ OR: [
+      { NOT: { transfers: { some: { status: 'PENDING', requestedByTcId: req.user.id } } } },
+      { transfers: { some: { status: 'PENDING', recipientTcId: req.user.id } } },
+    ] });
   }
   const sectorIds = queryIds(req.query.sectorIds);
   const cellIds = queryIds(req.query.cellIds);
@@ -565,7 +861,7 @@ router.get('/', authenticateToken, requireTerritoryAccess, async (req, res) => {
           where: { status: 'PENDING', ...(req.user.role === 'TC' ? { recipientTcId: req.user.id } : {}) },
           select: {
             id: true, fromTerritoryId: true, toTerritoryId: true, recipientTcId: true,
-            status: true, acceptedAt: true, requestedAt: true,
+            status: true, acceptedAt: true, requestedAt: true, adminRoutedAt: true,
             toTerritory: { select: { id: true, name: true } },
             requestedByTc: { select: { id: true, firstName: true, lastName: true } },
           },
@@ -577,9 +873,18 @@ router.get('/', authenticateToken, requireTerritoryAccess, async (req, res) => {
         } } : {}),
       },
     });
+    const lastQualifiedVisitByAgent = await latestQualifiedVisits(prisma, 'IREMBO', agents.map(({ id }) => id));
+    const agentsWithCoverage = agents.map((agent) => ({
+      ...agent,
+      ...coverageState(lastQualifiedVisitByAgent.get(agent.id)),
+    }));
+    if (priorityAgentIds.length) {
+      const priorityOrder = new Map(priorityAgentIds.map((id, index) => [id, index]));
+      agentsWithCoverage.sort((a, b) => (priorityOrder.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (priorityOrder.get(b.id) ?? Number.MAX_SAFE_INTEGER));
+    }
 
     res.json({
-      data: agents,
+      data: agentsWithCoverage,
       total,
       page,
       limit,
@@ -600,6 +905,7 @@ router.get('/offline-pack', authenticateToken, requireTerritoryAccess, requireRo
       prisma.agent.findMany({
         where: {
           status: 'ACTIVE',
+          isOnHold: false,
           OR: [
             { territoryId: { in: territoryIds } },
             { transfers: { some: { recipientTcId: req.user.id, status: 'PENDING', toTerritoryId: { in: territoryIds } } } },
@@ -628,7 +934,7 @@ router.get('/offline-pack', authenticateToken, requireTerritoryAccess, requireRo
           sector: { select: { id: true, name: true } },
           cell: { select: { id: true, name: true } },
           village: { select: { id: true, name: true } },
-          transfers: { where: { recipientTcId: req.user.id, status: 'PENDING' }, select: { id: true, fromTerritoryId: true, toTerritoryId: true, status: true, acceptedAt: true, requestedAt: true } },
+          transfers: { where: { recipientTcId: req.user.id, status: 'PENDING' }, select: { id: true, fromTerritoryId: true, toTerritoryId: true, status: true, acceptedAt: true, requestedAt: true, adminRoutedAt: true } },
         },
       }),
       prisma.systemConfig.findUnique({ where: { key: 'GEOFENCE_RADIUS_METERS' }, select: { value: true } }),
@@ -639,6 +945,11 @@ router.get('/offline-pack', authenticateToken, requireTerritoryAccess, requireRo
         include: { children: { where: { isActive: true }, orderBy: { name: 'asc' }, include: { children: { where: { isActive: true }, orderBy: { name: 'asc' }, include: { children: { where: { isActive: true }, orderBy: { name: 'asc' } } } } } } },
       }),
     ]);
+    const lastQualifiedVisitByAgent = await latestQualifiedVisits(prisma, 'IREMBO', agents.map(({ id }) => id));
+    const agentsWithCoverage = agents.map((agent) => ({
+      ...agent,
+      ...coverageState(lastQualifiedVisitByAgent.get(agent.id)),
+    }));
     let checklistSchema = [];
     if (checklist?.value) {
       const parsed = JSON.parse(checklist.value);
@@ -647,7 +958,7 @@ router.get('/offline-pack', authenticateToken, requireTerritoryAccess, requireRo
     res.json({
       userId: req.user.id,
       downloadedAt: new Date().toISOString(),
-      agents,
+      agents: agentsWithCoverage,
       territories,
       radiusMeters: geofence ? Number.parseInt(geofence.value, 10) || 100 : 100,
       checklistSchema,
@@ -713,6 +1024,27 @@ router.post('/', authenticateToken, requireTerritoryAccess, requireRole('ADMIN',
   }
 });
 
+router.get('/movement-notices', authenticateToken, requireRole('TC'), async (req, res) => {
+  try {
+    const notices = await prisma.agentMovementNotice.findMany({ where: { recipientTcId: req.user.id, readAt: null }, orderBy: { createdAt: 'desc' }, take: 20 });
+    res.json(notices);
+  } catch (error) {
+    console.error('Agent movement notices error:', error.code || error.name);
+    res.status(500).json({ error: 'Could not load agent movement updates.' });
+  }
+});
+
+router.patch('/movement-notices/:id/read', authenticateToken, requireRole('TC'), async (req, res) => {
+  try {
+    const updated = await prisma.agentMovementNotice.updateMany({ where: { id: req.params.id, recipientTcId: req.user.id, readAt: null }, data: { readAt: new Date() } });
+    if (!updated.count) return res.status(404).json({ error: 'This movement update is no longer available.' });
+    res.json({ id: req.params.id, read: true });
+  } catch (error) {
+    console.error('Agent movement notice acknowledgement error:', error.code || error.name);
+    res.status(500).json({ error: 'Could not acknowledge this movement update.' });
+  }
+});
+
 router.get('/:id/transfer-targets', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
   const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, territoryId: true, firstVisitLocationCapturedAt: true, firstVisitCompletedAt: true } });
   if (!agent) return res.status(404).json({ error: 'Agent not found.' });
@@ -729,6 +1061,126 @@ router.get('/:id/transfer-targets', authenticateToken, requireTerritoryAccess, r
     targets.set(assignment.territoryId, target);
   }
   res.json([...targets.values()].sort((a, b) => a.name.localeCompare(b.name)));
+});
+
+router.post('/irembo/:agentCode/field-record', authenticateToken, requireTerritoryAccess, requireRole('ADMIN', 'TC'), async (req, res) => {
+  try {
+    const agent = await ensureIremboFieldAgent(req, req.params.agentCode);
+    if (req.user.role === 'TC' && !(req.user.assignedTerritories || []).includes(agent.territoryId)) return res.status(403).json({ error: 'This Irembo agent is outside your assigned district.' });
+    await logAction(req.user.id, 'LINK_IREMBO_FIELD_RECORD', 'Agent', agent.id, { agentCode: agent.agentId }, req);
+    res.json(agent);
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    console.error('Irembo field record link failed:', error.code || error.name);
+    res.status(500).json({ error: 'Could not prepare this Irembo agent for field actions.' });
+  }
+});
+
+router.post('/:id/admin-transfer', authenticateToken, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, agentId: true, name: true, phoneNumber: true, territoryId: true } });
+    if (!agent) return res.status(404).json({ error: 'Agent not found.' });
+    const toTerritoryId = String(req.body.toTerritoryId || '').trim();
+    const recipientTcId = String(req.body.recipientTcId || '').trim();
+    const destination = await prisma.tcTerritoryAssignment.findFirst({ where: { territoryId: toTerritoryId, tcId: recipientTcId, isActive: true, territory: { is: { type: 'DISTRICT', isActive: true } }, tc: { is: { role: 'TC', isActive: true } } }, select: { territory: { select: { id: true, name: true } }, tc: { select: { id: true, firstName: true, lastName: true } } } });
+    if (!destination || toTerritoryId === agent.territoryId) return res.status(400).json({ error: 'Choose an active TC assigned to a different district.' });
+    const transfer = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
+      const [pendingTransfer, pendingRelocation, sourceAssignment] = await Promise.all([
+        tx.agentTransfer.findFirst({ where: { agentId: agent.id, status: { in: ['PENDING', 'ON_HOLD'] } }, select: { id: true } }),
+        tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'PENDING' }, select: { id: true } }),
+        tx.tcTerritoryAssignment.findFirst({ where: { territoryId: agent.territoryId, isActive: true, tc: { is: { role: 'TC', isActive: true } } }, select: { tcId: true } }),
+      ]);
+      if (pendingTransfer || pendingRelocation) throw Object.assign(new Error(pendingTransfer ? 'This agent already has a transfer awaiting review.' : 'This agent already has a relocation request awaiting review.'), { statusCode: 409 });
+      const created = await tx.agentTransfer.create({ data: {
+        agentId: agent.id, fromTerritoryId: agent.territoryId, toTerritoryId, requestedByTcId: sourceAssignment?.tcId || req.user.id,
+        recipientTcId, reason: String(req.body.reason || '').trim().slice(0, 500) || null, adminRoutedAt: new Date(),
+      }, include: { fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } }, recipientTc: { select: { id: true, firstName: true, lastName: true } } } });
+      if (sourceAssignment?.tcId) await tx.agentMovementNotice.create({ data: { recipientTcId: sourceAssignment.tcId, agentId: agent.id, network: 'IREMBO', agentName: agent.name, agentCode: agent.agentId, noticeType: 'TRANSFER_ROUTED', fromTerritoryName: (await tx.territory.findUnique({ where: { id: agent.territoryId }, select: { name: true } }))?.name, toTerritoryName: destination.territory.name } });
+      return created;
+    }, { maxWait: 10000, timeout: 15000 });
+    await logAction(req.user.id, 'ADMIN_ROUTE_AGENT_TRANSFER', 'Agent', agent.id, { transferId: transfer.id, fromTerritoryId: agent.territoryId, toTerritoryId, recipientTcId }, req);
+    res.status(201).json(transfer);
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    console.error('Admin agent transfer routing failed:', error.code || error.name);
+    res.status(500).json({ error: 'Could not route this agent to the selected TC.' });
+  }
+});
+
+router.get('/transfer-holds', authenticateToken, requireRole('ADMIN'), async (_req, res) => {
+  try {
+    const transfers = await prisma.agentTransfer.findMany({
+      where: { status: 'ON_HOLD' },
+      include: {
+        agent: { select: { id: true, agentId: true, name: true, phoneNumber: true, businessName: true, territory: { select: { id: true, name: true } } } },
+        fromTerritory: { select: { id: true, name: true, parent: { select: { name: true } } } },
+        toTerritory: { select: { id: true, name: true, parent: { select: { name: true } } } },
+        requestedByTc: { select: { id: true, firstName: true, lastName: true, phoneNumber: true } },
+        recipientTc: { select: { id: true, firstName: true, lastName: true } },
+      },
+      orderBy: [{ reviewedAt: 'asc' }, { requestedAt: 'asc' }],
+    });
+    res.json(transfers);
+  } catch (error) {
+    console.error('Transfer hold inbox error:', error.code || error.name);
+    res.status(500).json({ error: 'Could not load agents waiting for administrator reassignment.' });
+  }
+});
+
+router.get('/transfer-hold-targets', authenticateToken, requireRole('ADMIN'), async (_req, res) => {
+  try {
+    const assignments = await prisma.tcTerritoryAssignment.findMany({
+      where: { isActive: true, territory: { is: { type: 'DISTRICT', isActive: true } }, tc: { is: { role: 'TC', isActive: true } } },
+      include: { territory: { select: { id: true, name: true, parent: { select: { name: true } } } }, tc: { select: { id: true, firstName: true, lastName: true } } },
+    });
+    const targets = new Map();
+    for (const assignment of assignments) {
+      const target = targets.get(assignment.territoryId) || { id: assignment.territoryId, name: assignment.territory.name, province: assignment.territory.parent?.name || '', coordinators: [] };
+      if (!target.coordinators.some((tc) => tc.id === assignment.tc.id)) target.coordinators.push(assignment.tc);
+      targets.set(assignment.territoryId, target);
+    }
+    res.json([...targets.values()].sort((a, b) => a.name.localeCompare(b.name)));
+  } catch (error) {
+    console.error('Transfer hold destination list error:', error.code || error.name);
+    res.status(500).json({ error: 'Could not load active coordinator districts.' });
+  }
+});
+
+router.put('/transfer-holds/:id/route', authenticateToken, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const toTerritoryId = String(req.body.toTerritoryId || '').trim();
+    const recipientTcId = String(req.body.recipientTcId || '').trim();
+    const destination = toTerritoryId ? await prisma.tcTerritoryAssignment.findFirst({
+      where: { territoryId: toTerritoryId, tcId: recipientTcId, isActive: true, territory: { is: { type: 'DISTRICT', isActive: true } }, tc: { is: { role: 'TC', isActive: true } } },
+      select: { territory: { select: { id: true, name: true } }, tc: { select: { id: true, firstName: true, lastName: true } } },
+    }) : null;
+    if (!destination) return res.status(400).json({ error: 'Choose an active TC assigned to the destination district.' });
+    const transfer = await prisma.$transaction(async (tx) => {
+      const current = await tx.agentTransfer.findUnique({ where: { id: req.params.id }, select: { id: true, agentId: true, status: true, fromTerritoryId: true, toTerritoryId: true } });
+      if (!current || current.status !== 'ON_HOLD') {
+        const conflict = new Error('This held agent has already been routed or reviewed. Refresh the request list.');
+        conflict.statusCode = current ? 409 : 404;
+        throw conflict;
+      }
+      await advisoryTransactionLock(tx, current.agentId, 'AGENT_MOVE');
+      const claimed = await tx.agentTransfer.updateMany({ where: { id: current.id, status: 'ON_HOLD' }, data: {
+        status: 'PENDING', toTerritoryId, recipientTcId, adminRoutedAt: new Date(), acceptedAt: null, reviewedAt: null,
+      } });
+      if (!claimed.count) {
+        const conflict = new Error('This held agent has already been routed or reviewed. Refresh the request list.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      return tx.agentTransfer.findUnique({ where: { id: current.id }, include: { agent: true, toTerritory: true, recipientTc: { select: { id: true, firstName: true, lastName: true } } } });
+    });
+    await logAction(req.user.id, 'ADMIN_ROUTE_HELD_AGENT', 'Agent', transfer.agentId, { transferId: transfer.id, toTerritoryId, recipientTcId }, req);
+    res.json(transfer);
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    console.error('Admin transfer routing failed:', error.code || error.name);
+    res.status(500).json({ error: 'Could not route this held agent.' });
+  }
 });
 
 router.post('/:id/transfer', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
@@ -805,6 +1257,7 @@ router.put('/transfer-requests/:id/review', authenticateToken, requireTerritoryA
     const decision = String(req.body.decision || '').toUpperCase();
     if (!['ACCEPT', 'REJECT'].includes(decision)) return res.status(400).json({ error: 'Choose whether to accept or reject this transfer.' });
     const reviewNote = String(req.body.note || '').trim().slice(0, 500) || null;
+    if (decision === 'REJECT' && !reviewNote) return res.status(400).json({ error: 'Enter a reason for rejecting this transfer.' });
     const transfer = await prisma.agentTransfer.findUnique({
       where: { id: req.params.id },
       include: { agent: { select: { id: true, agentId: true, name: true } } },
@@ -814,13 +1267,19 @@ router.put('/transfer-requests/:id/review', authenticateToken, requireTerritoryA
     if (transfer.status !== 'PENDING' || transfer.acceptedAt) return res.status(409).json({ error: 'This transfer has already been reviewed.' });
 
     if (decision === 'REJECT') {
-      const rejected = await prisma.agentTransfer.updateMany({
-        where: { id: transfer.id, recipientTcId: req.user.id, status: 'PENDING', acceptedAt: null },
-        data: { status: 'CANCELLED', reviewedAt: new Date(), reviewNote: reviewNote || 'The destination coordinator could not confirm the agent.' },
+      const rejected = await prisma.$transaction(async (tx) => {
+        await advisoryTransactionLock(tx, transfer.agentId, 'AGENT_MOVE');
+        const changed = await tx.agentTransfer.updateMany({
+          where: { id: transfer.id, recipientTcId: req.user.id, status: 'PENDING', acceptedAt: null },
+          data: { status: 'ON_HOLD', reviewedAt: new Date(), reviewNote },
+        });
+        if (!changed.count) return false;
+        await tx.agent.update({ where: { id: transfer.agentId }, data: { isOnHold: true } });
+        return true;
       });
-      if (!rejected.count) return res.status(409).json({ error: 'This transfer has already been reviewed.' });
+      if (!rejected) return res.status(409).json({ error: 'This transfer has already been reviewed.' });
       await logAction(req.user.id, 'REJECT_AGENT_TRANSFER', 'Agent', transfer.agentId, { agentName: transfer.agent.name, agentCode: transfer.agent.agentId, transferId: transfer.id, note: reviewNote }, req);
-      return res.json({ id: transfer.id, status: 'CANCELLED' });
+      return res.json({ id: transfer.id, status: 'ON_HOLD', reviewNote });
     }
 
     if (!(req.user.assignedTerritories || []).includes(transfer.toTerritoryId)) return res.status(403).json({ error: 'You are no longer assigned to the destination district.' });
@@ -844,6 +1303,7 @@ router.put('/transfer-requests/:id/review', authenticateToken, requireTerritoryA
       const moved = await tx.agent.updateMany({ where: { id: transfer.agentId, territoryId: transfer.fromTerritoryId }, data: {
         territoryId: transfer.toTerritoryId, sectorId: null, cellId: null, villageId: null,
         address: null, registeredLatitude: null, registeredLongitude: null, gpsAccuracy: null, locationVerified: false,
+        isOnHold: false,
       } });
       if (!moved.count) {
         const conflict = new Error('The agent’s territory changed before this transfer was accepted. Refresh the request and review again.');
@@ -1174,6 +1634,7 @@ router.put('/:id', authenticateToken, requireRole('ADMIN', 'MANAGER'), async (re
         throw conflict;
       }
       const updated = await tx.agent.findUnique({ where: { id: req.params.id } });
+      if (locationChanged && req.user.role === 'ADMIN') await createAgentMovementNotices(tx, { agent: updated, fromTerritoryId: existing.territoryId, toTerritoryId: updated.territoryId, noticeType: 'RELOCATED' });
       return updated;
     });
     const updatedPersonalData = ['nationalId', 'nextOfKinName', 'nextOfKinPhone'].some((field) => req.body[field] !== undefined);
@@ -1235,6 +1696,7 @@ router.patch('/:id/location', authenticateToken, requireRole('ADMIN'), async (re
         throw conflict;
       }
       const updated = await tx.agent.findUnique({ where: { id: req.params.id } });
+      if (moved) await createAgentMovementNotices(tx, { agent: updated, fromTerritoryId: existing.territoryId, toTerritoryId: nextTerritoryId, noticeType: 'RELOCATED' });
       if (!moved) await tx.agentLocation.create({ data: { agentId: updated.id, latitude, longitude, accuracy, recordedById: req.user.id, reason } });
       return updated;
     });

@@ -4,8 +4,9 @@
 const fs = require('fs');
 const path = require('path');
 if (!process.env.DATABASE_URL) {
-  const environmentFile = path.join(__dirname, '..', '.env');
-  if (fs.existsSync(environmentFile)) {
+  const environmentFile = [path.join(__dirname, '..', '.env'), path.join(__dirname, '..', '..', '.env')]
+    .find((file) => fs.existsSync(file));
+  if (environmentFile) {
     const databaseLine = fs.readFileSync(environmentFile, 'utf8').split(/\r?\n/)
       .find((line) => /^\s*(?:export\s+)?DATABASE_URL\s*=/.test(line));
     if (databaseLine) {

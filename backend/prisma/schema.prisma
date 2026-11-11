@@ -25,6 +25,7 @@ enum TerritoryType {
 
 enum AgentTransferStatus {
   PENDING
+  ON_HOLD
   COMPLETED
   CANCELLED
 }
@@ -33,6 +34,11 @@ enum AgentRelocationRequestStatus {
   PENDING
   APPROVED
   REJECTED
+}
+
+enum MovementNoticeType {
+  RELOCATED
+  TRANSFER_ROUTED
 }
 
 enum AgentStatus {
@@ -46,6 +52,25 @@ enum LocationStatus {
   VERIFIED
   OUTSIDE_RADIUS
   LOW_ACCURACY
+  MANUAL_REVIEW_APPROVED
+}
+
+enum LocationMethod {
+  GPS
+  MANUAL_EVIDENCE
+}
+
+enum VisitPlanPeriod {
+  DAY
+  WEEK
+  MONTH
+  CUSTOM
+}
+
+enum FieldFollowUpStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
 }
 
 enum VisitStatus {
@@ -53,6 +78,12 @@ enum VisitStatus {
   COMPLETED
   FLAGGED
   REJECTED
+}
+
+enum VisitNetwork {
+  IREMBO
+  MOOLA_PLUS
+  COMBINED
 }
 
 enum SyncStatus {
@@ -84,12 +115,20 @@ model User {
   championAgents        Agent[]                  @relation("AgentChampion")
   agentLocationsRecorded AgentLocation[]         @relation("AgentLocationRecordedBy")
   visits                Visit[]                  @relation("VisitTc")
+  visitsLocationReviewed Visit[]                 @relation("VisitLocationReviewer")
+  fieldWorkdayFollowUps FieldWorkdayFollowUp[]   @relation("FieldWorkdayFollowUpTc")
+  fieldWorkdayReviews   FieldWorkdayFollowUp[]   @relation("FieldWorkdayFollowUpReviewer")
   auditLogs             AuditLog[]               @relation("AuditLogUser")
   systemConfigsUpdated  SystemConfig[]           @relation("ConfigUpdatedBy")
   requestedAgentTransfers AgentTransfer[]        @relation("AgentTransferRequester")
   receivedAgentTransfers  AgentTransfer[]        @relation("AgentTransferRecipient")
   relocationRequestsCreated AgentRelocationRequest[] @relation("RelocationRequestCreator")
   relocationRequestsReviewed AgentRelocationRequest[] @relation("RelocationRequestReviewer")
+  moolaRelocationsCreated MoolaRelocationRequest[] @relation("MoolaRelocationCreator")
+  moolaRelocationsReviewed MoolaRelocationRequest[] @relation("MoolaRelocationReviewer")
+  requestedMoolaTransfers MoolaAgentTransfer[] @relation("MoolaTransferRequester")
+  receivedMoolaTransfers MoolaAgentTransfer[] @relation("MoolaTransferRecipient")
+  movementNotices AgentMovementNotice[] @relation("MovementNoticeRecipient")
 }
 
 model Territory {
@@ -114,6 +153,14 @@ model Territory {
   relocationRequestsTo AgentRelocationRequest[]   @relation("RelocationToTerritory")
   visits          Visit[]                  @relation("VisitTerritory")
   visitPlans      VisitPlan[]               @relation("VisitPlanTerritory")
+  moolaLocations  MoolaAgentLocation[]     @relation("MoolaLocationTerritory")
+  moolaLocationsSector MoolaAgentLocation[] @relation("MoolaLocationSector")
+  moolaLocationsCell MoolaAgentLocation[] @relation("MoolaLocationCell")
+  moolaLocationsVillage MoolaAgentLocation[] @relation("MoolaLocationVillage")
+  moolaRelocationsFrom MoolaRelocationRequest[] @relation("MoolaRelocationFromTerritory")
+  moolaRelocationsTo MoolaRelocationRequest[]   @relation("MoolaRelocationToTerritory")
+  moolaTransfersFrom MoolaAgentTransfer[] @relation("MoolaTransferFromTerritory")
+  moolaTransfersTo MoolaAgentTransfer[] @relation("MoolaTransferToTerritory")
 
   @@index([type, parentId])
 }
@@ -158,6 +205,7 @@ model Agent {
   championId         String?          @db.Uuid
   champion           User?            @relation("AgentChampion", fields: [championId], references: [id])
   status             AgentStatus      @default(ACTIVE)
+  isOnHold           Boolean          @default(false)
   registeredLatitude Float?
   registeredLongitude Float?
   gpsAccuracy        Float?
@@ -170,6 +218,7 @@ model Agent {
   visits             Visit[]          @relation("VisitAgent")
   transfers          AgentTransfer[]
   relocationRequests AgentRelocationRequest[]
+  movementNotices    AgentMovementNotice[]
 
   @@index([territoryId, status])
   @@index([name, id])
@@ -197,6 +246,7 @@ model AgentTransfer {
   acceptedAt        DateTime?
   reviewedAt        DateTime?
   reviewNote        String?             @db.VarChar(500)
+  adminRoutedAt     DateTime?
   completedAt       DateTime?
 
   @@index([agentId, status])
@@ -252,21 +302,31 @@ model Visit {
   visitId           String         @unique
   tcId              String         @db.Uuid
   tc                User           @relation("VisitTc", fields: [tcId], references: [id])
-  agentId           String         @db.Uuid
-  agent             Agent          @relation("VisitAgent", fields: [agentId], references: [id])
+  network           VisitNetwork   @default(IREMBO)
+  agentId           String?        @db.Uuid
+  agent             Agent?         @relation("VisitAgent", fields: [agentId], references: [id])
+  externalAgentId   String?
+  externalAgentName String?
+  externalAgentCode String?
   territoryId       String         @db.Uuid
   territory         Territory      @relation("VisitTerritory", fields: [territoryId], references: [id])
   visitDate         DateTime
   checkInTime       DateTime
   checkOutTime      DateTime?
-  agentLatitude     Float
-  agentLongitude    Float
-  tcLatitude        Float
-  tcLongitude       Float
-  distanceMeters    Float
-  gpsAccuracyMeters Float
+  agentLatitude     Float?
+  agentLongitude    Float?
+  tcLatitude        Float?
+  tcLongitude       Float?
+  distanceMeters    Float?
+  gpsAccuracyMeters Float?
   locationStatus    LocationStatus
+  locationMethod    LocationMethod @default(GPS)
+  locationReviewNote String?       @db.VarChar(500)
+  locationReviewedAt DateTime?
+  locationReviewedById String?     @db.Uuid
+  locationReviewedBy User?         @relation("VisitLocationReviewer", fields: [locationReviewedById], references: [id])
   visitStatus       VisitStatus    @default(STARTED)
+  countsForMetrics  Boolean        @default(true)
   isOffline         Boolean        @default(false)
   syncStatus        SyncStatus     @default(SYNCED)
   createdAt         DateTime       @default(now())
@@ -276,8 +336,117 @@ model Visit {
 
   @@index([tcId, visitDate])
   @@index([agentId, visitDate])
+  @@index([agentId, countsForMetrics, visitDate])
+  @@index([network, externalAgentId, visitDate])
+  @@index([network, countsForMetrics, visitDate])
   @@index([territoryId, visitDate])
   @@index([visitDate])
+}
+
+// This is a field-location overlay keyed to the upstream DDIN ID. It does not
+// copy or replace Moola Plus agent records in the local Agent table.
+model MoolaAgentLocation {
+  externalAgentId String    @id
+  agentName       String
+  loginName       String
+  territoryId     String    @db.Uuid
+  territory       Territory @relation("MoolaLocationTerritory", fields: [territoryId], references: [id])
+  sectorId        String?   @db.Uuid
+  sector          Territory? @relation("MoolaLocationSector", fields: [sectorId], references: [id], onDelete: SetNull)
+  cellId          String?   @db.Uuid
+  cell            Territory? @relation("MoolaLocationCell", fields: [cellId], references: [id], onDelete: SetNull)
+  villageId       String?   @db.Uuid
+  village         Territory? @relation("MoolaLocationVillage", fields: [villageId], references: [id], onDelete: SetNull)
+  sectorName      String?
+  cellName        String?
+  villageName     String?
+  venue           String?   @db.VarChar(200)
+  latitude        Float?
+  longitude       Float?
+  accuracy        Float?
+  locationVerified Boolean  @default(false)
+  isOnHold         Boolean  @default(false)
+  firstLocationCapturedAt DateTime?
+  firstVisitCompletedAt DateTime?
+  updatedById     String    @db.Uuid
+  updatedAt       DateTime  @updatedAt
+  createdAt       DateTime  @default(now())
+  relocationRequests MoolaRelocationRequest[]
+
+  @@index([territoryId, locationVerified])
+}
+
+model MoolaRelocationRequest {
+  id              String   @id @default(uuid()) @db.Uuid
+  externalAgentId String
+  agentLocation   MoolaAgentLocation @relation(fields: [externalAgentId], references: [externalAgentId], onDelete: Cascade)
+  agentName       String
+  loginName       String
+  fromTerritoryId String   @db.Uuid
+  fromTerritory   Territory @relation("MoolaRelocationFromTerritory", fields: [fromTerritoryId], references: [id])
+  toTerritoryId   String   @db.Uuid
+  toTerritory     Territory @relation("MoolaRelocationToTerritory", fields: [toTerritoryId], references: [id])
+  reason          String?  @db.VarChar(500)
+  requestedByTcId String   @db.Uuid
+  requestedByTc   User     @relation("MoolaRelocationCreator", fields: [requestedByTcId], references: [id])
+  reviewedById    String?  @db.Uuid
+  reviewedBy      User?    @relation("MoolaRelocationReviewer", fields: [reviewedById], references: [id])
+  status          AgentRelocationRequestStatus @default(PENDING)
+  requestedAt     DateTime @default(now())
+  reviewedAt      DateTime?
+  reviewNote      String?  @db.VarChar(500)
+
+  @@index([status, requestedAt])
+  @@index([externalAgentId, status])
+}
+
+model MoolaAgentTransfer {
+  id              String              @id @default(uuid()) @db.Uuid
+  externalAgentId String
+  agentName       String
+  loginName       String
+  phoneNumber     String?
+  fromTerritoryId String              @db.Uuid
+  fromTerritory   Territory           @relation("MoolaTransferFromTerritory", fields: [fromTerritoryId], references: [id])
+  toTerritoryId   String              @db.Uuid
+  toTerritory     Territory           @relation("MoolaTransferToTerritory", fields: [toTerritoryId], references: [id])
+  requestedByTcId String              @db.Uuid
+  requestedByTc   User                @relation("MoolaTransferRequester", fields: [requestedByTcId], references: [id])
+  recipientTcId   String              @db.Uuid
+  recipientTc     User                @relation("MoolaTransferRecipient", fields: [recipientTcId], references: [id])
+  reason          String?             @db.VarChar(500)
+  status          AgentTransferStatus @default(PENDING)
+  requestedAt     DateTime            @default(now())
+  acceptedAt      DateTime?
+  reviewedAt      DateTime?
+  reviewNote      String?             @db.VarChar(500)
+  adminRoutedAt   DateTime?
+  completedAt     DateTime?
+
+  @@index([externalAgentId, status])
+  @@index([recipientTcId, status])
+  @@index([requestedByTcId, requestedAt])
+}
+
+model AgentMovementNotice {
+  id                String             @id @default(uuid()) @db.Uuid
+  recipientTcId     String             @db.Uuid
+  recipientTc       User               @relation("MovementNoticeRecipient", fields: [recipientTcId], references: [id], onDelete: Cascade)
+  agentId           String?            @db.Uuid
+  agent             Agent?             @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  network           VisitNetwork       @default(IREMBO)
+  externalAgentId   String?
+  agentName         String
+  agentCode         String?
+  noticeType        MovementNoticeType
+  fromTerritoryName String?
+  toTerritoryName   String?
+  createdAt         DateTime           @default(now())
+  readAt            DateTime?
+
+  @@index([recipientTcId, readAt, createdAt])
+  @@index([agentId, createdAt])
+  @@index([externalAgentId, createdAt])
 }
 
 model VisitReport {
@@ -305,15 +474,41 @@ model VisitPlan {
   tcId              String    @db.Uuid
   tc                User      @relation("VisitPlanTc", fields: [tcId], references: [id], onDelete: Cascade)
   planDate          DateTime  @db.Date
+  endDate           DateTime  @db.Date
+  periodType        VisitPlanPeriod @default(DAY)
+  network           VisitNetwork @default(IREMBO)
   territoryId       String    @db.Uuid
   territory         Territory @relation("VisitPlanTerritory", fields: [territoryId], references: [id], onDelete: Cascade)
   targetAgents      Int
+  minimumAgents     Int       @default(1)
+  estimatedWorkingDays Int    @default(1)
   notes             String?   @db.VarChar(500)
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
-  @@unique([tcId, planDate, territoryId])
+  @@unique([tcId, network, planDate, territoryId])
   @@index([tcId, planDate])
+  @@index([tcId, endDate])
+}
+
+model FieldWorkdayFollowUp {
+  id                String              @id @default(uuid()) @db.Uuid
+  tcId              String              @db.Uuid
+  tc                User                @relation("FieldWorkdayFollowUpTc", fields: [tcId], references: [id], onDelete: Cascade)
+  workDate          DateTime            @db.Date
+  requiredAgents    Int
+  completedAgents   Int
+  missedAgents      Int
+  status            FieldFollowUpStatus @default(OPEN)
+  reviewNote        String?             @db.VarChar(500)
+  reviewedById      String?             @db.Uuid
+  reviewedBy        User?               @relation("FieldWorkdayFollowUpReviewer", fields: [reviewedById], references: [id])
+  reviewedAt        DateTime?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  @@unique([tcId, workDate])
+  @@index([status, workDate])
 }
 
 model VisitPhoto {

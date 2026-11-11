@@ -1,7 +1,7 @@
 {
-  "name": "DDIN TC Visit and Reporting",
-  "short_name": "DDIN Visits",
-  "description": "Territory visits and agent reporting for DDIN field teams.",
+  "name": "DDIN TC Daily Tool",
+  "short_name": "TC Daily Tool",
+  "description": "Daily field activity and agent coverage for DDIN field teams.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

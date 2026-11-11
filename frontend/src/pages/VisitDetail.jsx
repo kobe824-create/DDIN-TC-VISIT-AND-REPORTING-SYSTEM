@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, BadgeCheck, Camera, Clock3, FileText, MapPin, Navigation, Printer, ShieldAlert } from 'lucide-react';
 import api from '../api';
+import { useAuth } from '../AuthContext';
 import PageHeader from '../components/PageHeader';
 import { ErrorState, LoadingState, StatusBadge } from '../components';
 
@@ -19,10 +20,14 @@ const coordinate = (value) => Number.isFinite(Number(value)) ? Number(value).toF
 export default function VisitDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [visit, setVisit] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [photoOpen, setPhotoOpen] = useState(false);
+  const [reviewNote, setReviewNote] = useState('');
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewError, setReviewError] = useState('');
 
   const loadVisit = async () => {
     setLoading(true);
@@ -41,6 +46,17 @@ export default function VisitDetail() {
 
   const evidence = visit.photos?.[0];
   const verified = visit.locationStatus === 'VERIFIED';
+  const canReviewLocation = ['ADMIN', 'MANAGER'].includes(user?.role?.toUpperCase()) && visit.visitStatus === 'FLAGGED' && !visit.locationReviewedAt;
+  const submitLocationReview = async (decision) => {
+    if (!reviewNote.trim()) { setReviewError('Add a short reason for this location decision.'); return; }
+    setReviewBusy(true); setReviewError('');
+    try {
+      await api.put(`/api/v1/visits/${visit.id}/location-review`, { decision, note: reviewNote.trim() });
+      setReviewNote('');
+      await loadVisit();
+    } catch (err) { setReviewError(err.response?.data?.error || 'Could not save this location review.'); }
+    finally { setReviewBusy(false); }
+  };
   const timeline = [
     { label: 'Checked in', date: visit.checkInTime, icon: MapPin },
     { label: 'Evidence captured', date: evidence?.photoCapturedAt, icon: Camera },
@@ -49,8 +65,9 @@ export default function VisitDetail() {
 
   return <div className="visit-detail-page page">
     <PageHeader title={visit.visitId || 'Visit record'} subtitle="Verified field visit record and submitted evidence." breadcrumbs={[{ label: 'Visits', href: '/visits' }, { label: visit.visitId || 'Visit' }]} actions={<div className="page-header-actions"><button className="btn btn-secondary" onClick={() => navigate('/visits')}><ArrowLeft size={16} />Back to visits</button><button className="btn btn-primary" onClick={() => window.print()}><Printer size={15} />Export PDF</button><StatusBadge status={visit.visitStatus} /></div>} />
+    {visit.countsForMetrics === false && <div className="metric-exclusion-banner" role="note"><Clock3 size={16} /><span>This follow-up remains in visit history but does not affect coverage or performance metrics. Only one visit per agent in a rolling three-month period is counted.</span></div>}
     <section className="visit-summary surface-card">
-      <div className="visit-summary-main"><span className="summary-agent-avatar">{(visit.agent?.name || 'A').slice(0, 1).toUpperCase()}</span><div><span className="section-kicker">AGENT VISIT</span><h2>{visit.agent?.name || 'Unknown agent'}</h2><p>{visit.agent?.businessName || 'Independent agent'} <span>·</span> {visit.agent?.agentId || 'Agent ID unavailable'}</p></div></div>
+      <div className="visit-summary-main"><span className="summary-agent-avatar">{(visit.agent?.name || visit.externalAgentName || 'A').slice(0, 1).toUpperCase()}</span><div><span className="section-kicker">{visit.network === 'MOOLA_PLUS' ? 'MOOLA PLUS AGENT VISIT' : 'IREMBO AGENT VISIT'}</span><h2>{visit.agent?.name || visit.externalAgentName || 'Unknown agent'}</h2><p>{visit.agent?.businessName || (visit.network === 'MOOLA_PLUS' ? 'Moola Plus agent' : 'Independent agent')} <span>·</span> {visit.agent?.agentId || visit.externalAgentCode || 'Agent ID unavailable'}</p></div></div>
       <div className="summary-meta"><span>Territory</span><strong>{visit.territory?.name || visit.agent?.territory?.name || '—'}</strong></div>
       <div className="summary-meta"><span>Coordinator</span><strong>{fullName(visit.tc)}</strong></div>
       <div className="summary-meta"><span>Visit date</span><strong>{dateTime(visit.visitDate || visit.checkInTime)}</strong></div>
@@ -59,9 +76,17 @@ export default function VisitDetail() {
     <section className="visit-detail-grid">
       <div className="visit-detail-main">
         <article className="surface-card detail-panel">
-          <div className="detail-panel-heading"><span className="detail-icon gps-icon"><Navigation size={17} /></span><div><h3>Location verification</h3><p>GPS reading captured at check-in</p></div><span className={`verification-status ${verified ? 'good' : 'review'}`}>{verified ? <BadgeCheck size={14} /> : <ShieldAlert size={14} />}{verified ? 'Verified' : 'Review required'}</span></div>
-          <div className="gps-metrics"><div><span>Distance to agent</span><strong>{Math.round(visit.distanceMeters || 0)} <small>m</small></strong></div><div><span>GPS accuracy</span><strong>±{Math.round(visit.gpsAccuracyMeters || 0)} <small>m</small></strong></div><div><span>Location status</span><StatusBadge status={visit.locationStatus} /></div></div>
+          <div className="detail-panel-heading"><span className="detail-icon gps-icon"><Navigation size={17} /></span><div><h3>Location verification</h3><p>{visit.locationMethod === 'MANUAL_EVIDENCE' ? 'Manual evidence submitted for human review' : 'GPS reading captured at check-in'}</p></div><span className={`verification-status ${verified || visit.locationStatus === 'MANUAL_REVIEW_APPROVED' ? 'good' : 'review'}`}>{verified || visit.locationStatus === 'MANUAL_REVIEW_APPROVED' ? <BadgeCheck size={14} /> : <ShieldAlert size={14} />}{verified ? 'Verified' : visit.locationStatus === 'MANUAL_REVIEW_APPROVED' ? 'Approved' : 'Review required'}</span></div>
+          <div className="gps-metrics"><div><span>Distance to agent</span><strong>{visit.distanceMeters == null ? '—' : <>{Math.round(visit.distanceMeters)} <small>m</small></>}</strong></div><div><span>GPS accuracy</span><strong>{visit.gpsAccuracyMeters == null ? '—' : <>±{Math.round(visit.gpsAccuracyMeters)} <small>m</small></>}</strong></div><div><span>Location status</span><StatusBadge status={visit.locationStatus} /></div></div>
           <div className="coordinate-grid"><div><span>TC coordinates</span><code>{coordinate(visit.tcLatitude)}, {coordinate(visit.tcLongitude)}</code></div><div><span>Registered agent coordinates</span><code>{coordinate(visit.agentLatitude)}, {coordinate(visit.agentLongitude)}</code></div></div>
+          {visit.locationReviewNote && <div className="request-reason visit-location-review-note"><small>{visit.locationReviewedAt ? 'ADMIN REVIEW NOTE' : 'LOCATION NOTE'}</small><p>{visit.locationReviewNote}</p></div>}
+          {canReviewLocation && <div className="visit-location-review">
+            <strong>Review this location evidence</strong>
+            <p>Approve only if the evidence supports that the TC was with the agent. Approved visits can count toward the current coverage window.</p>
+            <label className="request-rejection-field">Review reason<textarea className="input" rows={2} maxLength={500} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="Explain the decision" /></label>
+            {reviewError && <p className="request-modal-error" role="alert">{reviewError}</p>}
+            <div className="request-modal-actions"><button className="btn btn-secondary" type="button" disabled={reviewBusy} onClick={() => submitLocationReview('REJECT')}>{reviewBusy ? 'Saving…' : 'Reject visit'}</button><button className="btn btn-primary" type="button" disabled={reviewBusy} onClick={() => submitLocationReview('APPROVE')}><BadgeCheck size={15} />{reviewBusy ? 'Saving…' : 'Approve location'}</button></div>
+          </div>}
         </article>
 
         <article className="surface-card detail-panel report-panel">

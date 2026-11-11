@@ -1,19 +1,18 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   ArrowRight, ArrowUpRight, BadgeCheck, CalendarDays,
-  ClipboardCheck, Clock3, MapPin, Plus, ShieldAlert, UsersRound
+  ClipboardCheck, Clock3, MapPin, Plus, RefreshCw, ShieldAlert, UsersRound
 } from 'lucide-react';
 import api from '../api';
 import { useAuth } from '../AuthContext';
 import { ErrorState, ListPagination, LoadingState, StatusBadge } from '../components';
-import FieldPerformance from '../components/FieldPerformance';
+import MoolaAnalytics from '../components/MoolaAnalytics';
+import IremboActivity from '../components/IremboActivity';
+import { OverviewAgentResults, OverviewFilters, PerformanceRanking } from '../components/NetworkOverview';
+import { MOOLA_PLUS_NETWORK, useNetwork } from '../NetworkContext';
 
 const formatDate = (value, options) => value ? new Intl.DateTimeFormat('en-GB', options).format(new Date(value)) : '—';
-const localDateValue = (date) => {
-  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
-  return local.toISOString().slice(0, 10);
-};
 const personName = (person) => [person?.firstName, person?.lastName].filter(Boolean).join(' ') || person?.username || '—';
 const valueOrZero = (value) => Number.parseFloat(value || 0) || 0;
 
@@ -26,10 +25,18 @@ function MetricCard({ index, label, value, caption }) {
 
 export default function Dashboard() {
   const { user } = useAuth();
+  const { network } = useNetwork();
   const navigate = useNavigate();
   const [fromDate, setFromDate] = useState('');
   const [toDate, setToDate] = useState('');
+  const [territoryFilters, setTerritoryFilters] = useState({ province: '', district: '', sector: '', cell: '', village: '' });
+  const [selectedStatus, setSelectedStatus] = useState('');
+  const [iremboSummary, setIremboSummary] = useState(null);
   const [dashboard, setDashboard] = useState(null);
+  const [moolaSummary, setMoolaSummary] = useState(null);
+  const [moolaLoading, setMoolaLoading] = useState(false);
+  const [moolaError, setMoolaError] = useState('');
+  const [moolaVisitSummary, setMoolaVisitSummary] = useState(null);
   const [visits, setVisits] = useState([]);
   const [visitTotal, setVisitTotal] = useState(0);
   const [visitPages, setVisitPages] = useState(0);
@@ -44,6 +51,14 @@ export default function Dashboard() {
   const dashboardRequest = useRef(0);
   const role = user?.role?.toUpperCase();
   const canStartVisit = role === 'TC';
+  const agentFilters = useMemo(() => ({ ...territoryFilters, fromDate, toDate }), [territoryFilters, fromDate, toDate]);
+  const updateAgentFilters = (next) => {
+    setTerritoryFilters({ province: next.province || '', district: next.district || '', sector: next.sector || '', cell: next.cell || '', village: next.village || '' });
+    setFromDate(next.fromDate || '');
+    setToDate(next.toDate || '');
+    setVisitPage(1);
+  };
+  const receiveIremboSummary = useCallback((data) => setIremboSummary(data), []);
 
   const loadDashboard = useCallback(async () => {
     const requestId = ++dashboardRequest.current;
@@ -62,29 +77,52 @@ export default function Dashboard() {
     }
   }, [fromDate, toDate]);
 
-  useEffect(() => { loadDashboard(); }, [loadDashboard]);
+  useEffect(() => {
+    if (network === 'IREMBO') loadDashboard();
+  }, [loadDashboard, network]);
+
+  const loadMoolaSummary = useCallback(async (forceRefresh = false) => {
+    setMoolaLoading(true);
+    setMoolaError('');
+    try {
+      const { data } = await api.get('/api/v1/reports/moola-plus/summary', { params: { ...agentFilters, ...(forceRefresh ? { refresh: 'true' } : {}) } });
+      setMoolaSummary(data);
+    } catch (err) {
+      setMoolaError(err.response?.data?.error || err.message || 'The DDIN Moola+ registry could not be loaded.');
+    } finally {
+      setMoolaLoading(false);
+    }
+  }, [agentFilters]);
+
+  useEffect(() => {
+    if (network === 'MOOLA_PLUS') loadMoolaSummary();
+  }, [loadMoolaSummary, network]);
 
   const activeRange = dashboard?.selectedRange;
 
   useEffect(() => {
-    if (!activeRange?.fromDate || !activeRange?.toDate) return undefined;
+    if (network !== 'MOOLA_PLUS' && (!activeRange?.fromDate || !activeRange?.toDate)) return undefined;
     const controller = new AbortController();
     setVisitsLoading(true);
     setVisitsError('');
-    api.get('/api/v1/visits', { params: { page: visitPage, limit: visitPageSize, fromDate: activeRange.fromDate, toDate: activeRange.toDate }, signal: controller.signal })
+    const params = network === 'MOOLA_PLUS'
+      ? { network, page: visitPage, limit: visitPageSize }
+      : { network, page: visitPage, limit: visitPageSize, fromDate: activeRange.fromDate, toDate: activeRange.toDate };
+    api.get('/api/v1/reports/visits', { params, signal: controller.signal })
       .then(({ data }) => {
         if (controller.signal.aborted) return;
         setVisits(data.data || []);
         setVisitTotal(data.meta?.total ?? 0);
         setVisitPages(data.meta?.pages ?? 0);
         setVisitPage(data.meta?.page ?? visitPage);
+        if (network === 'MOOLA_PLUS') setMoolaVisitSummary(data.summary || null);
       })
       .catch((err) => {
         if (!controller.signal.aborted) setVisitsError(err.response?.data?.error || 'Could not load recent visits.');
     })
       .finally(() => { if (!controller.signal.aborted) setVisitsLoading(false); });
     return () => controller.abort();
-  }, [activeRange?.fromDate, activeRange?.toDate, visitPage, visitPageSize, visitsRetryKey]);
+  }, [activeRange?.fromDate, activeRange?.toDate, network, visitPage, visitPageSize, visitsRetryKey]);
 
   useEffect(() => {
     if (visitPage > Math.max(visitPages, 1)) setVisitPage(Math.max(visitPages, 1));
@@ -100,36 +138,57 @@ export default function Dashboard() {
     ? `Showing activity from ${formatDate(`${dashboard.selectedRange.fromDate}T00:00:00`, { day: 'numeric', month: 'short', year: 'numeric' })} through ${formatDate(`${dashboard.selectedRange.toDate}T00:00:00`, { day: 'numeric', month: 'short', year: 'numeric' })}.`
     : 'Choose a date range for dashboard activity.';
 
-  if (loading) return <div className="dashboard-page"><LoadingState type="cards" message="Loading your operations overview…" /></div>;
-  if (error && !dashboard) return <div className="dashboard-page"><ErrorState message={error} onRetry={loadDashboard} /></div>;
-
   return <div className="dashboard-page">
     <section className="welcome-panel">
       <div className="welcome-copy">
         <span className="welcome-kicker"><CalendarDays size={14} /> {new Intl.DateTimeFormat('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).format(new Date())}</span>
         <h2>{greeting}, {greetingName}</h2>
-        <p>{activityDescription} Data covers your authorized areas.</p>
+        <p>{network === MOOLA_PLUS_NETWORK ? 'Moola Plus agents and reported deposit activity are loaded from the DDIN registry within your authorized coverage.' : `${activityDescription} Irembo agent status and field activity cover your authorized areas.`}</p>
       </div>
       <div className="welcome-actions dashboard-range-controls">
-        <label className="dashboard-date-wrap" htmlFor="dashboard-from"><span>From (optional)</span>
-          <input id="dashboard-from" className="period-select period-date-input" type="date" value={fromDate} max={toDate || localDateValue(new Date())} onChange={(event) => { setFromDate(event.target.value); setVisitPage(1); }} />
-        </label>
-        <label className="dashboard-date-wrap" htmlFor="dashboard-through"><span>Through (optional)</span>
-          <input id="dashboard-through" className="period-select period-date-input" type="date" value={toDate} min={fromDate || undefined} max={localDateValue(new Date())} onChange={(event) => { setToDate(event.target.value); setVisitPage(1); }} />
-        </label>
         {canStartVisit && <button className="btn btn-primary" onClick={() => navigate('/visits/new')}><Plus size={17} />Start a visit</button>}
+        {network === MOOLA_PLUS_NETWORK && <button className="btn btn-secondary" onClick={() => loadMoolaSummary(true)} disabled={moolaLoading}><RefreshCw size={16} className={moolaLoading ? 'spin' : ''} />Refresh registry</button>}
       </div>
     </section>
+
+    {network === MOOLA_PLUS_NETWORK ? <section className="moola-overview">
+      {moolaError && <ErrorState message={moolaError} onRetry={loadMoolaSummary} />}
+      {moolaLoading && !moolaSummary ? <LoadingState type="cards" message="Loading the DDIN Moola+ registry…" /> : moolaSummary && <>
+        <OverviewFilters network="Moola Plus" options={moolaSummary.filters} value={agentFilters} onChange={(next) => { updateAgentFilters(next); setSelectedStatus(''); }} />
+        <div className="network-source-note">
+          <strong>DDIN registry data</strong>
+          <span>{moolaSummary.stale ? 'Showing the last successful registry sync.' : 'Agent list refreshes from the DDIN API and is cached briefly.'}</span>
+          {moolaSummary.fetchedAt && <small>Last synced {formatDate(moolaSummary.fetchedAt, { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Kigali' })} Rwanda time</small>}
+        </div>
+        <MoolaAnalytics summary={moolaSummary} selectedStatus={selectedStatus} onStatusSelect={setSelectedStatus} />
+        {selectedStatus && <OverviewAgentResults network="MOOLA_PLUS" status={selectedStatus} filters={agentFilters} onClose={() => setSelectedStatus('')} />}
+        <PerformanceRanking performance={moolaSummary.performance} network="Moola Plus" filters={agentFilters} showTcCoverage={['ADMIN', 'MANAGER'].includes(role)} />
+        <section className="moola-field-activity" aria-label="Moola Plus field visit activity">
+          <div className="metric-grid">
+            <MetricCard index="M1" label="Counted Moola visits" value={Number(moolaVisitSummary?.total || 0).toLocaleString()} caption="Within the three-month agent window" />
+            <MetricCard index="M2" label="Agents visited" value={Number(moolaVisitSummary?.uniqueAgentsVisited || 0).toLocaleString()} caption="Completed visits included in metrics" />
+            <MetricCard index="M3" label="Follow-up visits" value={Number(moolaVisitSummary?.followUps || 0).toLocaleString()} caption="Kept in visit history, excluded from totals" />
+            <MetricCard index="M4" label="GPS verified" value={Number(moolaVisitSummary?.verified || 0).toLocaleString()} caption="Counted completed visits with verified GPS" />
+          </div>
+          <section className="surface-card recent-visits-card">
+            <div className="surface-heading"><div><span className="section-kicker">MOOLA PLUS FIELD ACTIVITY</span><h3>Recent visits</h3><p>Visit records use DDIN agent IDs and remain separate from the Irembo roster.</p></div><button className="btn btn-secondary btn-sm" onClick={() => navigate('/visits')}>All Moola visits <ArrowRight size={14} /></button></div>
+            {visitsLoading ? <LoadingState message="Loading Moola Plus visits…" /> : visitsError ? <ErrorState message={visitsError} onRetry={() => setVisitsRetryKey((key) => key + 1)} /> : visits.length ? <div className="table-scroll"><table className="data-table"><thead><tr><th>Agent</th><th>Visit</th><th>Coordinator</th><th>Status</th><th>Date</th></tr></thead><tbody>{visits.map((visit) => <tr key={visit.id} onClick={() => navigate(`/visits/${visit.id}`)}><td><strong>{visit.externalAgentName || visit.agent?.name || 'Moola Plus agent'}</strong><small className="visit-subtext">{visit.externalAgentCode || visit.agent?.agentId || '—'}</small></td><td>{visit.visitId}{visit.countsForMetrics === false && <small className="metric-exclusion-note">Follow-up · excluded</small>}</td><td>{personName(visit.tc)}</td><td><StatusBadge status={visit.visitStatus} /></td><td>{formatDate(visit.visitDate || visit.checkInTime, { day: '2-digit', month: 'short', year: 'numeric' })}</td></tr>)}</tbody></table></div> : <div className="detail-empty">No Moola Plus visits have been recorded in this period.</div>}
+            {visitPages > 1 && <ListPagination page={visitPage} pages={visitPages} total={visitTotal} pageSize={visitPageSize} onPageChange={setVisitPage} onPageSizeChange={(value) => { setVisitPageSize(value); setVisitPage(1); }} />}
+          </section>
+        </section>
+      </>}
+    </section> : loading && !dashboard ? <LoadingState type="cards" message="Loading your Irembo overview…" /> : error && !dashboard ? <ErrorState message={error} onRetry={loadDashboard} /> : <>
     {error && <ErrorState message={error} onRetry={loadDashboard} />}
+    <OverviewFilters network="Irembo" options={iremboSummary?.filters} value={agentFilters} onChange={(next) => { updateAgentFilters(next); setSelectedStatus(''); }} />
+    <IremboActivity filters={agentFilters} selectedStatus={selectedStatus} onStatusSelect={setSelectedStatus} onSummary={receiveIremboSummary} />
+    {selectedStatus && <OverviewAgentResults network="IREMBO" status={selectedStatus} filters={agentFilters} onClose={() => setSelectedStatus('')} />}
+    <PerformanceRanking performance={iremboSummary?.performance} network="Irembo" filters={agentFilters} showTcCoverage={['ADMIN', 'MANAGER'].includes(role)} />
 
-    <section className="metric-grid" aria-label="Field performance">
-      <MetricCard index="01" label="Visits recorded" value={stats.totalVisits ?? 0} caption={`${stats.completedVisits ?? 0} completed in this period`} />
-      <MetricCard index="02" label="Active agents" value={stats.totalActiveAgents ?? 0} caption="Across authorized territories" />
-      <MetricCard index="03" label="Verified visits" value={`${verifiedRate.toFixed(0)}%`} caption="Location checks passed" />
-      <MetricCard index="04" label="Needs review" value={flagged} caption="Outside the allowed radius" />
+    <section className="metric-grid" aria-label="Irembo field activity">
+      <MetricCard index="01" label="Visits counted" value={stats.totalVisits ?? 0} caption={`${stats.completedVisits ?? 0} completed in this period`} />
+      <MetricCard index="02" label="Verified visits" value={`${verifiedRate.toFixed(0)}%`} caption="Location checks passed" />
+      <MetricCard index="03" label="Needs review" value={flagged} caption="Outside the allowed radius" />
     </section>
-
-    {['TC', 'ADMIN', 'MANAGER'].includes(role) && <FieldPerformance role={role} fromDate={dashboard?.selectedRange?.fromDate} toDate={dashboard?.selectedRange?.toDate} />}
 
     <section className="surface-card field-activity-card" aria-label="First visit and territory changes">
       <div className="surface-heading">
@@ -160,7 +219,7 @@ export default function Dashboard() {
           <tbody>{visits.map((visit) => <tr key={visit.id} onClick={() => navigate(`/visits/${visit.id}`)} tabIndex="0" onKeyDown={(event) => event.key === 'Enter' && navigate(`/visits/${visit.id}`)}>
             <td><div className="table-person"><span className="table-avatar">{(visit.agent?.name || 'A').slice(0, 1).toUpperCase()}</span><span><strong>{visit.agent?.name || 'Unknown agent'}</strong><small>{visit.agent?.agentId || visit.visitId || 'Agent record'}</small></span></div></td>
             <td>{personName(visit.tc)}</td>
-            <td><StatusBadge status={visit.visitStatus} /></td>
+            <td><StatusBadge status={visit.visitStatus} />{visit.countsForMetrics === false && <small className="metric-exclusion-note">Follow-up · excluded from metrics</small>}</td>
             <td><span className={`location-result ${visit.locationStatus === 'VERIFIED' ? 'verified' : 'needs-review'}`}><span />{(visit.locationStatus || 'UNKNOWN').replaceAll('_', ' ')}</span></td>
             <td className="date-cell">{formatDate(visit.visitDate || visit.checkInTime, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</td>
             <td><ArrowRight className="row-arrow" size={16} /></td>
@@ -171,15 +230,6 @@ export default function Dashboard() {
       </article>
 
       <aside className="dashboard-side-column">
-        <article className="surface-card coverage-card">
-          <div className="surface-heading compact"><div><span className="section-kicker">COVERAGE</span><h3>Territory coverage</h3></div><span className="coverage-icon"><UsersRound size={17} /></span></div>
-          <div className="coverage-value">{stats.coverageRate || '0%'}</div>
-          <p className="coverage-copy">Active agents visited during the selected period.</p>
-          <div className="coverage-track"><span style={{ width: `${Math.min(100, valueOrZero(stats.coverageRate))}%` }} /></div>
-          <div className="coverage-legend"><span><i className="legend-dot orange-dot" />Visited agents</span><span>{stats.totalActiveAgents || 0} active</span></div>
-          <button className="subtle-link" onClick={() => navigate('/reports')}>Explore coverage report <ArrowRight size={15} /></button>
-        </article>
-
         <article className={`review-card ${flagged ? 'has-flags' : ''}`}>
           <div className="review-top"><span className="review-icon">{flagged ? <ShieldAlert size={18} /> : <BadgeCheck size={18} />}</span><span className="review-label">VISIT INTEGRITY</span>{flagged > 0 && <span className="review-count">{flagged}</span>}</div>
           <h3>{flagged ? 'Visits to review' : 'All clear for now'}</h3>
@@ -196,6 +246,7 @@ export default function Dashboard() {
         </article>
       </aside>
     </section>
-    <footer className="dashboard-footer"><span>Operational overview</span><span>Field visit data is recorded for authorized roles only.</span></footer>
+    <footer className="dashboard-footer"><span>Irembo field activity</span><span>Visit activity is scoped to your authorized areas. Follow-up visits within three months are kept in history but excluded from performance metrics.</span></footer>
+    </>}
   </div>;
 }
