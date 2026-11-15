@@ -13,7 +13,7 @@ This application manages TC assignments, agent registration, GPS-verified field 
 | ReportsService (`backend/ReportsService`) | Dashboards, reports, CSV exports, audit logs and system settings | 3004 |
 | Frontend (`frontend/`) | React PWA served by Nginx | 5173 (dev) / 8080 (Compose) |
 
-All backend services, shared code, scripts and the schema in `backend/prisma/schema.prisma` live under `backend/`; the frontend remains independently buildable from `frontend/`. The root `compose.yaml` orchestrates both folders. PostgreSQL is external to Compose. The current visit-photo volume is local to one Docker host.
+All backend services, shared code, scripts and the schema in `backend/prisma/schema.prisma` live under `backend/`; the frontend builds from `frontend/` and only needs the API Gateway. Each folder includes its own run instructions for operating independently. The root `compose.yaml` can still orchestrate both folders. PostgreSQL is external to Compose. The current visit-photo volume is local to one Docker host.
 
 ## Offline field workflow
 
@@ -78,6 +78,8 @@ The demo seed script is blocked when `NODE_ENV=production`. It creates two demo 
 ## Docker Compose
 
 Set `.env` with a PostgreSQL URL reachable from the containers. Compose reads backend build context from `backend/` and the frontend build context from `frontend/`.
+
+To run either side by itself, follow [frontend/README.md](frontend/README.md) or [backend/README.md](backend/README.md). The standalone frontend uses `VITE_API_URL` for the browser-reachable API Gateway. Set the backend's `FRONTEND_URL` to the frontend origin; the backend Compose setup uses an external PostgreSQL database and has no dependency on the frontend folder.
 
 ```bash
 docker compose up --build -d

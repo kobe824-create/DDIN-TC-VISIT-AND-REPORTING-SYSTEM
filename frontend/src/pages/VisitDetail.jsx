@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, BadgeCheck, Camera, Clock3, FileText, MapPin, Navigation, Printer, ShieldAlert } from 'lucide-react';
-import api from '../api';
+import api, { resolveApiUrl } from '../api';
 import { useAuth } from '../AuthContext';
 import PageHeader from '../components/PageHeader';
 import { ErrorState, LoadingState, StatusBadge } from '../components';
@@ -98,7 +98,7 @@ export default function VisitDetail() {
       <aside className="visit-detail-aside">
         <article className="surface-card evidence-panel">
           <div className="detail-panel-heading"><span className="detail-icon photo-icon"><Camera size={17} /></span><div><h3>Photo evidence</h3><p>Captured during the visit</p></div></div>
-          {evidence ? <button className="evidence-image-button" onClick={() => setPhotoOpen(true)}><img src={evidence.photoUrl} alt="Visit evidence" /><span>{dateTime(evidence.photoCapturedAt)}</span></button> : <div className="detail-empty">No photo evidence attached.</div>}
+          {evidence ? <button className="evidence-image-button" onClick={() => setPhotoOpen(true)}><img src={resolveApiUrl(evidence.photoUrl)} alt="Visit evidence" /><span>{dateTime(evidence.photoCapturedAt)}</span></button> : <div className="detail-empty">No photo evidence attached.</div>}
         </article>
         <article className="surface-card timeline-panel">
           <div className="detail-panel-heading"><span className="detail-icon timeline-icon"><Clock3 size={17} /></span><div><h3>Visit timeline</h3><p>Recorded timestamps</p></div></div>
@@ -107,6 +107,6 @@ export default function VisitDetail() {
         </article>
       </aside>
     </section>
-    {photoOpen && evidence && <button className="photo-lightbox" aria-label="Close photo preview" onClick={() => setPhotoOpen(false)}><img src={evidence.photoUrl} alt="Visit evidence enlarged" /></button>}
+    {photoOpen && evidence && <button className="photo-lightbox" aria-label="Close photo preview" onClick={() => setPhotoOpen(false)}><img src={resolveApiUrl(evidence.photoUrl)} alt="Visit evidence enlarged" /></button>}
   </div>;
 }

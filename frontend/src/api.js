@@ -10,6 +10,15 @@ const api = axios.create({
   }
 });
 
+export const resolveApiUrl = (path) => {
+  if (!path) return path;
+  try {
+    return new URL(path, api.defaults.baseURL || window.location.origin).toString();
+  } catch {
+    return path;
+  }
+};
+
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token');
   if (token) {
