@@ -4,7 +4,8 @@ const path = require('path');
 const { randomUUID } = require('crypto');
 const { performance } = require('node:perf_hooks');
 const dotenv = require('dotenv');
-dotenv.config();
+const { loadServiceEnv } = require('../../shared/env');
+loadServiceEnv(__dirname, dotenv);
 const prisma = require('./utils/prisma');
 const { addPiiResponseSanitizer } = require('../../shared/pii');
 

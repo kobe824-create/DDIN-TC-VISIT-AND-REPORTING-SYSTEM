@@ -16,7 +16,7 @@ Compose builds all backend services from this folder, applies Prisma migrations 
 
 ## Service environment files
 
-The backend root `.env.example` lists the variables used by the Docker Compose stack. Copy it to `.env` when running Compose. Each service also has its own `.env.example` for running that service directly from its folder; copy the matching example to `.env` and provide its values. The Compose stack injects service settings from the backend root `.env`, so the per-service files are not read inside the containers. These examples contain placeholders only. Keep real credentials and keys in untracked `.env` files or your deployment secret manager.
+The backend root `.env.example` lists the variables used by the Docker Compose stack and localhost service URLs for direct runs. Copy it to `.env` when running Compose or launching services from this folder. Each service also has its own `.env.example` for running that service directly from its folder; copy the matching example to `.env` and provide its values. Services load their own `.env` first and then use the backend root `.env` for missing values, regardless of the working directory. Existing process variables, including Docker Compose's injected values, take precedence. These examples contain placeholders only. Keep real credentials and keys in untracked `.env` files or your deployment secret manager.
 
 ## Backend contents
 

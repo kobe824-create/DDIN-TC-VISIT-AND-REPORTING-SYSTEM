@@ -1,7 +1,8 @@
 const express = require('express');
 const helmet = require('helmet');
 const dotenv = require('dotenv');
-dotenv.config();
+const { loadServiceEnv } = require('../../shared/env');
+loadServiceEnv(__dirname, dotenv);
 const prisma = require('./utils/prisma');
 const { addPiiResponseSanitizer } = require('../../shared/pii');
 
