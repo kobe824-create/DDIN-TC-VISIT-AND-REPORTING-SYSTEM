@@ -14,6 +14,10 @@ docker compose up --build -d
 
 Compose builds all backend services from this folder, applies Prisma migrations before starting the API services, and exposes the API Gateway on port `3000`. Visit photos persist in the `visit-photos` Docker volume. The database is not created by this Compose file; point `DATABASE_URL` to a PostgreSQL database available to the containers.
 
+## Service environment files
+
+The backend root `.env.example` lists the variables used by the Docker Compose stack. Copy it to `.env` when running Compose. Each service also has its own `.env.example` for running that service directly from its folder; copy the matching example to `.env` and provide its values. The Compose stack injects service settings from the backend root `.env`, so the per-service files are not read inside the containers. These examples contain placeholders only. Keep real credentials and keys in untracked `.env` files or your deployment secret manager.
+
 ## Backend contents
 
 - `ApiGateway/` routes browser requests to the backend services.
