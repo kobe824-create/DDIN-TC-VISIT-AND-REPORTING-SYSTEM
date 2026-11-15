@@ -3,6 +3,7 @@ const router = express.Router();
 const crypto = require('node:crypto');
 const prisma = require('../utils/prisma');
 const { authenticateToken, requireRole, requireTerritoryAccess } = require('../middleware/auth');
+const requireAgentRegistrationEnabled = require('../middleware/registration');
 const { logAction } = require('../utils/auditLog');
 const { decryptPii, encryptPii } = require('../../../shared/pii');
 const { advisoryTransactionLock } = require('../../../shared/advisory-locks');
@@ -1182,7 +1183,7 @@ router.get('/offline-pack', authenticateToken, requireTerritoryAccess, requireRo
   }
 });
 
-router.post('/', authenticateToken, requireTerritoryAccess, requireRole('ADMIN', 'MANAGER', 'TC'), async (req, res) => {
+router.post('/', authenticateToken, requireTerritoryAccess, requireRole('ADMIN', 'MANAGER', 'TC'), requireAgentRegistrationEnabled, async (req, res) => {
   try {
     const venue = String(req.body.venue || '').trim();
     if (!venue) return res.status(400).json({ error: 'Enter the agent’s venue.' });

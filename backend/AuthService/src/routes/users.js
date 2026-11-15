@@ -6,6 +6,7 @@ const bcrypt = require('bcryptjs');
 const prisma = require('../utils/prisma');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { logAction } = require('../utils/auditLog');
+const { encryptPii } = require('../../../shared/pii');
 const { parseTabularUpload } = require(path.join(__dirname, '..', '..', '..', 'shared', 'tabular'));
 const { canonicalDistrict, clean, findHeader, normalize, slug } = require(path.join(__dirname, '..', '..', '..', 'shared', 'import-normalization'));
 
@@ -207,7 +208,7 @@ router.get('/', authenticateToken, requireRole('ADMIN', 'MANAGER'), async (req, 
     skip: (page - 1) * limit,
     take: limit,
     orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }, { id: 'asc' }],
-    select: { id: true, username: true, email: true, role: true, firstName: true, lastName: true, isActive: true, mustChangePassword: true, createdAt: true }
+    select: { id: true, username: true, email: true, role: true, firstName: true, lastName: true, phoneNumber: true, gender: true, educationLevel: true, isActive: true, mustChangePassword: true, createdAt: true }
   });
 
   res.json({ data: users, total, page, limit, pages });
@@ -216,7 +217,7 @@ router.get('/', authenticateToken, requireRole('ADMIN', 'MANAGER'), async (req, 
 router.get('/:id', authenticateToken, requireRole('ADMIN', 'MANAGER'), async (req, res) => {
   const user = await prisma.user.findUnique({
     where: { id: req.params.id },
-    select: { id: true, username: true, email: true, role: true, firstName: true, lastName: true, isActive: true, mustChangePassword: true, createdAt: true }
+    select: { id: true, username: true, email: true, role: true, firstName: true, lastName: true, phoneNumber: true, gender: true, educationLevel: true, isActive: true, mustChangePassword: true, createdAt: true }
   });
   if (!user) return res.status(404).json({ error: 'User not found' });
   res.json(user);
@@ -260,13 +261,16 @@ router.post('/:id/reset-password', authenticateToken, requireRole('ADMIN'), asyn
 
 router.put('/:id', authenticateToken, requireRole('ADMIN'), async (req, res) => {
   try {
-    const { username, email, role, firstName, lastName, phoneNumber, isActive } = req.body;
+    const { username, email, role, firstName, lastName, phoneNumber, gender, educationLevel, nationalId, isActive } = req.body;
     const user = await prisma.user.update({
       where: { id: req.params.id },
-      data: { username, email, role, firstName, lastName, phoneNumber, isActive },
+      data: {
+        username, email, role, firstName, lastName, phoneNumber, gender, educationLevel, isActive,
+        ...(nationalId ? { nationalIdEncrypted: encryptPii(nationalId) } : {}),
+      },
       select: { id: true, username: true, role: true }
     });
-    await logAction(req.user.id, 'UPDATE_USER', 'User', user.id, { username, email, role, firstName, lastName, phoneNumber, isActive }, req);
+    await logAction(req.user.id, 'UPDATE_USER', 'User', user.id, { username, email, role, firstName, lastName, phoneNumber, gender, educationLevel, nationalIdUpdated: Boolean(nationalId), isActive }, req);
     res.json(user);
   } catch (error) {
     res.status(400).json({ error: 'Update failed' });

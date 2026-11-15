@@ -3,6 +3,7 @@ const path = require('path');
 const router = express.Router();
 const prisma = require('../utils/prisma');
 const { authenticateToken, requireRole } = require('../middleware/auth');
+const requireAgentRegistrationEnabled = require('../middleware/registration');
 const { logAction } = require('../utils/auditLog');
 const { parseTabularUpload } = require(path.join(__dirname, '..', '..', '..', 'shared', 'tabular'));
 const { canonicalDistrict, canonicalProvince, canonicalProvinceForDistrict, clean, findHeader, normalize, slug } = require(path.join(__dirname, '..', '..', '..', 'shared', 'import-normalization'));
@@ -347,7 +348,7 @@ async function createTerritories(tx, records) {
   });
 }
 
-router.post('/preview', authenticateToken, requireRole('ADMIN', 'TC'), async (req, res) => {
+router.post('/preview', authenticateToken, requireRole('ADMIN', 'TC'), requireAgentRegistrationEnabled, async (req, res) => {
   try {
     const analysis = await analyzeAgentImport(req.body, req.user);
     res.json({ summary: analysis.summary, errors: analysis.errors, warnings: analysis.warnings });
@@ -356,7 +357,7 @@ router.post('/preview', authenticateToken, requireRole('ADMIN', 'TC'), async (re
   }
 });
 
-router.post('/', authenticateToken, requireRole('ADMIN', 'TC'), async (req, res) => {
+router.post('/', authenticateToken, requireRole('ADMIN', 'TC'), requireAgentRegistrationEnabled, async (req, res) => {
   try {
     const analysis = await analyzeAgentImport(req.body, req.user);
     if (!analysis.ready.length && !analysis.enrichments.length) return res.status(400).json({

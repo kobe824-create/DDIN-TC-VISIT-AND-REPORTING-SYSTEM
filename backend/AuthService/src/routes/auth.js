@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const prisma = require('../utils/prisma');
 const { logAction } = require('../utils/auditLog');
 const { authenticateToken, requireRole } = require('../middleware/auth');
+const { encryptPii } = require('../../../shared/pii');
 
 router.post('/login', async (req, res) => {
   const { username, password } = req.body;
@@ -78,11 +79,16 @@ router.post('/login', async (req, res) => {
 });
 
 router.post('/register', authenticateToken, requireRole('ADMIN'), async (req, res) => {
-  const { username, password, email, role, firstName, lastName, phoneNumber } = req.body;
+  const { username, password, email, role, firstName, lastName, phoneNumber, gender, educationLevel, nationalId } = req.body;
   try {
     const passwordHash = await bcrypt.hash(password, 10);
     const user = await prisma.user.create({
-      data: { username, email, passwordHash, role, firstName, lastName, phoneNumber }
+      data: {
+        username, email, passwordHash, role, firstName, lastName, phoneNumber,
+        gender: gender || null,
+        educationLevel: educationLevel || null,
+        nationalIdEncrypted: encryptPii(nationalId),
+      }
     });
     await logAction(req.user.id, 'CREATE_USER', 'User', user.id, { username, role }, req);
     res.status(201).json({ id: user.id, username: user.username, role: user.role });
