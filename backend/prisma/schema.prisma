@@ -494,6 +494,12 @@ model VisitPlan {
   @@index([tcId, endDate])
 }
 
+model FieldOperationsSettings {
+  id            Int      @id @default(1)
+  fieldStartDate DateTime @db.Date
+  updatedAt     DateTime @updatedAt
+}
+
 model FieldWorkdayFollowUp {
   id              String              @id @default(uuid()) @db.Uuid
   tcId            String              @db.Uuid

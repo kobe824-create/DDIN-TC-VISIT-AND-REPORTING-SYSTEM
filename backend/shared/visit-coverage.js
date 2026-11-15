@@ -15,7 +15,7 @@ function shiftKigaliMonths(value, monthOffset) {
   return new Date(`${dateKey}T${values.hour}:${values.minute}:${values.second}.${String(value.getMilliseconds()).padStart(3, '0')}+02:00`);
 }
 
-async function latestQualifiedVisits(client, network, ids) {
+async function latestQualifiedVisits(client, network, ids, fromDate) {
   if (!Array.isArray(ids) || ids.length === 0) return new Map();
   const key = network === 'MOOLA_PLUS' ? 'externalAgentId' : 'agentId';
   const groups = await client.visit.groupBy({
@@ -26,6 +26,7 @@ async function latestQualifiedVisits(client, network, ids) {
       countsForMetrics: true,
       visitStatus: { in: COMPLETED_VISIT_STATUSES },
       locationStatus: { in: ACCEPTED_LOCATION_STATUSES },
+      ...(fromDate ? { visitDate: { gte: fromDate } } : {}),
     },
     _max: { visitDate: true },
   });

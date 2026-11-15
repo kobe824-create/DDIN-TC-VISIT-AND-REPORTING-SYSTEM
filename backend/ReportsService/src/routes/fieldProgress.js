@@ -181,15 +181,24 @@ function visitPersonId(visit, index) {
   return recordId ? index.personByVisitKey.get(`${visit.network}:${recordId}`) || null : null;
 }
 
-async function planningCoverage(agents, network) {
+async function fieldOperationsStartDate() {
+  const settings = await prisma.fieldOperationsSettings.findUnique({
+    where: { id: 1 },
+    select: { fieldStartDate: true },
+  });
+  return settings?.fieldStartDate?.toISOString().slice(0, 10) || kigaliDateKey();
+}
+
+async function planningCoverage(agents, network, fieldStartDate) {
+  const fromDate = fieldStartDate ? dayRange(fieldStartDate).start : undefined;
   if (network !== 'COMBINED') {
-    const latest = await latestQualifiedVisits(prisma, network, agents.map(({ id }) => String(id)));
+    const latest = await latestQualifiedVisits(prisma, network, agents.map(({ id }) => String(id)), fromDate);
     return new Map(agents.map((agent) => [agent.id, coverageState(latest.get(String(agent.id)))]));
   }
   const index = planningVisitIndex(agents, network);
   const [irembo, moola] = await Promise.all([
-    latestQualifiedVisits(prisma, 'IREMBO', index.iremboIds),
-    latestQualifiedVisits(prisma, 'MOOLA_PLUS', index.moolaIds),
+    latestQualifiedVisits(prisma, 'IREMBO', index.iremboIds, fromDate),
+    latestQualifiedVisits(prisma, 'MOOLA_PLUS', index.moolaIds, fromDate),
   ]);
   return new Map(agents.map((person) => {
     const states = (person.sourceRecords || []).map((source) => {
@@ -778,7 +787,7 @@ router.get('/plan-preview', authenticateToken, requireRole('TC'), async (req, re
     const agents = await planningRoster(network, req.user, districts);
     const rosterCount = agents.length;
     const areaAgents = agents.filter((agent) => agentMatchesTerritory(agent, territory, districts));
-    const coverage = await planningCoverage(areaAgents, network);
+    const coverage = await planningCoverage(areaAgents, network, await fieldOperationsStartDate());
     const uncoveredAgents = areaAgents.filter((agent) => !coverage.get(agent.id)?.visitedInCoverage).length;
     const dailyTarget = minimumDailyTarget(rosterCount, quarterFieldDays(today).days);
     const intervalWorkdays = workingDaysBetween(startDate, endDate);
@@ -823,7 +832,7 @@ router.put('/plans', authenticateToken, requireRole('TC'), async (req, res) => {
     const allAgents = await planningRoster(network, req.user, districts);
     const assignedAgents = allAgents.length;
     const areaAgents = allAgents.filter((agent) => agentMatchesTerritory(agent, territory, districts));
-    const coverage = await planningCoverage(areaAgents, network);
+    const coverage = await planningCoverage(areaAgents, network, await fieldOperationsStartDate());
     const uncoveredCount = areaAgents.filter((agent) => !coverage.get(agent.id)?.visitedInCoverage).length;
     const quarter = quarterFieldDays(today);
     const dailyTarget = minimumDailyTarget(assignedAgents, quarter.days);
@@ -850,19 +859,21 @@ router.put('/plans', authenticateToken, requireRole('TC'), async (req, res) => {
 router.get('/daily-workload', authenticateToken, requireRole('TC'), async (req, res) => {
   try {
     const today = kigaliDateKey();
+    const fieldStartDate = await fieldOperationsStartDate();
     const districts = await accessibleDistricts(req.user);
     const districtIds = districts.map(({ id }) => id);
     if (!districtIds.length) return res.json({ date: today, isWorkday: isFieldWeekday(today), dailyTarget: 0, completedToday: 0, carryOver: 0, requiredToday: 0, dueCount: 0, dueAgents: [], rosterCount: 0, coverageRemaining: 0 });
     const agents = await combinedPlanningRoster(req.user, districts);
     const visitIndex = planningVisitIndex(agents, 'COMBINED');
     const quarterStart = addMonthsToDateKey(today, -3);
+    const workloadStart = fieldStartDate > quarterStart ? fieldStartDate : quarterStart;
     const [coverageByAgent, visits] = await Promise.all([
-      planningCoverage(agents, 'COMBINED'),
+      planningCoverage(agents, 'COMBINED', fieldStartDate),
       visitIndex.where.length ? prisma.visit.findMany({
         where: {
           tcId: req.user.id,
           OR: visitIndex.where,
-          visitDate: { gte: dayRange(quarterStart).start, lt: dayRange(today).end },
+          visitDate: { gte: dayRange(workloadStart).start, lt: dayRange(today).end },
           countsForMetrics: true,
           visitStatus: { in: COMPLETED_STATUSES },
           locationStatus: { in: ACCEPTED_LOCATION_STATUSES },
@@ -878,7 +889,7 @@ router.get('/daily-workload', authenticateToken, requireRole('TC'), async (req, 
       if (!agentsByDate.has(key)) agentsByDate.set(key, new Set());
       agentsByDate.get(key).add(personId);
     }
-    const quarterDays = dateKeysBetween(quarterStart, addCalendarDays(today, -1));
+    const quarterDays = dateKeysBetween(workloadStart, addCalendarDays(today, -1));
     let carryOver = 0;
     for (const dateKey of quarterDays) {
       if (!isFieldWeekday(dateKey)) continue;
@@ -924,6 +935,8 @@ router.get('/follow-ups', authenticateToken, requireRole('ADMIN', 'MANAGER'), as
   try {
     const today = kigaliDateKey();
     const quarterStart = addMonthsToDateKey(today, -3);
+    const fieldStartDate = await fieldOperationsStartDate();
+    const followUpStart = fieldStartDate > quarterStart ? fieldStartDate : quarterStart;
     const lastClosedWorkday = previousFieldDay(today);
     const [tcs, assignments, districts] = await Promise.all([
       prisma.user.findMany({ where: { role: 'TC', isActive: true }, select: { id: true, firstName: true, lastName: true, username: true } }),
@@ -951,12 +964,12 @@ router.get('/follow-ups', authenticateToken, requireRole('ADMIN', 'MANAGER'), as
     const [visits, existing] = tcIds.length && visitIndex.where.length ? await Promise.all([
       prisma.visit.findMany({
         where: {
-          tcId: { in: tcIds }, OR: visitIndex.where, visitDate: { gte: dayRange(quarterStart).start, lt: dayRange(today).start },
+          tcId: { in: tcIds }, OR: visitIndex.where, visitDate: { gte: dayRange(followUpStart).start, lt: dayRange(today).start },
           countsForMetrics: true, visitStatus: { in: COMPLETED_STATUSES }, locationStatus: { in: ACCEPTED_LOCATION_STATUSES },
         },
         select: { tcId: true, network: true, agentId: true, externalAgentId: true, visitDate: true },
       }),
-      prisma.fieldWorkdayFollowUp.findMany({ where: { workDate: { gte: new Date(`${quarterStart}T00:00:00.000Z`), lte: new Date(`${lastClosedWorkday}T00:00:00.000Z`) } }, select: { tcId: true, workDate: true } }),
+      prisma.fieldWorkdayFollowUp.findMany({ where: { workDate: { gte: new Date(`${followUpStart}T00:00:00.000Z`), lte: new Date(`${lastClosedWorkday}T00:00:00.000Z`) } }, select: { tcId: true, workDate: true } }),
     ]) : [[], []];
     const visitsByTcDate = new Map();
     for (const visit of visits) {
@@ -971,7 +984,7 @@ router.get('/follow-ups', authenticateToken, requireRole('ADMIN', 'MANAGER'), as
     for (const tc of tcs) {
       const rosterCount = agentIdsByTc.get(tc.id)?.size || 0;
       if (!rosterCount) continue;
-      for (const dateKey of dateKeysBetween(quarterStart, lastClosedWorkday)) {
+      for (const dateKey of dateKeysBetween(followUpStart, lastClosedWorkday)) {
         if (!isFieldWeekday(dateKey)) continue;
         const key = `${tc.id}:${dateKey}`;
         if (existingKeys.has(key)) continue;
@@ -983,7 +996,7 @@ router.get('/follow-ups', authenticateToken, requireRole('ADMIN', 'MANAGER'), as
     }
     if (missedRows.length) await prisma.fieldWorkdayFollowUp.createMany({ data: missedRows, skipDuplicates: true });
     const followUps = await prisma.fieldWorkdayFollowUp.findMany({
-      where: { workDate: { gte: new Date(`${quarterStart}T00:00:00.000Z`), lte: new Date(`${lastClosedWorkday}T00:00:00.000Z`) }, status: { in: ['OPEN', 'ACKNOWLEDGED'] } },
+      where: { workDate: { gte: new Date(`${followUpStart}T00:00:00.000Z`), lte: new Date(`${lastClosedWorkday}T00:00:00.000Z`) }, status: { in: ['OPEN', 'ACKNOWLEDGED'] } },
       include: { tc: { select: { id: true, firstName: true, lastName: true, username: true } } },
       orderBy: [{ workDate: 'asc' }, { missedAgents: 'desc' }],
     });
