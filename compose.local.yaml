@@ -1,0 +1,66 @@
+# Local-only overlay. Run this with compose.yaml and a local environment file.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ddin_tc
+      POSTGRES_USER: ddin_local
+      POSTGRES_PASSWORD: ddin_local
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - local-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ddin_local -d ddin_tc"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  db-migrate:
+    environment:
+      DATABASE_URL: postgresql://ddin_local:ddin_local@postgres:5432/ddin_tc?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  auth-service:
+    environment:
+      DATABASE_URL: postgresql://ddin_local:ddin_local@postgres:5432/ddin_tc?schema=public
+      JWT_SECRET: local-development-jwt-secret-not-for-production
+      JWT_REFRESH_SECRET: local-development-refresh-secret-not-for-production
+      PII_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+      TC_INITIAL_PASSWORD: LocalOnly-Demo-2026
+
+  agents-service:
+    environment:
+      DATABASE_URL: postgresql://ddin_local:ddin_local@postgres:5432/ddin_tc?schema=public
+      JWT_SECRET: local-development-jwt-secret-not-for-production
+      PII_ENCRYPTION_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+      AGENT_REGISTRATION_ENABLED: "false"
+      WHAPI_API_TOKEN: ""
+
+  visits-service:
+    environment:
+      DATABASE_URL: postgresql://ddin_local:ddin_local@postgres:5432/ddin_tc?schema=public
+      JWT_SECRET: local-development-jwt-secret-not-for-production
+
+  reports-service:
+    environment:
+      DATABASE_URL: postgresql://ddin_local:ddin_local@postgres:5432/ddin_tc?schema=public
+      JWT_SECRET: local-development-jwt-secret-not-for-production
+      IREMBO_ACTIVITY_FEED_URL: ""
+      DDIN_API_KEY: ""
+
+  api-gateway:
+    environment:
+      FRONTEND_URL: http://localhost:8180
+    ports: !override
+      - "127.0.0.1:3030:3000"
+
+  frontend:
+    ports: !override
+      - "127.0.0.1:8180:8080"
+
+volumes:
+  local-postgres-data:

@@ -81,6 +81,23 @@ Set `.env` with a PostgreSQL URL reachable from the containers. Compose reads ba
 
 To run either side by itself, follow [frontend/README.md](frontend/README.md) or [backend/README.md](backend/README.md). The standalone frontend uses `VITE_API_URL` for the browser-reachable API Gateway. Set the backend's `FRONTEND_URL` to the frontend origin; the backend Compose setup uses an external PostgreSQL database and has no dependency on the frontend folder.
 
+For a full local check against a separate PostgreSQL database, copy `local.env.example` to `.env.local` and start an isolated Compose project:
+
+```bash
+cp local.env.example .env.local
+docker compose --env-file .env.local -p ddin-tc-local -f compose.yaml -f compose.local.yaml up --build -d
+```
+
+Open `http://localhost:8180`. The local stack uses its own PostgreSQL volume, binds the app to ports 8180 and 3030, and applies migrations only to that local database. It leaves the regular `8080`/`3000` stack and root `.env` configuration separate. Check startup with `docker compose --env-file .env.local -p ddin-tc-local -f compose.yaml -f compose.local.yaml ps`. Stop it with the same options and `down`; omit `-v` to keep the local database for the next run. The values in `local.env.example` are for local development only.
+
+To add sample users and agents for a local sign-in, run:
+
+```bash
+docker compose --env-file .env.local -p ddin-tc-local -f compose.yaml -f compose.local.yaml exec -T -e NODE_ENV=development -e DEMO_SEED_ENABLED=true auth-service node src/seedDemoAccounts.js
+```
+
+The command prints a one-time initial password for `demo-admin`; the demo TCs use the temporary password in `.env.local` and must change it at first sign-in. It writes only to the isolated local database.
+
 ```bash
 docker compose up --build -d
 ```
