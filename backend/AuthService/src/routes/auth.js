@@ -65,8 +65,15 @@ router.post('/login', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Login error:', error.code || error.name);
-    res.status(500).json({ error: 'Could not sign in right now. Please try again.', stack: error.stack });
+    const errorCode = error.code || error.errorCode;
+    const databaseUnavailable = error.name === 'PrismaClientInitializationError'
+      || ['P1001', 'P1002', 'P2024'].includes(errorCode);
+    console.error('Login error:', errorCode || error.name);
+    res.status(databaseUnavailable ? 503 : 500).json({
+      error: databaseUnavailable
+        ? 'Sign-in is temporarily unavailable. Please try again shortly.'
+        : 'Could not sign in right now. Please try again.',
+    });
   }
 });
 
