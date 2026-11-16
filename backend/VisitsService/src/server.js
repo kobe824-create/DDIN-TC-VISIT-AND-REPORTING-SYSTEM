@@ -52,6 +52,7 @@ app.get('/ready', async (req, res) => {
   }
 });
 app.use('/api/v1/visits', require('./routes/visits'));
+app.use('/api/v1/issues', require('./routes/issues'));
 
 const PORT = process.env.PORT || 3003;
 app.listen(PORT, () => console.log(`VisitsService running on port ${PORT}`));

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
-  ChevronDown, FileBarChart2, FileClock, Upload,
+  ChevronDown, FileBarChart2, FileClock, Upload, LifeBuoy,
   LayoutDashboard, LogOut, Map, MapPinned, Menu, Settings2, ShieldCheck,
   KeyRound, MessageCircle, UserRound, UsersRound, X
 } from 'lucide-react';
@@ -16,6 +16,7 @@ const primaryNav = [
   { label: 'Visits', path: '/visits', icon: MapPinned, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
   { label: 'Agents', path: '/agents', icon: UsersRound, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
   { label: 'WhatsApp groups', path: '/sector-groups', icon: MessageCircle, roles: ['TC'] },
+  { label: 'Issues', path: '/issues', icon: LifeBuoy, roles: ['ADMIN', 'TC'] },
   { label: 'Reports', path: '/reports', icon: FileBarChart2, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
 ];
 

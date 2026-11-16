@@ -45,7 +45,7 @@ app.use((req, res, next) => {
     const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
     const photoUpload = req.method === 'PUT' && /^\/api\/v1\/visits\/[^/]+\/photo$/.test(requestPath);
     if (!closedEarly && !photoUpload && res.statusCode < 400 && durationMs < 1000) return;
-    const service = requestPath.startsWith('/api/v1/visits') || requestPath.startsWith('/uploads') ? 'visits-service'
+    const service = requestPath.startsWith('/api/v1/visits') || requestPath.startsWith('/api/v1/issues') || requestPath.startsWith('/uploads') ? 'visits-service'
       : requestPath.startsWith('/api/v1/agents') || requestPath.startsWith('/api/v1/territories') ? 'agents-service'
         : requestPath.startsWith('/api/v1/auth') || requestPath.startsWith('/api/v1/users') ? 'auth-service'
           : requestPath.startsWith('/api/v1/reports') || requestPath.startsWith('/api/v1/config') ? 'reports-service' : 'api-gateway';
@@ -151,6 +151,11 @@ app.use(
 app.use(
   '/api/v1/visits',
   createJsonProxy(VISITS_SERVICE_URL, '/api/v1/visits', 'visits-service')
+);
+
+app.use(
+  '/api/v1/issues',
+  createJsonProxy(VISITS_SERVICE_URL, '/api/v1/issues', 'visits-service')
 );
 
 app.use(

@@ -26,6 +26,9 @@ import AuditLogs from './pages/AuditLogs';
 import ProfilePage from './pages/ProfilePage';
 import BulkImport from './pages/BulkImport';
 import SectorGroups from './pages/SectorGroups';
+import Issues from './pages/Issues';
+import NewIssue from './pages/NewIssue';
+import IssueDetail from './pages/IssueDetail';
 import NetworkNotice from './components/NetworkNotice';
 import { MOOLA_PLUS_NETWORK, useNetwork } from './NetworkContext';
 
@@ -76,6 +79,9 @@ const AppRoutes = () => {
         <Route path="/irembo/agents/:id" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER', 'TC', 'CHAMPION']}><IremboAgentDetail /></ProtectedRoute>} />
         <Route path="/moola-plus/agents/:id" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER', 'TC', 'CHAMPION']}><MoolaPlusAgentDetail /></ProtectedRoute>} />
         <Route path="/sector-groups" element={<ProtectedRoute allowedRoles={['TC']}><SectorGroups /></ProtectedRoute>} />
+        <Route path="/issues" element={<ProtectedRoute allowedRoles={['ADMIN', 'TC']}><Issues /></ProtectedRoute>} />
+        <Route path="/issues/new" element={<ProtectedRoute allowedRoles={['TC']}><NewIssue /></ProtectedRoute>} />
+        <Route path="/issues/:id" element={<ProtectedRoute allowedRoles={['ADMIN', 'TC']}><IssueDetail /></ProtectedRoute>} />
         <Route path="/agents/new" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER', 'TC']}><IremboOnlyRoute title="Register an Irembo agent"><AgentForm /></IremboOnlyRoute></ProtectedRoute>} />
         <Route path="/agents/:id" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER', 'TC', 'CHAMPION']}><NetworkAgentDetail /></ProtectedRoute>} />
         <Route path="/agents/:id/edit" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER']}><IremboOnlyRoute title="Edit an Irembo agent"><AgentForm /></IremboOnlyRoute></ProtectedRoute>} />

@@ -86,6 +86,34 @@ enum VisitNetwork {
   COMBINED
 }
 
+enum IssueStatus {
+  NEW
+  IN_PROGRESS
+  WAITING
+  ESCALATED
+  RESOLVED
+  REJECTED
+  CLOSED
+}
+
+enum IssueCategory {
+  REQUEST
+  MATERIALS
+  PAYMENT
+  DEVICE
+  ACCOUNT
+  TRAINING
+  COMPLAINT
+  OTHER
+}
+
+enum IssuePriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
 enum SyncStatus {
   SYNCED
   PENDING
@@ -132,6 +160,58 @@ model User {
   requestedMoolaTransfers          MoolaAgentTransfer[]     @relation("MoolaTransferRequester")
   receivedMoolaTransfers           MoolaAgentTransfer[]     @relation("MoolaTransferRecipient")
   movementNotices                  AgentMovementNotice[]    @relation("MovementNoticeRecipient")
+  issuesReported                   Issue[]                  @relation("IssueReporter")
+  issuesAssigned                   Issue[]                  @relation("IssueAssignee")
+  issueComments                    IssueComment[]           @relation("IssueCommentAuthor")
+  issueAssignments                 IssueComment[]           @relation("IssueCommentAssignee")
+}
+
+model Issue {
+  id             String        @id @default(uuid()) @db.Uuid
+  code           String        @unique
+  title          String        @db.VarChar(200)
+  description    String        @db.VarChar(5000)
+  category       IssueCategory @default(OTHER)
+  priority       IssuePriority @default(NORMAL)
+  status         IssueStatus   @default(NEW)
+  network        VisitNetwork  @default(IREMBO)
+  reporterId     String        @db.Uuid
+  reporter       User          @relation("IssueReporter", fields: [reporterId], references: [id], onDelete: Restrict)
+  assignedToId   String?       @db.Uuid
+  assignedTo     User?         @relation("IssueAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  agentName      String        @default("") @db.VarChar(200)
+  agentPhone     String        @default("") @db.VarChar(32)
+  agentCode      String        @default("") @db.VarChar(80)
+  province       String        @default("") @db.VarChar(80)
+  district       String        @default("") @db.VarChar(80)
+  sector         String        @default("") @db.VarChar(80)
+  cell           String        @default("") @db.VarChar(80)
+  village        String        @default("") @db.VarChar(80)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  resolvedAt     DateTime?
+  closedAt       DateTime?
+  comments       IssueComment[]
+
+  @@index([reporterId, updatedAt])
+  @@index([assignedToId, status, updatedAt])
+  @@index([status, updatedAt])
+}
+
+model IssueComment {
+  id             String       @id @default(uuid()) @db.Uuid
+  issueId        String       @db.Uuid
+  issue          Issue        @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  authorId       String?      @db.Uuid
+  author         User?        @relation("IssueCommentAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+  body           String       @default("") @db.VarChar(5000)
+  statusFrom     IssueStatus?
+  statusTo       IssueStatus?
+  assignedToId   String?      @db.Uuid
+  assignedTo     User?        @relation("IssueCommentAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  createdAt      DateTime     @default(now())
+
+  @@index([issueId, createdAt])
 }
 
 model Territory {
