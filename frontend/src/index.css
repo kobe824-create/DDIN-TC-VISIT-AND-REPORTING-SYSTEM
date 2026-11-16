@@ -2383,6 +2383,7 @@ html, body, #root {
 .sector-groups-guidance > svg { flex: 0 0 auto; margin-top: 2px; color: #cf713b; }
 .sector-groups-guidance strong { color: #553b2c; font-size: 14px; }
 .sector-groups-guidance p { margin: 5px 0 0; color: #775c4c; font-size: 13px; line-height: 1.55; }
+.sector-group-level-select { display: grid; grid-template-columns: minmax(180px, 320px); gap: 7px; color: #56645a; font-size: 12px; font-weight: 700; }
 .sector-groups-provider-note { padding: 14px 17px; border: 1px solid #f0d5c3; border-radius: 11px; color: #74482f; background: #fffaf6; }
 .sector-groups-provider-note > strong { color: #553b2c; font-size: 13px; }
 .sector-groups-provider-note p { margin: 5px 0; font-size: 12px; line-height: 1.55; }

@@ -11,6 +11,7 @@ RUN apt-get update \
 COPY package.json package-lock.json ./
 COPY prisma ./prisma
 COPY shared ./shared
+COPY data ./data
 RUN npm ci --omit=dev
 RUN npx prisma generate
 

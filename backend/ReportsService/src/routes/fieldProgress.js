@@ -3,6 +3,7 @@ const router = express.Router();
 const prisma = require('../utils/prisma');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { COMPLETED_VISIT_STATUSES, ACCEPTED_LOCATION_STATUSES, coverageState, latestQualifiedVisits } = require('../../../shared/visit-coverage');
+const { isOfficialTerritoryPath } = require('../../../shared/rwanda-territory-catalog');
 const reportsRouter = require('./reports');
 
 const COMPLETED_STATUSES = COMPLETED_VISIT_STATUSES;
@@ -656,6 +657,7 @@ router.get('/explorer', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC')
     } else {
       nodes = await prisma.territory.findMany({ where: { parentId: selected.id, isActive: true }, orderBy: { name: 'asc' }, select: { id: true, name: true, type: true, parentId: true } });
       if (req.user.role === 'TC') nodes = nodes.filter((node) => node.type !== 'DISTRICT' || districtIds.has(node.id));
+      nodes = nodes.filter((node) => isOfficialTerritoryPath([...breadcrumbs, node]));
     }
 
     const districtIdList = [...districtIds];

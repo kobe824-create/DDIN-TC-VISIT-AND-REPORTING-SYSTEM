@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const prisma = require('../utils/prisma');
 const { authenticateToken, requireRole } = require('../middleware/auth');
-const { coverageState, latestQualifiedVisits } = require('../../../shared/visit-coverage');
+const { coverageState, latestQualifiedVisits, shiftKigaliMonths } = require('../../../shared/visit-coverage');
 
 async function visitScope(user) {
   if (!['ADMIN', 'MANAGER'].includes(user.role)) {
@@ -92,11 +92,16 @@ const numberOrZero = (value) => {
   const number = Number(value);
   return Number.isFinite(number) ? number : 0;
 };
-const ACTIVITY_LEVELS = [
+const IREMBO_ACTIVITY_LEVELS = [
   { name: 'Active', minimum: 80, maximum: null, range: '80+ transactions' },
   { name: 'Transacting', minimum: 30, maximum: 79, range: '30–79 transactions' },
   { name: 'Dormant', minimum: 1, maximum: 29, range: '1–29 transactions' },
   { name: 'Inactive', minimum: 0, maximum: 0, range: '0 transactions' },
+];
+const MOOLA_ACTIVITY_LEVELS = [
+  { name: 'Active', range: 'Transaction in the last 3 months' },
+  { name: 'Dormant', range: 'Transaction older than 3 months' },
+  { name: 'Inactive', range: 'No reported transactions' },
 ];
 
 function pickFeedValue(row, fieldNames) {
@@ -117,7 +122,7 @@ function classifyTransactionActivity(value) {
   return 'Inactive';
 }
 
-function getIremboActivityLevels() { return ACTIVITY_LEVELS.map(({ name, range }) => ({ name, range })); }
+function getIremboActivityLevels() { return IREMBO_ACTIVITY_LEVELS.map(({ name, range }) => ({ name, range })); }
 
 function parseIremboFeedRows(payload) {
   if (payload?.success === false) throw new Error('The Irembo activity feed reported an unsuccessful response.');
@@ -206,7 +211,7 @@ async function fetchIremboActivityData(forceRefresh = false) {
 }
 
 function getIremboActivitySummary(agents, fetchedAt, stale) {
-  const byStatus = Object.fromEntries(ACTIVITY_LEVELS.map(({ name }) => [name, 0]));
+  const byStatus = Object.fromEntries(IREMBO_ACTIVITY_LEVELS.map(({ name }) => [name, 0]));
   const districts = new Map();
   const franchisees = new Map();
   let totalTransactions = 0;
@@ -269,7 +274,7 @@ function filterNetworkAgents(agents, query = {}) {
       return {
         ...agent,
         reportedDepositCount,
-        activityStatus: classifyMoolaActivity(reportedDepositCount),
+        activityStatus: agent.activityStatus,
         hasDeposited: reportedDepositCount > 0,
         totalDeposited: rows.reduce((sum, row) => sum + row.totalDeposited, 0),
         depositActivity: [...byBank.values()],
@@ -401,12 +406,13 @@ async function filterMoolaAgentsByAreaIds(agents, query = {}) {
   });
 }
 
-function classifyMoolaActivity(depositCount) {
+function classifyMoolaActivity(depositCount, lastTransactionDate, today = kigaliDateKey()) {
   const count = numberOrZero(depositCount);
-  if (count >= 80) return 'Active';
-  if (count >= 30) return 'Transacting';
-  if (count >= 1) return 'Dormant';
-  return 'Inactive';
+  if (count <= 0) return 'Inactive';
+  const lastDate = String(lastTransactionDate || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(lastDate)) return 'Dormant';
+  const cutoff = kigaliDateKey(shiftKigaliMonths(new Date(), -3));
+  return lastDate >= cutoff && lastDate <= today ? 'Active' : 'Dormant';
 }
 
 async function getDdinRows(url, headers) {
@@ -442,8 +448,9 @@ async function fetchDdinAgentData(forceRefresh = false) {
         const current = depositsByLogin.get(key) || { depositCount: 0, totalDeposited: 0, activity: new Map(), datedActivity: [] };
         const depositCount = numberOrZero(deposit?.countDeposit);
         const totalAmount = numberOrZero(deposit?.totalAmount);
-        const rawDate = deposit?.transactionDate || deposit?.depositDate || deposit?.date || deposit?.createdAt || deposit?.reportDate;
-        const date = rawDate && !Number.isNaN(new Date(rawDate).getTime()) ? new Date(rawDate).toISOString().slice(0, 10) : null;
+        const rawDate = deposit?.transactionDate || deposit?.depositDate || deposit?.date || deposit?.createdAt;
+        const parsedDate = rawDate ? new Date(rawDate) : null;
+        const date = parsedDate && !Number.isNaN(parsedDate.getTime()) ? kigaliDateKey(parsedDate) : null;
         current.depositCount += depositCount;
         current.totalDeposited += totalAmount;
         const bankUsed = String(deposit?.bankUsed || 'Other').trim() || 'Other';
@@ -451,7 +458,7 @@ async function fetchDdinAgentData(forceRefresh = false) {
         bankRow.depositCount += depositCount;
         bankRow.totalDeposited += totalAmount;
         current.activity.set(bankUsed, bankRow);
-        if (date) current.datedActivity.push({ date, bankUsed, depositCount, totalDeposited: totalAmount });
+        if (date && depositCount > 0) current.datedActivity.push({ date, bankUsed, depositCount, totalDeposited: totalAmount });
         depositsByLogin.set(key, current);
       }
 
@@ -459,6 +466,7 @@ async function fetchDdinAgentData(forceRefresh = false) {
         const loginName = String(row?.loginName || '').trim();
         const deposit = depositsByLogin.get(loginName.toLocaleLowerCase()) || { depositCount: 0, totalDeposited: 0, activity: new Map(), datedActivity: [] };
         const depositCount = Math.max(0, Math.trunc(deposit.depositCount));
+        const lastTransactionDate = deposit.datedActivity.reduce((latest, item) => item.date > latest ? item.date : latest, '');
         return {
           id: String(row?.id ?? loginName),
           loginName,
@@ -475,7 +483,8 @@ async function fetchDdinAgentData(forceRefresh = false) {
           gender: String(row?.gender || ''),
           registrationDate: row?.registrationDate || null,
           reportedDepositCount: depositCount,
-          activityStatus: classifyMoolaActivity(depositCount),
+          lastTransactionDate: lastTransactionDate || null,
+          activityStatus: classifyMoolaActivity(depositCount, lastTransactionDate),
           hasDeposited: depositCount > 0,
           totalDeposited: deposit.totalDeposited,
           depositActivity: [...deposit.activity.values()],
@@ -609,7 +618,7 @@ async function withMoolaFieldLocations(agents, districtScope, hideOnHold = false
 }
 
 function getMoolaAnalytics(agents, fetchedAt, stale, canSeeMoney, balanceRows = []) {
-  const byStatus = Object.fromEntries(ACTIVITY_LEVELS.map(({ name }) => [name, 0]));
+  const byStatus = Object.fromEntries(MOOLA_ACTIVITY_LEVELS.map(({ name }) => [name, 0]));
   const districts = new Map();
   const categories = new Map();
   const registrationMonths = new Map();
@@ -645,7 +654,7 @@ function getMoolaAnalytics(agents, fetchedAt, stale, canSeeMoney, balanceRows = 
   return {
     totalAgents: agents.length,
     byStatus,
-    activityLevels: ACTIVITY_LEVELS,
+    activityLevels: MOOLA_ACTIVITY_LEVELS,
     reportedDepositCount,
     depositingAgents: depositors,
     agentsWithoutDeposits: Math.max(0, agents.length - depositors),

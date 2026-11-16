@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowRightLeft, Send } from 'lucide-react';
 import api from '../api';
 
@@ -6,6 +6,7 @@ const assignedIds = (assignments = []) => assignments.map((item) => typeof item 
 
 export default function AgentActions({ agent, assignedTerritories = [], onAgentChange }) {
   const [territories, setTerritories] = useState([]);
+  const [territoriesLoading, setTerritoriesLoading] = useState(false);
   const [transferTargets, setTransferTargets] = useState([]);
   const [transferOpen, setTransferOpen] = useState(false);
   const [loadedTransferTargets, setLoadedTransferTargets] = useState(false);
@@ -29,13 +30,19 @@ export default function AgentActions({ agent, assignedTerritories = [], onAgentC
   const villages = useMemo(() => territories.filter((item) => item.type === 'VILLAGE' && item.isActive && item.parentId === cellId), [territories, cellId]);
   const activeTransfer = agent.transfers?.find((item) => item.status === 'PENDING');
 
-  const loadTerritories = async () => {
+  const loadTerritories = useCallback(async () => {
     if (territories.length) return;
+    setTerritoriesLoading(true);
     try {
       const { data } = await api.get('/api/v1/territories');
       setTerritories(data || []);
     } catch (err) { setError(err.response?.data?.error || 'Could not load your assigned areas.'); }
-  };
+    finally { setTerritoriesLoading(false); }
+  }, [territories.length]);
+
+  useEffect(() => {
+    if (agent.firstVisitLocationCapturedAt && !agent.tcRelocationUsed && !relocation && !activeTransfer) void loadTerritories();
+  }, [activeTransfer, agent.firstVisitLocationCapturedAt, agent.tcRelocationUsed, loadTerritories, relocation]);
 
   const requestRelocation = async (event) => {
     event.preventDefault(); setError(''); setNotice('');
@@ -83,6 +90,7 @@ export default function AgentActions({ agent, assignedTerritories = [], onAgentC
     {relocation ? <div className="agent-request-status" role="status"><strong>Relocation awaiting admin review</strong><span>Requested {new Date(relocation.requestedAt).toLocaleDateString()} · the current area remains active until approval; capture new GPS during the next visit after approval.</span></div> : activeTransfer ? null : agent.firstVisitLocationCapturedAt && !agent.tcRelocationUsed ? <form className="agent-relocation-form" onSubmit={requestRelocation}>
       <h4>Request a move inside your assigned areas</h4>
       <p>An administrator must approve this change. The TC will capture the new GPS during the agent’s next visit after approval.</p>
+      {territoriesLoading && <p className="agent-request-status" role="status">Loading your assigned territories…</p>}
       <div className="agent-relocation-grid">
         <label>District<select value={territoryId} onChange={(event) => { setTerritoryId(event.target.value); setSectorId(''); setCellId(''); setVillageId(''); void loadTerritories(); }} onFocus={() => void loadTerritories()} required><option value="">Choose district</option>{districts.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
         <label>Sector<select value={sectorId} onChange={(event) => { setSectorId(event.target.value); setCellId(''); setVillageId(''); }} onFocus={() => void loadTerritories()} required><option value="">Choose sector</option>{sectors.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>

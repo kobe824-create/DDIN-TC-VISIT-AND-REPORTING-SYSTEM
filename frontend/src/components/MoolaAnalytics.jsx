@@ -2,9 +2,8 @@ import React from 'react';
 import { Activity, Banknote, UsersRound } from 'lucide-react';
 
 const statusOrder = [
-  { key: 'Active', range: '80+ reported transactions' },
-  { key: 'Transacting', range: '30–79 reported transactions' },
-  { key: 'Dormant', range: '1–29 reported transactions' },
+  { key: 'Active', range: 'Transaction in the last 3 months' },
+  { key: 'Dormant', range: 'Past transaction, none in 3 months' },
   { key: 'Inactive', range: 'No reported transactions' },
 ];
 const number = (value) => Number(value || 0).toLocaleString();
@@ -30,6 +29,6 @@ export default function MoolaAnalytics({ summary, selectedStatus = '', onStatusS
         <span>{key}</span><strong>{number(byStatus[key])}</strong><small>{range}</small>
       </button>)}
     </section>
-    <p className="moola-data-note">Activity is based on DDIN’s reported manual deposit count. Where the report includes deposit dates, the selected range recalculates each agent’s activity; otherwise the range uses the registration date.</p>
+    <p className="moola-data-note">Active means at least one transaction in the last 3 months. Dormant means the agent has transacted before but not during that period. Inactive means no transactions are reported. Agents without a transaction date are shown as Dormant until recent activity can be confirmed.</p>
   </div>;
 }

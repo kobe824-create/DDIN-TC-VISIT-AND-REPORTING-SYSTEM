@@ -9,10 +9,9 @@ import AdminAgentMoves from '../components/AdminAgentMoves';
 import { useAuth } from '../AuthContext';
 
 const activityStatuses = [
-  { name: 'Active', range: '80+ transactions' },
-  { name: 'Transacting', range: '30–79 transactions' },
-  { name: 'Dormant', range: '1–29 transactions' },
-  { name: 'Inactive', range: '0 transactions' },
+  { name: 'Active', range: 'Transaction in the last 3 months' },
+  { name: 'Dormant', range: 'Transaction older than 3 months' },
+  { name: 'Inactive', range: 'No transactions reported' },
 ];
 const formatDate = (value) => value ? new Intl.DateTimeFormat('en-GB', { dateStyle: 'medium' }).format(new Date(value)) : '—';
 
@@ -108,7 +107,7 @@ export default function MoolaPlusAgentList() {
         </tr>)}</tbody></table></div>
         <div className="agent-pagination"><span className="agent-pagination-range">Showing {firstResult.toLocaleString()}–{lastResult.toLocaleString()} of {total.toLocaleString()}</span><div className="agent-pagination-controls" aria-label="Agent list pages"><span>Page {page} of {Math.max(pages, 1).toLocaleString()}</span><button className="agent-page-button" type="button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1} aria-label="Previous page"><ChevronLeft size={17} /></button><button className="agent-page-button" type="button" onClick={() => setPage((current) => Math.min(pages, current + 1))} disabled={pages === 0 || page >= pages} aria-label="Next page"><ChevronRight size={17} /></button></div></div>
       </> : <EmptyState icon={Activity} title="No Moola Plus agents found" message={search || status || Object.values(territoryFilters).some(Boolean) ? 'Try changing your filters.' : 'No agents are available in your authorized coverage.'} />}
-      <div className="card-footnote"><Activity size={14} /><span>Status bands use the DDIN dashboard thresholds on the reported manual deposit count; the upstream API does not expose monthly transaction totals.</span></div>
+      <div className="card-footnote"><Activity size={14} /><span>Active means a transaction in the last 3 months; Dormant means a past transaction with none in that period; Inactive means no transactions reported. When the DDIN feed has no transaction date, an agent with deposits is shown as Dormant until recent activity can be confirmed.</span></div>
     </section>}
   </div>;
 }

@@ -762,7 +762,7 @@ router.post('/check-in', authenticateToken, requireTerritoryAccess, requireRole(
     }
     const sector = agent.sector;
     if (!sector || sector.type !== 'SECTOR' || sector.parentId !== agent.territoryId || (!agent.firstVisitCompletedAt && !sector.isActive)) return res.status(400).json({ error: 'The agent must be assigned to an active sector in their district before a first visit can start.' });
-    if (!agent.firstVisitCompletedAt) {
+    if (!agent.firstVisitCompletedAt || !agent.firstVisitLocationCapturedAt) {
       if (!String(agent.venue || '').trim()) return res.status(400).json({ error: 'Record the agent’s venue during the first visit before checking in.' });
       const cell = agent.cell;
       const village = agent.village;
@@ -1050,7 +1050,7 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
       const hasGps = validCoordinates(tcLatitude, tcLongitude, accuracy);
       if (!hasGps) return res.status(400).json({ error: 'An offline visit needs a fresh GPS reading.' });
       if (accuracy > 50) return res.status(422).json({ error: 'GPS accuracy must be 50 metres or better before an offline visit can sync.' });
-      const needsLocationCapture = Boolean(agent.registeredLatitude == null || agent.registeredLongitude == null || !agent.locationVerified || (!agent.firstVisitCompletedAt && !agent.firstVisitLocationCapturedAt));
+      const needsLocationCapture = Boolean(agent.registeredLatitude == null || agent.registeredLongitude == null || !agent.locationVerified || !agent.firstVisitLocationCapturedAt);
       let registeredLatitude = agent.registeredLatitude;
       let registeredLongitude = agent.registeredLongitude;
       let registeredAccuracy = agent.gpsAccuracy;
@@ -1106,7 +1106,7 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
         ]);
         if (!cell || cell.type !== 'CELL' || !cell.isActive || cell.parentId !== sectorId || !village || village.type !== 'VILLAGE' || !village.isActive || village.parentId !== cellId) return res.status(400).json({ error: 'The agent must have a valid active cell and village for their first visit.' });
       }
-      if (!agent.firstVisitCompletedAt && !needsLocationCapture && !agent.firstVisitLocationCapturedAt) return res.status(400).json({ error: 'The first-visit GPS capture is missing. Refresh the agent record before syncing.' });
+      if (!agent.firstVisitLocationCapturedAt && !needsLocationCapture) return res.status(400).json({ error: 'The first-visit GPS capture is missing. Refresh the agent record before syncing.' });
       const distanceMeters = hasGps ? calculateDistance(tcLatitude, tcLongitude, registeredLatitude, registeredLongitude) : null;
       if (distanceMeters == null || distanceMeters > radiusMeters) return res.status(403).json({ error: `You are ${Math.round(distanceMeters || 0)} metres from the agent’s saved location. Sync is allowed only within the configured ${radiusMeters} metre radius.` });
       const visitDate = new Date(item.visitDate || item.checkInTime || Date.now());
@@ -1159,7 +1159,7 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
               longitude: registeredLongitude,
               accuracy: registeredAccuracy,
               recordedById: req.user.id,
-              reason: transfer?.acceptedAt ? 'OFFLINE_TRANSFER_LOCATION_CAPTURE' : agent.firstVisitCompletedAt || agent.firstVisitLocationCapturedAt ? 'OFFLINE_RELOCATION_LOCATION_CAPTURE' : 'OFFLINE_FIRST_VISIT_CAPTURE',
+              reason: transfer?.acceptedAt ? 'OFFLINE_TRANSFER_LOCATION_CAPTURE' : agent.firstVisitLocationCapturedAt ? 'OFFLINE_RELOCATION_LOCATION_CAPTURE' : 'OFFLINE_FIRST_VISIT_CAPTURE',
             } });
             if (transfer?.acceptedAt) await tx.agentTransfer.update({ where: { id: transfer.id }, data: { status: 'COMPLETED', completedAt: checkInTime } });
           }

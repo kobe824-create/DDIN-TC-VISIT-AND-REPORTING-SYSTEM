@@ -599,7 +599,7 @@ export default function VisitWorkflow() {
       setError('The receiving TC must accept this transfer from the dashboard before recording the new location.');
       return;
     }
-    const needsLocationCapture = Boolean(selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || !selectedAgent.locationVerified || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt));
+    const needsLocationCapture = Boolean(selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || !selectedAgent.locationVerified || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt) || (!isMoolaPlus && !selectedAgent.firstVisitLocationCapturedAt));
     const transferNeedsLocationCapture = Boolean(incomingTransfer?.acceptedAt && needsLocationCapture);
     const locationAssignment = {
       territoryId: firstVisitFields.territoryId || selectedAgent.territoryId,
@@ -730,7 +730,7 @@ export default function VisitWorkflow() {
       const startLocally = async () => {
         if (!knownLocation || knownLocation.latitude == null || knownLocation.longitude == null) throw new Error('Capture the agent’s GPS location before starting this visit.');
         if (!selectedAgent.firstVisitCompletedAt && !String(selectedAgent.venue || '').trim()) throw new Error('Record the agent’s venue before starting the first visit.');
-        if (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.pendingLocation) throw new Error('Complete the first-visit district, sector, cell, village and GPS capture before starting this visit.');
+        if (!selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.pendingLocation) throw new Error('Complete the first-visit district, sector, cell, village and GPS capture before starting this visit.');
         if (!selectedAgent.locationVerified && !selectedAgent.pendingLocation) throw new Error('This agent’s GPS location is not verified yet. Connect and refresh the agent package before starting an offline visit.');
         const id = stableId;
         setClientVisitId(id);
@@ -1058,9 +1058,9 @@ export default function VisitWorkflow() {
 
   const activeIncomingTransfer = selectedAgent?.transfers?.find((transfer) => transfer.status === 'PENDING');
   const waitingForTransferReview = Boolean(activeIncomingTransfer && !activeIncomingTransfer.acceptedAt);
-  const needsLocationCapture = Boolean(selectedAgent && (selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || !selectedAgent.locationVerified || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt)));
+  const needsLocationCapture = Boolean(selectedAgent && (selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || !selectedAgent.locationVerified || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt) || (!isMoolaPlus && !selectedAgent.firstVisitLocationCapturedAt)));
   const transferNeedsLocationCapture = Boolean(activeIncomingTransfer?.acceptedAt && needsLocationCapture);
-  const showLocationCapture = Boolean(selectedAgent && !isMoolaPlus && (!selectedAgent.firstVisitCompletedAt || needsLocationCapture));
+  const showLocationCapture = Boolean(selectedAgent && !isMoolaPlus && (!selectedAgent.firstVisitLocationCapturedAt || needsLocationCapture));
   const showMoolaLocationCapture = Boolean(isMoolaPlus && selectedAgent && (
     !selectedAgent.locationVerified || selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null
     || !firstVisitFields.sectorId || !firstVisitFields.cellId || !firstVisitFields.villageId || !firstVisitFields.venue.trim()
@@ -1306,6 +1306,7 @@ export default function VisitWorkflow() {
               </button></> : <button onClick={captureAgentLocation} disabled={locationCaptureLoading || !locationSector || !firstVisitFields.cellId || !firstVisitFields.villageId || !firstVisitFields.venue.trim()} className="btn btn-primary mt-4 w-full justify-center disabled:opacity-50" type="button">
                 <MapPin size={17} />{locationCaptureLoading ? 'Capturing precise location…' : transferNeedsLocationCapture ? 'Capture new transfer location' : relocationNeedsLocationCapture ? 'Capture relocated location' : 'Capture first-visit location'}
               </button>}
+              {!selectedAgent.firstVisitLocationCapturedAt && <p className="first-visit-area-hint mt-2" role="status">Capture activates after you choose a district, sector, cell, village, and venue. Check-in becomes available after the agent’s location is saved.</p>}
               {!selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.transfers?.some((transfer) => transfer.status === 'PENDING') && !selectedAgent.transferRequest && <div className="mt-4 border-t border-[#e5e8ef] pt-3">
                 <button type="button" className="text-sm font-semibold text-[#202a4e] underline" onClick={openTransferPanel}>The agent moved to another district?</button>
                 {transferPanelOpen && <div className="mt-3 space-y-3 rounded-lg border border-amber-200 bg-white p-3">
@@ -1360,7 +1361,7 @@ export default function VisitWorkflow() {
 
             <button
               onClick={() => handleCheckIn()}
-              disabled={checkInLoading || waitingForTransferReview || Boolean(isMoolaPlus && selectedAgent.moolaPendingRelocation) || gpsStatus === 'success' || (isMoolaPlus ? !(firstVisitFields.territoryId || workTerritoryId) || !moolaLocationReady : selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || (!selectedAgent.locationVerified && !selectedAgent.pendingLocation) || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.pendingLocation))}
+              disabled={checkInLoading || waitingForTransferReview || Boolean(isMoolaPlus && selectedAgent.moolaPendingRelocation) || gpsStatus === 'success' || (isMoolaPlus ? !(firstVisitFields.territoryId || workTerritoryId) || !moolaLocationReady : selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || (!selectedAgent.locationVerified && !selectedAgent.pendingLocation) || (!selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.pendingLocation))}
               className="btn btn-primary w-full justify-center py-4 text-base disabled:opacity-50"
             >
               <MapPin className="w-6 h-6 mr-2" />

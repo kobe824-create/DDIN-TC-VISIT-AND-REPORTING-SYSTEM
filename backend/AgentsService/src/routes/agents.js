@@ -12,13 +12,97 @@ const { coverageState, kigaliDateKey, latestQualifiedVisits } = require('../../.
 const queryIds = (value) => (Array.isArray(value) ? value : value ? [value] : []).map(String).filter(Boolean);
 const isDatabaseSchemaError = (error) => ['P2021', 'P2022'].includes(error?.code);
 const databaseMigrationMessage = 'The database is missing an application update. Apply the pending Prisma migrations and restart the services.';
+const WHATSAPP_AREA_TYPES = ['DISTRICT', 'SECTOR', 'CELL', 'VILLAGE'];
+const WHATSAPP_AREA_FIELDS = { DISTRICT: 'territoryId', SECTOR: 'sectorId', CELL: 'cellId', VILLAGE: 'villageId' };
+const WHATSAPP_AREA_LABELS = { DISTRICT: 'district', SECTOR: 'sector', CELL: 'cell', VILLAGE: 'village' };
 const sectorWhatsAppGroupKey = (sectorId) => `SECTOR_WHATSAPP_GROUP:${sectorId}`;
 const sectorWhatsAppInviteKey = (sectorId) => `SECTOR_WHATSAPP_INVITE:${sectorId}`;
 const sectorWhatsAppDeliveryKey = (sectorId) => `SECTOR_WHATSAPP_INVITE_DELIVERY:${sectorId}`;
 const moolaGroupId = (district, sector) => crypto.createHash('sha256').update(`${String(district || '').trim().toLocaleLowerCase()}\u0000${String(sector || '').trim().toLocaleLowerCase()}`).digest('hex').slice(0, 24);
+const moolaAreaGroupId = (area) => area.type === 'SECTOR'
+  ? moolaGroupId(area.districtName, area.name)
+  : crypto.createHash('sha256').update(`${area.type}\u0000${area.id}`).digest('hex').slice(0, 24);
 const moolaWhatsAppGroupKey = (groupId) => `MOOLA_PLUS_WHATSAPP_GROUP:${groupId}`;
 const moolaWhatsAppInviteKey = (groupId) => `MOOLA_PLUS_WHATSAPP_INVITE:${groupId}`;
 const moolaWhatsAppDeliveryKey = (groupId) => `MOOLA_PLUS_WHATSAPP_INVITE_DELIVERY:${groupId}`;
+
+function normalizeAreaName(value) { return String(value || '').trim().toLocaleLowerCase().replace(/\s+/g, ' '); }
+function requestedWhatsAppAreaType(req) {
+  const type = String(req.query.type || 'SECTOR').trim().toUpperCase();
+  return WHATSAPP_AREA_TYPES.includes(type) ? type : null;
+}
+function areaLabel(type) { return WHATSAPP_AREA_LABELS[type] || 'area'; }
+function iremboWhatsAppKeys(type, id) {
+  if (type === 'SECTOR') return {
+    group: sectorWhatsAppGroupKey(id), invite: sectorWhatsAppInviteKey(id), delivery: sectorWhatsAppDeliveryKey(id),
+  };
+  return {
+    group: `TERRITORY_WHATSAPP_GROUP:${type}:${id}`,
+    invite: `TERRITORY_WHATSAPP_INVITE:${type}:${id}`,
+    delivery: `TERRITORY_WHATSAPP_INVITE_DELIVERY:${type}:${id}`,
+  };
+}
+
+async function getTcTerritoryHierarchy(assignedDistrictIds = []) {
+  const districtIds = [...new Set(assignedDistrictIds.map(String).filter(Boolean))];
+  if (!districtIds.length) return [];
+  const districts = await prisma.territory.findMany({
+    where: { id: { in: districtIds }, type: 'DISTRICT', isActive: true },
+    select: { id: true, name: true, type: true, parentId: true },
+    orderBy: { name: 'asc' },
+  });
+  const activeDistrictIds = districts.map(({ id }) => id);
+  if (!activeDistrictIds.length) return [];
+  const sectors = await prisma.territory.findMany({
+    where: { type: 'SECTOR', isActive: true, parentId: { in: activeDistrictIds } },
+    select: { id: true, name: true, type: true, parentId: true },
+    orderBy: { name: 'asc' },
+  });
+  const sectorIds = sectors.map(({ id }) => id);
+  const cells = sectorIds.length ? await prisma.territory.findMany({
+    where: { type: 'CELL', isActive: true, parentId: { in: sectorIds } },
+    select: { id: true, name: true, type: true, parentId: true },
+    orderBy: { name: 'asc' },
+  }) : [];
+  const cellIds = cells.map(({ id }) => id);
+  const villages = cellIds.length ? await prisma.territory.findMany({
+    where: { type: 'VILLAGE', isActive: true, parentId: { in: cellIds } },
+    select: { id: true, name: true, type: true, parentId: true },
+    orderBy: { name: 'asc' },
+  }) : [];
+  const rows = [...districts, ...sectors, ...cells, ...villages];
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return rows.map((area) => {
+    const parent = byId.get(area.parentId);
+    const district = area.type === 'DISTRICT' ? area : area.type === 'SECTOR' ? parent : area.type === 'CELL' ? byId.get(parent?.parentId) : byId.get(byId.get(parent?.parentId)?.parentId);
+    const path = [];
+    let current = area;
+    while (current) { path.unshift(current); current = byId.get(current.parentId); }
+    return { ...area, districtId: district?.id || '', districtName: district?.name || '', parentName: parent?.name || '', path };
+  });
+}
+
+function areaForMoolaAgent(agent, rows) {
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const children = new Map();
+  for (const row of rows) children.set(`${row.type}:${row.parentId || ''}:${normalizeAreaName(row.name)}`, row);
+  const findChild = (type, parentId, name) => children.get(`${type}:${parentId || ''}:${normalizeAreaName(name)}`) || null;
+  const location = agent.fieldLocation || {};
+  const district = byId.get(location.territoryId)?.type === 'DISTRICT'
+    ? byId.get(location.territoryId)
+    : rows.find((row) => row.type === 'DISTRICT' && normalizeAreaName(row.name) === normalizeAreaName(location.territory?.name || location.district || agent.district));
+  if (!district) return null;
+  const sector = byId.get(location.sectorId)?.parentId === district.id
+    ? byId.get(location.sectorId)
+    : findChild('SECTOR', district.id, location.sectorName || location.sector || agent.sector);
+  const cell = byId.get(location.cellId)?.parentId === sector?.id
+    ? byId.get(location.cellId)
+    : sector && findChild('CELL', sector.id, location.cellName || location.cell || agent.cell);
+  const village = byId.get(location.villageId)?.parentId === cell?.id
+    ? byId.get(location.villageId)
+    : cell && findChild('VILLAGE', cell.id, location.villageName || location.village || agent.village);
+  return { DISTRICT: district, SECTOR: sector, CELL: cell, VILLAGE: village };
+}
 
 function normalizeWhatsAppNumber(value) {
   let digits = String(value || '').trim().split('@')[0].replace(/\D/g, '');
@@ -294,6 +378,8 @@ async function saveSectorWhatsAppGroup(client, sector, groupData, userId) {
 }
 
 async function getMoolaPlusGroups(req) {
+  const areaType = requestedWhatsAppAreaType(req);
+  if (!areaType) throw Object.assign(new Error('Choose district, sector, cell, or village.'), { statusCode: 400 });
   const base = String(process.env.REPORTS_SERVICE_URL || 'http://reports-service:3004').replace(/\/$/, '');
   const agents = [];
   let pages = 1;
@@ -313,12 +399,22 @@ async function getMoolaPlusGroups(req) {
     pages = Math.max(1, Number(payload.pages) || 1);
   }
 
+  const hierarchy = await getTcTerritoryHierarchy(req.user.assignedTerritories || []);
   const groups = new Map();
+  for (const area of hierarchy.filter((item) => item.type === areaType)) {
+    const id = moolaAreaGroupId(area);
+    groups.set(id, {
+      id, territoryId: area.id, type: area.type, name: area.name,
+      districtId: area.districtId, districtName: area.districtName,
+      parentName: area.parentName, path: area.path.map(({ name }) => name).join(' · '), agents: [],
+    });
+  }
   for (const agent of agents) {
-    const districtName = String(agent.fieldLocation?.district || agent.district || '').trim() || 'Unassigned district';
-    const sectorName = String(agent.fieldLocation?.sector || agent.sector || '').trim() || 'Unspecified sector';
-    const id = moolaGroupId(districtName, sectorName);
-    const group = groups.get(id) || { id, name: sectorName, districtName, agents: [] };
+    const area = areaForMoolaAgent(agent, hierarchy)[areaType];
+    if (!area) continue;
+    const id = moolaAreaGroupId(area);
+    const group = groups.get(id);
+    if (!group) continue;
     group.agents.push({
       id: String(agent.id),
       agentId: String(agent.loginName || agent.id),
@@ -328,7 +424,7 @@ async function getMoolaPlusGroups(req) {
     groups.set(id, group);
   }
 
-  const result = [...groups.values()].sort((a, b) => a.districtName.localeCompare(b.districtName) || a.name.localeCompare(b.name));
+  const result = [...groups.values()].sort((a, b) => a.path.localeCompare(b.path));
   const keys = result.flatMap(({ id }) => [moolaWhatsAppGroupKey(id), moolaWhatsAppInviteKey(id), moolaWhatsAppDeliveryKey(id)]);
   const configs = keys.length ? await prisma.systemConfig.findMany({ where: { key: { in: keys } }, select: { key: true, value: true } }) : [];
   const configByKey = new Map(configs.map((row) => [row.key, row.value]));
@@ -341,6 +437,7 @@ async function getMoolaPlusGroups(req) {
       group: stored ? {
         status: stored.status || 'active',
         groupName: stored.groupName || `DDIN ${group.name}`,
+        groupId: stored.groupId || null,
         createdAt: stored.createdAt || null,
         attemptedCount: Number.isInteger(stored.attemptedCount) ? stored.attemptedCount : (stored.attemptedAgentIds || []).length,
         addedCount: Number.isInteger(stored.addedCount) ? stored.addedCount : (stored.addedAgentIds || []).length,
@@ -349,6 +446,190 @@ async function getMoolaPlusGroups(req) {
       providerAvailable: whatsAppProviderReady(),
     };
   });
+}
+
+async function getIremboWhatsAppGroups(req, areaType) {
+  const hierarchy = await getTcTerritoryHierarchy(req.user.assignedTerritories || []);
+  const areas = hierarchy.filter((area) => area.type === areaType);
+  if (!areas.length) return [];
+  const field = WHATSAPP_AREA_FIELDS[areaType];
+  const keysByArea = new Map(areas.map((area) => [area.id, iremboWhatsAppKeys(areaType, area.id)]));
+  const [agents, configs] = await Promise.all([
+    prisma.agent.findMany({
+      where: { [field]: { in: areas.map(({ id }) => id) }, status: 'ACTIVE', isOnHold: false },
+      select: { id: true, agentId: true, name: true, phoneNumber: true, [field]: true },
+      orderBy: [{ name: 'asc' }, { id: 'asc' }],
+    }),
+    prisma.systemConfig.findMany({
+      where: { key: { in: [...keysByArea.values()].flatMap(({ group, invite, delivery }) => [group, invite, delivery]) } },
+      select: { key: true, value: true },
+    }),
+  ]);
+  const configByKey = new Map(configs.map(({ key, value }) => [key, value]));
+  return areas.map((area) => {
+    const keys = keysByArea.get(area.id);
+    const areaAgents = agents.filter((agent) => agent[field] === area.id);
+    const group = parseSystemConfigJson(configByKey.get(keys.group));
+    return {
+      id: area.id, territoryId: area.id, type: areaType, name: area.name,
+      districtId: area.districtId, districtName: area.districtName,
+      parentName: area.parentName, path: area.path.map(({ name }) => name).join(' · '),
+      inviteUrl: group?.inviteUrl || configByKey.get(keys.invite) || '',
+      inviteDelivery: inviteDeliveryResponse(parseSystemConfigJson(configByKey.get(keys.delivery)), areaAgents),
+      group: group ? {
+        status: group.status || 'active', groupName: group.groupName || `DDIN ${area.name}`,
+        groupId: group.groupId || null, createdAt: group.createdAt || null,
+        attemptedCount: Number.isInteger(group.attemptedCount) ? group.attemptedCount : (group.attemptedAgentIds || []).length,
+        addedCount: Number.isInteger(group.addedCount) ? group.addedCount : (group.addedAgentIds || []).length,
+        failedCount: Number.isInteger(group.failedCount) ? group.failedCount : (group.failedAgentIds || []).length,
+      } : null,
+      agents: areaAgents,
+      providerAvailable: whatsAppProviderReady(),
+    };
+  });
+}
+
+async function saveAreaWhatsAppGroup(client, key, description, value, userId) {
+  await client.systemConfig.upsert({
+    where: { key },
+    create: { key, value: JSON.stringify(value), description, updatedById: userId },
+    update: { value: JSON.stringify(value), description, updatedById: userId },
+  });
+}
+
+async function createOrUpdateAreaWhatsAppGroup({ req, group, network }) {
+  const prefix = network === 'MOOLA_PLUS' ? 'Moola Plus' : 'Irembo';
+  const description = `${prefix} ${areaLabel(group.type)} group for ${group.path || group.name}`;
+  const lockId = `${network}:${group.id}`;
+  const groupKey = group.keys.group;
+  const inviteKey = group.keys.invite;
+  const byNumber = new Map();
+  let missingPhoneCount = 0;
+  let invalidPhoneCount = 0;
+  for (const agent of group.agents) {
+    if (!String(agent.phoneNumber || '').trim()) { missingPhoneCount += 1; continue; }
+    const number = normalizeWhatsAppNumber(agent.phoneNumber);
+    if (!number) { invalidPhoneCount += 1; continue; }
+    if (!byNumber.has(number)) byNumber.set(number, []);
+    byNumber.get(number).push(String(agent.id));
+  }
+  if (!byNumber.size) {
+    const error = new Error(`No ${prefix} agents in this ${areaLabel(group.type)} have a valid phone number.`);
+    error.statusCode = 400; error.missingPhoneCount = missingPhoneCount; error.invalidPhoneCount = invalidPhoneCount;
+    throw error;
+  }
+  if (byNumber.size > 1023) {
+    const error = new Error(`This ${areaLabel(group.type)} has more numbers than one WhatsApp group can hold. Split the group or use its manual invite link.`);
+    error.statusCode = 400; throw error;
+  }
+
+  const reserved = await prisma.$transaction(async (tx) => {
+    await advisoryTransactionLock(tx, lockId, 'WHATSAPP_AREA_GROUP');
+    const [storedRow, invite] = await Promise.all([
+      tx.systemConfig.findUnique({ where: { key: groupKey }, select: { value: true } }),
+      tx.systemConfig.findUnique({ where: { key: inviteKey }, select: { value: true } }),
+    ]);
+    const stored = parseSystemConfigJson(storedRow?.value);
+    if (stored) return { group: stored, created: false };
+    if (invite?.value) {
+      const error = new Error('A manual WhatsApp invite link is already saved. Remove it before creating a provider-managed group.');
+      error.statusCode = 409; throw error;
+    }
+    const pending = {
+      provider: 'whapi', status: 'creating', requestId: crypto.randomUUID(),
+      groupName: `DDIN ${group.name} ${group.parentName || group.districtName}`.trim().slice(0, 25),
+      createdAt: new Date().toISOString(), createdById: req.user.id,
+      attemptedAgentIds: [], addedAgentIds: [], failedAgentIds: [],
+      attemptedCount: 0, addedCount: 0, failedCount: 0,
+    };
+    await saveAreaWhatsAppGroup(tx, groupKey, description, pending, req.user.id);
+    return { group: pending, created: true };
+  }, { timeout: 10000 });
+
+  if (reserved.group.status === 'creating' && !reserved.created) {
+    const error = new Error('A previous group creation may still be in progress. Check the WhatsApp provider before trying again.');
+    error.statusCode = 409; throw error;
+  }
+  if (reserved.group.status === 'needs_review') {
+    const error = new Error('An administrator must review the WhatsApp provider account before this group can be changed.');
+    error.statusCode = 409; throw error;
+  }
+
+  if (reserved.created) {
+    let providerGroup;
+    try {
+      providerGroup = await whapiRequest('/groups', { method: 'POST', body: { subject: reserved.group.groupName, participants: [...byNumber.keys()] } });
+    } catch (error) {
+      if (error.ambiguous) await saveAreaWhatsAppGroup(prisma, groupKey, description, { ...reserved.group, status: 'needs_review' }, req.user.id);
+      else await prisma.systemConfig.deleteMany({ where: { key: groupKey } });
+      throw error;
+    }
+    const providerGroupId = extractWhapiGroupId(providerGroup);
+    if (!providerGroupId) {
+      await saveAreaWhatsAppGroup(prisma, groupKey, description, { ...reserved.group, status: 'needs_review' }, req.user.id);
+      const error = new Error('The provider did not return a usable group ID. Ask an administrator to review the provider account.');
+      error.statusCode = 502; throw error;
+    }
+    const requested = new Set(byNumber.keys());
+    const { addedNumbers, failedNumbers } = getProviderParticipantResult(providerGroup, requested);
+    let inviteUrl = '';
+    try { inviteUrl = await getWhapiInviteUrl(providerGroupId); } catch (error) { console.error('WhatsApp invite lookup failed:', error.statusCode || error.name); }
+    const activeGroup = {
+      ...reserved.group, status: 'active', groupId: providerGroupId, inviteUrl,
+      attemptedAgentIds: [...new Set([...requested].flatMap((number) => byNumber.get(number) || []))],
+      addedAgentIds: [...new Set([...addedNumbers].flatMap((number) => byNumber.get(number) || []))],
+      failedAgentIds: [...new Set([...failedNumbers].flatMap((number) => byNumber.get(number) || []))],
+      attemptedCount: requested.size, addedCount: addedNumbers.size, failedCount: failedNumbers.size,
+    };
+    await saveAreaWhatsAppGroup(prisma, groupKey, description, activeGroup, req.user.id);
+    await logAction(req.user.id, 'CREATE_AREA_WHATSAPP_GROUP', 'Territory', group.territoryId, {
+      network, areaType: group.type, areaName: group.name, consentConfirmed: true,
+      requestedCount: requested.size, addedCount: addedNumbers.size, failedCount: failedNumbers.size,
+      missingPhoneCount, invalidPhoneCount,
+    }, req);
+    return {
+      groupId: group.id, groupName: activeGroup.groupName, inviteUrl, created: true,
+      attemptedCount: requested.size, addedCount: addedNumbers.size, failedCount: failedNumbers.size,
+      missingPhoneCount, invalidPhoneCount,
+      message: inviteUrl ? 'WhatsApp group created.' : 'WhatsApp group created, but no invite link was returned. Ask an administrator to refresh it.',
+    };
+  }
+
+  const stored = reserved.group;
+  if (!stored.groupId || stored.status !== 'active') {
+    const error = new Error('This group is not ready for member updates. Ask an administrator to review its provider status.');
+    error.statusCode = 409; throw error;
+  }
+  const attempted = new Set(stored.attemptedAgentIds || []);
+  const newNumbers = [...byNumber.entries()].filter(([, ids]) => !ids.every((id) => attempted.has(id))).map(([number]) => number);
+  if (!newNumbers.length) return {
+    groupId: group.id, groupName: stored.groupName, inviteUrl: stored.inviteUrl || '', created: false,
+    attemptedCount: 0, addedCount: 0, failedCount: stored.failedCount || 0,
+    missingPhoneCount, invalidPhoneCount, message: 'All recorded agents have already been processed for this group.',
+  };
+  const requested = new Set(newNumbers);
+  const result = await whapiRequest(`/groups/${encodeURIComponent(stored.groupId)}/participants`, { method: 'POST', body: { participants: newNumbers } });
+  const { addedNumbers, failedNumbers } = getProviderParticipantResult(result, requested);
+  const updated = {
+    ...stored,
+    attemptedAgentIds: [...new Set([...attempted, ...newNumbers.flatMap((number) => byNumber.get(number) || [])])],
+    addedAgentIds: [...new Set([...(stored.addedAgentIds || []), ...[...addedNumbers].flatMap((number) => byNumber.get(number) || [])])],
+    failedAgentIds: [...new Set([...(stored.failedAgentIds || []), ...[...failedNumbers].flatMap((number) => byNumber.get(number) || [])])],
+    attemptedCount: (stored.attemptedCount || 0) + newNumbers.length,
+    addedCount: (stored.addedCount || 0) + addedNumbers.size,
+    failedCount: (stored.failedCount || 0) + failedNumbers.size,
+  };
+  await saveAreaWhatsAppGroup(prisma, groupKey, description, updated, req.user.id);
+  await logAction(req.user.id, 'ADD_AREA_WHATSAPP_GROUP_MEMBERS', 'Territory', group.territoryId, {
+    network, areaType: group.type, areaName: group.name, consentConfirmed: true,
+    requestedCount: newNumbers.length, addedCount: addedNumbers.size, failedCount: failedNumbers.size,
+    missingPhoneCount, invalidPhoneCount,
+  }, req);
+  return {
+    groupId: group.id, groupName: updated.groupName, inviteUrl: updated.inviteUrl || '', created: false,
+    attemptedCount: newNumbers.length, addedCount: addedNumbers.size, failedCount: failedNumbers.size,
+    missingPhoneCount, invalidPhoneCount, message: `New agents were processed for the ${areaLabel(group.type)} WhatsApp group.`,
+  };
 }
 
 async function saveMoolaWhatsAppGroup(client, group, groupData, userId) {
@@ -491,6 +772,99 @@ async function areaAddress({ villageId }, client = prisma) {
   const province = district?.parent;
   return [province?.name, district?.name, sector?.name, cell?.name, village?.name].filter(Boolean).join(', ');
 }
+
+async function resolveWhatsAppAreaGroup(req, network) {
+  const type = requestedWhatsAppAreaType(req);
+  if (!type) return { error: 'Choose district, sector, cell, or village.' };
+  const groups = network === 'MOOLA_PLUS' ? await getMoolaPlusGroups(req) : await getIremboWhatsAppGroups(req, type);
+  const group = groups.find((item) => item.id === String(req.params.areaId || ''));
+  if (!group) return { error: `This ${areaLabel(type)} is not in your assigned districts.` };
+  group.type = type;
+  group.territoryId ||= group.id;
+  group.keys = network === 'MOOLA_PLUS'
+    ? { group: moolaWhatsAppGroupKey(group.id), invite: moolaWhatsAppInviteKey(group.id), delivery: moolaWhatsAppDeliveryKey(group.id) }
+    : iremboWhatsAppKeys(type, group.id);
+  return { group };
+}
+
+async function saveAreaWhatsAppInvite(req, res, network) {
+  try {
+    const resolved = await resolveWhatsAppAreaGroup(req, network);
+    if (resolved.error) return res.status(req.query.type && !requestedWhatsAppAreaType(req) ? 400 : 404).json({ error: resolved.error });
+    const { group } = resolved;
+    const inviteUrl = String(req.body.inviteUrl || '').trim();
+    if (inviteUrl && whatsAppProviderReady() && req.body?.confirmInviteConsent !== true) return res.status(400).json({ error: 'Confirm that agents agreed to receive this WhatsApp invite and have their numbers checked by the WhatsApp provider.' });
+    let normalizedUrl = '';
+    if (inviteUrl) {
+      const url = new URL(inviteUrl);
+      if (url.protocol !== 'https:' || url.hostname !== 'chat.whatsapp.com' || !/^\/[A-Za-z0-9_-]+\/?$/.test(url.pathname)) return res.status(400).json({ error: 'Paste a valid WhatsApp group invite link from chat.whatsapp.com.' });
+      normalizedUrl = url.toString();
+    }
+    const description = `${network === 'MOOLA_PLUS' ? 'Moola Plus' : 'Irembo'} WhatsApp invite for ${group.path || group.name}`;
+    const saved = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, `${network}:${group.id}`, 'WHATSAPP_AREA_GROUP');
+      const managed = await tx.systemConfig.findUnique({ where: { key: group.keys.group }, select: { value: true } });
+      if (parseSystemConfigJson(managed?.value)?.groupId) { const error = new Error('This area already has a provider-managed WhatsApp group. Its invite link is managed by the group integration.'); error.statusCode = 409; throw error; }
+      if (!normalizedUrl) {
+        await tx.systemConfig.deleteMany({ where: { key: group.keys.invite } });
+        await tx.systemConfig.deleteMany({ where: { key: group.keys.delivery } });
+        return { inviteUrl: '', previousDelivery: null };
+      }
+      const prior = await tx.systemConfig.findUnique({ where: { key: group.keys.delivery }, select: { value: true } });
+      await tx.systemConfig.upsert({ where: { key: group.keys.invite }, create: { key: group.keys.invite, value: normalizedUrl, description, updatedById: req.user.id }, update: { value: normalizedUrl, description, updatedById: req.user.id } });
+      return { inviteUrl: normalizedUrl, previousDelivery: parseSystemConfigJson(prior?.value) };
+    }, { timeout: 10000 });
+    await logAction(req.user.id, saved.inviteUrl ? 'SAVE_AREA_WHATSAPP_INVITE' : 'REMOVE_AREA_WHATSAPP_INVITE', 'Territory', group.territoryId, { network, areaType: group.type, areaName: group.name }, req);
+    if (!saved.inviteUrl) return res.json({ groupId: group.id, inviteUrl: '', inviteDelivery: null });
+    const delivery = await sendSectorWhatsAppInvites({ agents: group.agents, inviteUrl: saved.inviteUrl, previousDelivery: saved.previousDelivery, deliveryKey: group.keys.delivery, description: group.path || group.name, userId: req.user.id });
+    return res.json({ groupId: group.id, inviteUrl: saved.inviteUrl, inviteDelivery: inviteDeliveryResponse(delivery, group.agents) });
+  } catch (error) {
+    if (error instanceof TypeError) return res.status(400).json({ error: 'Paste a valid WhatsApp group invite link.' });
+    if (error.statusCode === 409) return res.status(409).json({ error: error.message });
+    console.error('Save area WhatsApp invite failed:', error.statusCode || error.code || error.name);
+    return res.status(error.statusCode || 500).json({ error: error.message || 'Could not save this WhatsApp invite.' });
+  }
+}
+
+router.get('/whatsapp-area-groups', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  const areaType = requestedWhatsAppAreaType(req);
+  if (!areaType) return res.status(400).json({ error: 'Choose district, sector, cell, or village.' });
+  try { return res.json(await getIremboWhatsAppGroups(req, areaType)); }
+  catch (error) { console.error('Irembo WhatsApp area groups error:', error.code || error.name); return res.status(500).json({ error: 'Could not load the selected area groups.' }); }
+});
+router.put('/whatsapp-area-groups/:areaId', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => saveAreaWhatsAppInvite(req, res, 'IREMBO'));
+router.post('/whatsapp-area-groups/:areaId/create', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  if (req.body?.confirmAgentConsent !== true) return res.status(400).json({ error: 'Confirm that every agent being added agreed to join this WhatsApp group and share their phone number with the provider.' });
+  if (!whatsAppProviderReady()) return res.status(503).json({ error: 'Automatic WhatsApp group creation is not configured. An administrator must set WHAPI_API_TOKEN for AgentsService.' });
+  try {
+    const resolved = await resolveWhatsAppAreaGroup(req, 'IREMBO');
+    if (resolved.error) return res.status(req.query.type && !requestedWhatsAppAreaType(req) ? 400 : 404).json({ error: resolved.error });
+    return res.status(201).json(await createOrUpdateAreaWhatsAppGroup({ req, group: resolved.group, network: 'IREMBO' }));
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message, missingPhoneCount: error.missingPhoneCount, invalidPhoneCount: error.invalidPhoneCount });
+    console.error('Irembo WhatsApp area group operation failed:', error.code || error.name);
+    return res.status(502).json({ error: 'Could not complete the WhatsApp group operation.' });
+  }
+});
+router.get('/moola-plus-whatsapp-area-groups', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  if (!requestedWhatsAppAreaType(req)) return res.status(400).json({ error: 'Choose district, sector, cell, or village.' });
+  try { return res.json(await getMoolaPlusGroups(req)); }
+  catch (error) { console.error('Moola Plus WhatsApp area groups error:', error.statusCode || error.code || error.name); return res.status(error.statusCode || 502).json({ error: error.message || 'Could not load the selected area groups.' }); }
+});
+router.put('/moola-plus-whatsapp-area-groups/:areaId', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => saveAreaWhatsAppInvite(req, res, 'MOOLA_PLUS'));
+router.post('/moola-plus-whatsapp-area-groups/:areaId/create', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  if (req.body?.confirmAgentConsent !== true) return res.status(400).json({ error: 'Confirm that every agent being added agreed to join this WhatsApp group and share their phone number with the provider.' });
+  if (!whatsAppProviderReady()) return res.status(503).json({ error: 'Automatic WhatsApp group creation is not configured. An administrator must set WHAPI_API_TOKEN for AgentsService.' });
+  try {
+    const resolved = await resolveWhatsAppAreaGroup(req, 'MOOLA_PLUS');
+    if (resolved.error) return res.status(req.query.type && !requestedWhatsAppAreaType(req) ? 400 : 404).json({ error: resolved.error });
+    return res.status(201).json(await createOrUpdateAreaWhatsAppGroup({ req, group: resolved.group, network: 'MOOLA_PLUS' }));
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message, missingPhoneCount: error.missingPhoneCount, invalidPhoneCount: error.invalidPhoneCount });
+    console.error('Moola Plus WhatsApp area group operation failed:', error.statusCode || error.code || error.name);
+    return res.status(error.statusCode || 502).json({ error: 'Could not complete the WhatsApp group operation.' });
+  }
+});
 
 router.get('/sector-groups', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
   try {
@@ -1688,7 +2062,7 @@ router.post('/:id/location/capture', authenticateToken, requireTerritoryAccess, 
     if (unreviewedIncomingTransfer) return res.status(409).json({ error: 'Review and accept this transfer from the dashboard before recording the agent’s location.' });
     const outgoingTransfer = await prisma.agentTransfer.findFirst({ where: { agentId: agent.id, requestedByTcId: req.user.id, status: 'PENDING' } });
     if (territoryId !== agent.territoryId && !pendingTransfer) return res.status(409).json({ error: 'The agent’s district can only change through an approved relocation or accepted transfer.' });
-    const needsLocationCapture = agent.registeredLatitude == null || agent.registeredLongitude == null || !agent.locationVerified || (!agent.firstVisitCompletedAt && !agent.firstVisitLocationCapturedAt);
+    const needsLocationCapture = agent.registeredLatitude == null || agent.registeredLongitude == null || !agent.locationVerified || !agent.firstVisitLocationCapturedAt;
     if (agent.firstVisitCompletedAt && !needsLocationCapture && !pendingTransfer) return res.status(409).json({ error: 'This agent already has a verified location. Request an administrator-approved relocation before changing it.' });
     if (outgoingTransfer && !pendingTransfer) return res.status(409).json({ error: 'This agent is awaiting the destination coordinator. You cannot record their first-visit location.' });
     if (!isAssignedHere && !pendingTransfer) return res.status(403).json({ error: 'This district is outside your assigned territories.' });
@@ -1736,12 +2110,12 @@ router.post('/:id/location/capture', authenticateToken, requireTerritoryAccess, 
         conflict.statusCode = 409;
         throw conflict;
       }
-      const recaptureAfterMove = Boolean(agent.firstVisitCompletedAt || agent.firstVisitLocationCapturedAt);
+      const recaptureAfterMove = Boolean(agent.firstVisitLocationCapturedAt);
       await tx.agentLocation.create({ data: { agentId: agent.id, latitude: lat, longitude: lon, accuracy: gpsAccuracy, recordedById: req.user.id, reason: pendingTransfer ? 'TRANSFER_LOCATION_CAPTURE' : recaptureAfterMove ? 'RELOCATION_LOCATION_CAPTURE' : 'FIRST_VISIT_LOCATION_CAPTURE' } });
       if (pendingTransfer) await tx.agentTransfer.update({ where: { id: pendingTransfer.id }, data: { status: 'COMPLETED', completedAt: new Date() } });
       return tx.agent.findUnique({ where: { id: agent.id }, include: { territory: true, sector: true, cell: true, village: true } });
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, pendingTransfer ? 'COMPLETE_AGENT_TRANSFER_LOCATION' : agent.firstVisitCompletedAt || agent.firstVisitLocationCapturedAt ? 'CAPTURE_AGENT_LOCATION' : 'CAPTURE_FIRST_VISIT_LOCATION', 'Agent', agent.id, {
+    await logAction(req.user.id, pendingTransfer ? 'COMPLETE_AGENT_TRANSFER_LOCATION' : agent.firstVisitLocationCapturedAt ? 'CAPTURE_AGENT_LOCATION' : 'CAPTURE_FIRST_VISIT_LOCATION', 'Agent', agent.id, {
       latitude: lat, longitude: lon, accuracy: gpsAccuracy, territoryId, sectorId, cellId: updated.cellId, villageId: updated.villageId, transferId: pendingTransfer?.id || null,
       venue, territoryName: updated.territory?.name, sectorName: updated.sector?.name, cellName: updated.cell?.name, villageName: updated.village?.name,
     }, req);
