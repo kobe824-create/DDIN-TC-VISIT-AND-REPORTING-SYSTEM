@@ -8,7 +8,7 @@ export default function AgentActions({ agent, assignedTerritories = [], onAgentC
   const [territories, setTerritories] = useState([]);
   const [transferTargets, setTransferTargets] = useState([]);
   const [transferOpen, setTransferOpen] = useState(false);
-  const [loadedTransferTargets, setLoadedTransferTargets] = useState(false);
+  const [transferTargetsStatus, setTransferTargetsStatus] = useState('idle');
   const [territoryId, setTerritoryId] = useState(agent.territoryId || '');
   const [sectorId, setSectorId] = useState('');
   const [cellId, setCellId] = useState('');
@@ -50,17 +50,27 @@ export default function AgentActions({ agent, assignedTerritories = [], onAgentC
     finally { setSaving(false); }
   };
 
-  const openTransfer = async () => {
-    setTransferOpen((open) => !open);
+  const loadTransferTargets = async () => {
+    if (transferTargetsStatus === 'loading' || transferTargetsStatus === 'loaded') return;
+    setTransferTargetsStatus('loading');
     setError(''); setNotice('');
-    if (loadedTransferTargets) return;
-    setLoadedTransferTargets(true);
     try {
       const { data } = await api.get(`/api/v1/agents/${agent.id}/transfer-targets`);
       setTransferTargets(data || []);
       setTransferTerritoryId(data?.[0]?.id || '');
       setRecipientTcId(data?.[0]?.coordinators?.[0]?.id || '');
-    } catch (err) { setError(err.response?.data?.error || 'Could not load destination coordinators.'); }
+      setTransferTargetsStatus('loaded');
+    } catch (err) {
+      setTransferTargetsStatus('error');
+      setError(err.response?.data?.error || 'Could not load destination coordinators.');
+    }
+  };
+
+  const openTransfer = () => {
+    const opening = !transferOpen;
+    setTransferOpen(opening);
+    setError(''); setNotice('');
+    if (opening) void loadTransferTargets();
   };
 
   const requestTransfer = async (event) => {
@@ -97,12 +107,13 @@ export default function AgentActions({ agent, assignedTerritories = [], onAgentC
       {activeTransfer ? <div className="agent-request-status"><strong>{activeTransfer.acceptedAt ? 'Transfer accepted — record the new location before visiting' : `Transfer request pending in ${currentTransfer}`}</strong><span>{activeTransfer.acceptedAt ? 'Open Start visit to capture the agent’s current GPS and village.' : 'The agent remains assigned to this district until the receiving TC reviews the request.'}</span></div> : <>
         <button type="button" className="agent-transfer-toggle" onClick={openTransfer}><ArrowRightLeft size={15} />{transferOpen ? 'Close transfer request' : 'Transfer to another TC’s district'}</button>
         {transferOpen && <form className="agent-relocation-form" onSubmit={requestTransfer}>
-          {!transferTargets.length && loadedTransferTargets ? <p>No active TC is assigned to another district yet.</p> : <>
-            <label>Destination district<select value={transferTerritoryId} onChange={(event) => { const target = transferTargets.find((item) => item.id === event.target.value); setTransferTerritoryId(event.target.value); setRecipientTcId(target?.coordinators?.[0]?.id || ''); }} required><option value="">Choose district</option>{transferTargets.map((item) => <option key={item.id} value={item.id}>{item.name}{item.province ? ` — ${item.province}` : ''}</option>)}</select></label>
-            <label>Receiving TC<select value={recipientTcId} onChange={(event) => setRecipientTcId(event.target.value)} required><option value="">Choose coordinator</option>{(transferTargets.find((item) => item.id === transferTerritoryId)?.coordinators || []).map((tc) => <option key={tc.id} value={tc.id}>{[tc.firstName, tc.lastName].filter(Boolean).join(' ')}</option>)}</select></label>
-            <label className="agent-request-reason">Reason<textarea rows={2} maxLength={500} value={transferReason} onChange={(event) => setTransferReason(event.target.value)} placeholder="Where the agent moved, if known" /></label>
-            <button className="btn btn-primary" type="submit" disabled={saving || !transferTargets.length}><Send size={15} />{saving ? 'Sending…' : 'Send transfer for TC review'}</button>
-          </>}
+          <label>Destination district<select value={transferTerritoryId} onChange={(event) => { const target = transferTargets.find((item) => item.id === event.target.value); setTransferTerritoryId(event.target.value); setRecipientTcId(target?.coordinators?.[0]?.id || ''); }} required disabled={transferTargetsStatus !== 'loaded' || !transferTargets.length}><option value="">{transferTargetsStatus === 'loading' ? 'Loading districts…' : 'Choose district'}</option>{transferTargets.map((item) => <option key={item.id} value={item.id}>{item.name}{item.province ? ` — ${item.province}` : ''}</option>)}</select></label>
+          <label>Receiving TC<select value={recipientTcId} onChange={(event) => setRecipientTcId(event.target.value)} required disabled={transferTargetsStatus !== 'loaded' || !transferTargets.length}><option value="">{transferTargetsStatus === 'loading' ? 'Loading coordinators…' : 'Choose coordinator'}</option>{(transferTargets.find((item) => item.id === transferTerritoryId)?.coordinators || []).map((tc) => <option key={tc.id} value={tc.id}>{[tc.firstName, tc.lastName].filter(Boolean).join(' ')}</option>)}</select></label>
+          <label className="agent-request-reason">Reason<textarea rows={2} maxLength={500} value={transferReason} onChange={(event) => setTransferReason(event.target.value)} placeholder="Where the agent moved, if known" /></label>
+          {transferTargetsStatus === 'loading' && <p role="status">Loading available districts and coordinators…</p>}
+          {transferTargetsStatus === 'loaded' && !transferTargets.length && <p role="status">No active TC is assigned to another district yet. Ask an administrator to assign a TC to the destination district.</p>}
+          {transferTargetsStatus === 'error' && <button className="btn btn-secondary" type="button" onClick={() => void loadTransferTargets()}>Retry loading destinations</button>}
+          <button className="btn btn-primary" type="submit" disabled={saving || transferTargetsStatus !== 'loaded' || !transferTargets.length || !transferTerritoryId || !recipientTcId}><Send size={15} />{saving ? 'Sending…' : 'Send transfer for TC review'}</button>
         </form>}
       </>}
     </div>
