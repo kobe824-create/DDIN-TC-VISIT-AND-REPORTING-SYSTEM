@@ -13,7 +13,17 @@ const api = axios.create({
 export const resolveApiUrl = (path) => {
   if (!path) return path;
   try {
-    return new URL(path, api.defaults.baseURL || window.location.origin).toString();
+    const appOrigin = window.location.origin;
+    const resolved = new URL(path, appOrigin);
+
+    // Visit photos are served through the frontend's same-origin /uploads proxy.
+    // Resolving them against VITE_API_URL can make them cross-origin, which the
+    // Visits service's Cross-Origin-Resource-Policy correctly blocks.
+    if (resolved.pathname.startsWith('/uploads/')) {
+      return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+    }
+
+    return new URL(path, api.defaults.baseURL || appOrigin).toString();
   } catch {
     return path;
   }

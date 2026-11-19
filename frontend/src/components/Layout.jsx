@@ -15,7 +15,7 @@ import { syncPendingVisits } from '../offline/sync';
 const primaryNav = [
   { label: 'Visits', path: '/visits', icon: MapPinned, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
   { label: 'Agents', path: '/agents', icon: UsersRound, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
-  { label: 'Sector groups', path: '/sector-groups', icon: MessageCircle, roles: ['TC'] },
+  { label: 'WhatsApp groups', path: '/sector-groups', icon: MessageCircle, roles: ['TC'] },
   { label: 'Reports', path: '/reports', icon: FileBarChart2, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
 ];
 
@@ -296,7 +296,7 @@ export default function Layout() {
       <nav className={`mobile-tabs${mustChangePassword ? ' mobile-tabs-single' : ''}`} aria-label="Quick navigation">
         {mustChangePassword ? <NavLink to="/profile" className={({ isActive }) => `mobile-tab${isActive ? ' is-active' : ''}`}><KeyRound size={19} /><span>Change password</span></NavLink> : <>
           <NavLink to="/dashboard" className={({ isActive }) => `mobile-tab${isActive ? ' is-active' : ''}`}><LayoutDashboard size={19} /><span>Overview</span></NavLink>
-          {primaryNav.filter(({ label }) => label !== 'Sector groups').map(({ label, path, icon: Icon }) => <NavLink key={path} to={path} className={({ isActive }) => `mobile-tab${isActive ? ' is-active' : ''}`}><Icon size={19} /><span>{label}</span></NavLink>)}
+          {primaryNav.filter(({ label }) => label !== 'WhatsApp groups').map(({ label, path, icon: Icon }) => <NavLink key={path} to={path} className={({ isActive }) => `mobile-tab${isActive ? ' is-active' : ''}`}><Icon size={19} /><span>{label}</span></NavLink>)}
         </>}
       </nav>
     </div>

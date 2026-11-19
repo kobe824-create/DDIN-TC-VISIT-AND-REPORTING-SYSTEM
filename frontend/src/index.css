@@ -2379,6 +2379,29 @@ html, body, #root {
 .dashboard-date-wrap { display: grid; gap: 5px; color: #68756d; font-size: 12px; font-weight: 600; }
 .dashboard-date-wrap input { min-width: 150px; }
 .sector-groups-page { display: grid; gap: 18px; }
+.territory-group-builder { display: grid; gap: 16px; padding: 18px; }
+.territory-group-fields { display: grid; grid-template-columns: minmax(150px, .7fr) minmax(220px, 1.3fr) minmax(220px, 1fr); gap: 12px; }
+.territory-group-fields label { display: grid; align-content: start; gap: 6px; color: #56645a; font-size: 12px; font-weight: 700; }
+.territory-group-fields select, .territory-group-fields input { width: 100%; min-width: 0; height: 42px; padding: 0 11px; border: 1px solid #dce2dc; border-radius: 8px; color: #35433a; background: #fff; font: inherit; font-weight: 450; }
+.territory-group-fields select:focus, .territory-group-fields input:focus { outline: 0; border-color: #9dba9f; box-shadow: 0 0 0 3px rgb(58 105 75 / 10%); }
+.territory-group-fields input:disabled { color: #78847b; background: #f5f7f4; }
+.territory-group-fields small { color: #879289; font-size: 10px; font-weight: 450; text-align: right; }
+.territory-group-summary { display: flex; align-items: flex-start; gap: 9px; padding: 11px 13px; border: 1px solid #e7ece7; border-radius: 9px; color: #66736a; background: #fafcf9; font-size: 12px; line-height: 1.5; }
+.territory-group-summary > svg { flex: 0 0 auto; margin-top: 1px; color: #557e5c; }
+.territory-group-summary strong { color: #405a45; }
+.territory-group-summary a, .territory-group-warning a { display: inline-flex; align-items: center; gap: 5px; color: #3e7048; font-weight: 650; }
+.territory-group-warning { display: grid; gap: 5px; padding: 11px 13px; border: 1px solid #f0d5c3; border-radius: 9px; color: #775c4c; background: #fff8f3; font-size: 12px; line-height: 1.45; }
+.territory-group-warning strong { color: #70452d; }
+.territory-group-action { margin: 0; }
+.territory-group-action .btn:disabled { cursor: not-allowed; opacity: .55; }
+.whatsapp-groups-actions { display: flex; align-items: flex-end; gap: 10px; }
+.whatsapp-groups-actions > label { display: grid; gap: 4px; color: #68756d; font-size: 11px; font-weight: 650; }
+.whatsapp-groups-actions select { min-width: 130px; height: 38px; padding: 0 9px; border: 1px solid #dce2dc; border-radius: 8px; color: #35433a; background: #fff; font: inherit; }
+.sector-group-name-field { width: min(100%, 430px); display: grid; gap: 5px; }
+.sector-group-name-field label { color: #56645a; font-size: 11px; font-weight: 700; }
+.sector-group-name-field input { min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #dce2dc; border-radius: 8px; color: #35433a; background: #fff; font: inherit; font-size: 12px; font-weight: 450; }
+.sector-group-name-field input:disabled { color: #78847b; background: #f5f7f4; }
+.sector-group-name-field small { color: #879289; font-size: 10px; text-align: right; }
 .sector-groups-guidance { display: flex; align-items: flex-start; gap: 12px; padding: 16px 18px; border: 1px solid #f0d5c3; border-radius: 12px; color: #74482f; background: #fff8f3; }
 .sector-groups-guidance > svg { flex: 0 0 auto; margin-top: 2px; color: #cf713b; }
 .sector-groups-guidance strong { color: #553b2c; font-size: 14px; }
@@ -2448,6 +2471,11 @@ html, body, #root {
 .movement-status.accepted-gps-pending, .movement-status.pending { color: #996022; background: #fff5e4; }
 .movement-status.rejected, .movement-status.cancelled { color: #a94f43; background: #fff0ec; }
 @media (max-width: 640px) {
+  .territory-group-builder { padding: 14px; }
+  .territory-group-fields { grid-template-columns: 1fr; }
+  .territory-group-action .btn { width: 100%; justify-content: center; }
+  .whatsapp-groups-actions { align-items: stretch; flex-direction: column; }
+  .whatsapp-groups-actions select { width: 100%; }
   .sector-group-card > header { padding: 14px; }
   .sector-auto-group { margin-right: 14px; margin-left: 14px; }
   .sector-group-provider-unavailable { margin-right: 14px; margin-left: 14px; }
