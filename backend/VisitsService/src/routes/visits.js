@@ -145,6 +145,11 @@ function validCoordinates(latitude, longitude, accuracy) {
 }
 
 const normalizeLocationName = (value) => String(value || '').trim().toLocaleLowerCase().replace(/\s+/g, ' ');
+const hasCompleteMoolaFieldLocation = (location) => Boolean(location?.locationVerified
+  && Number.isFinite(location.latitude) && location.latitude >= -90 && location.latitude <= 90
+  && Number.isFinite(location.longitude) && location.longitude >= -180 && location.longitude <= 180
+  && location.firstLocationCapturedAt && location.sectorId && location.cellId && location.villageId
+  && String(location.venue || '').trim());
 
 function moolaLocationShape(location) {
   if (!location) return null;
@@ -262,8 +267,8 @@ router.post('/moola-plus/agents/:externalAgentId/location/capture', authenticate
       return res.status(400).json({ error: 'Choose the assigned district and capture a valid GPS location.' });
     }
     if (accuracy > 20) return res.status(422).json({ error: `GPS accuracy is ±${Math.round(accuracy)} m. First-location capture needs 20 m accuracy or better; move to a clearer location and retry.` });
-    const savedLocation = await prisma.moolaAgentLocation.findUnique({ where: { externalAgentId }, select: { latitude: true, longitude: true, locationVerified: true } });
-    const reusingSavedCoordinates = Boolean(savedLocation?.locationVerified && savedLocation.latitude === latitude && savedLocation.longitude === longitude);
+    const savedLocation = await prisma.moolaAgentLocation.findUnique({ where: { externalAgentId }, select: { latitude: true, longitude: true, locationVerified: true, firstLocationCapturedAt: true } });
+    const reusingSavedCoordinates = Boolean(savedLocation?.locationVerified && savedLocation.firstLocationCapturedAt && savedLocation.latitude === latitude && savedLocation.longitude === longitude);
     if (!reusingSavedCoordinates) {
       const evidence = validateGpsEvidence(req.body.gpsCapturedAt, req.body.gpsSampleCount, { maxAgeMs: 5 * 60 * 1000 });
       if (!evidence.ok) return res.status(evidence.status).json({ error: evidence.error });
@@ -578,18 +583,14 @@ router.post('/moola-plus/check-in', authenticateToken, requireTerritoryAccess, r
     if (hasSavedCoordinates && savedDistance > radiusMeters) return res.status(403).json({ error: `You are ${Math.round(savedDistance)} m from the agent’s saved location. Check-in is allowed only within the configured ${radiusMeters} m radius.` });
     if (existingVisit) {
       if (existingVisit.tcId !== req.user.id || existingVisit.externalAgentId !== externalAgentId || existingVisit.network !== 'MOOLA_PLUS') return res.status(409).json({ error: 'This client visit ID already belongs to another visit.' });
-      if (!hasSavedCoordinates || existingVisit.locationStatus !== 'VERIFIED') return res.status(409).json({ error: 'This visit has no verified saved agent location. Capture the agent’s location and start a new check-in.' });
+      if (!hasCompleteMoolaFieldLocation(previousLocation)) return res.status(409).json({ error: 'Capture and save the agent’s first location with its district, sector, cell, village and venue before checking in.' });
+      if (existingVisit.locationStatus !== 'VERIFIED') return res.status(409).json({ error: 'This visit has no verified saved agent location. Capture the agent’s location and start a new check-in.' });
       return res.json({ ...existingVisit, distanceMeters: savedDistance, radiusMeters });
     }
     if (!previousLocation && String(agent.district || '').trim().toLocaleLowerCase().replace(/\s+/g, ' ') !== territory.name.trim().toLocaleLowerCase().replace(/\s+/g, ' ')) {
       return res.status(403).json({ error: 'Choose the agent’s registered district for its first visit.' });
     }
-    const firstLocation = !previousLocation?.locationVerified || previousLocation.latitude == null || previousLocation.longitude == null
-      || !previousLocation.sectorId || !previousLocation.cellId || !previousLocation.villageId || !previousLocation.venue;
-    const locationResult = firstLocation ? await validateMoolaFieldLocation({ territoryId, ...req.body }) : null;
-    if (locationResult?.error) return res.status(400).json({ error: locationResult.error });
-    if (!hasSavedCoordinates && gpsAccuracyMeters > 20) return res.status(422).json({ error: `First-visit GPS accuracy is ±${Math.round(gpsAccuracyMeters)} m. Capture the agent’s coordinates with accuracy of 20 m or better before checking in.` });
-    const locationAssignment = locationResult?.location || previousLocation;
+    if (!hasCompleteMoolaFieldLocation(previousLocation)) return res.status(409).json({ error: 'Capture and save the agent’s first location with its district, sector, cell, village and venue before checking in.' });
     const checkInTime = new Date();
     const visit = await prisma.$transaction(async (tx) => {
       await advisoryTransactionLock(tx, externalAgentId, 'AGENT_MOVE');
@@ -602,14 +603,9 @@ router.post('/moola-plus/check-in', authenticateToken, requireTerritoryAccess, r
       if (currentOutgoingTransfer) throw conflict('This agent is awaiting transfer review. You cannot start a visit until the transfer is resolved.');
       if (currentIncomingTransfer) throw conflict('Review and accept this transfer from the dashboard before visiting the agent.');
       if (currentLocation && currentLocation.territoryId !== territoryId) throw conflict('The Moola Plus agent location changed before check-in. Reload the profile.');
-      const needsLocation = !currentLocation?.locationVerified || currentLocation.latitude == null || currentLocation.longitude == null
-        || !currentLocation.sectorId || !currentLocation.cellId || !currentLocation.villageId || !currentLocation.venue;
-      if (needsLocation !== firstLocation) throw conflict('The Moola Plus location changed before check-in. Reload the agent and try again.');
-      const currentHasSavedCoordinates = Boolean(currentLocation?.locationVerified && currentLocation.latitude != null && currentLocation.longitude != null);
-      const distance = currentHasSavedCoordinates
-        ? calculateDistance(tcLatitude, tcLongitude, currentLocation.latitude, currentLocation.longitude)
-        : 0;
-      if (gpsAccuracyMeters > (currentHasSavedCoordinates ? 50 : 20)) throw conflict(`GPS accuracy must be ${currentHasSavedCoordinates ? '50' : '20'} m or better before check-in.`);
+      if (!hasCompleteMoolaFieldLocation(currentLocation)) throw conflict('The agent’s saved location is incomplete or changed. Capture and save its district, sector, cell, village, venue and first GPS location before checking in.');
+      const distance = calculateDistance(tcLatitude, tcLongitude, currentLocation.latitude, currentLocation.longitude);
+      if (gpsAccuracyMeters > 50) throw conflict('GPS accuracy must be 50 m or better before check-in.');
       if (distance > radiusMeters) throw conflict(`You are ${Math.round(distance)} m from the agent’s saved location. Check-in is allowed only within the configured ${radiusMeters} m radius.`);
       const locationStatus = 'VERIFIED';
       await advisoryTransactionLock(tx, externalAgentId, 'MOOLA_METRIC_WINDOW');
@@ -617,22 +613,14 @@ router.post('/moola-plus/check-in', authenticateToken, requireTerritoryAccess, r
         visitId: requestedVisitId || makeVisitId(), network: 'MOOLA_PLUS', externalAgentId,
         externalAgentName: agent.name, externalAgentCode: agent.loginName || externalAgentId,
         tc: { connect: { id: req.user.id } }, territory: { connect: { id: territoryId } }, visitDate: checkInTime, checkInTime,
-        agentLatitude: needsLocation ? (hasGps && gpsAccuracyMeters <= 20 ? tcLatitude : currentLocation?.latitude ?? null) : currentLocation.latitude,
-        agentLongitude: needsLocation ? (hasGps && gpsAccuracyMeters <= 20 ? tcLongitude : currentLocation?.longitude ?? null) : currentLocation.longitude,
+        agentLatitude: currentLocation.latitude,
+        agentLongitude: currentLocation.longitude,
         tcLatitude: hasGps ? tcLatitude : null, tcLongitude: hasGps ? tcLongitude : null,
         distanceMeters: distance, gpsAccuracyMeters: hasGps ? gpsAccuracyMeters : null,
         locationStatus, locationMethod: 'GPS',
         visitStatus: 'STARTED', countsForMetrics: false, isOffline: false,
       };
       const created = await tx.visit.create({ data });
-      if (needsLocation) {
-        const accurate = hasGps && gpsAccuracyMeters <= 20;
-        await tx.moolaAgentLocation.upsert({
-          where: { externalAgentId },
-          create: { externalAgentId, agentName: agent.name, loginName: agent.loginName || externalAgentId, ...locationAssignment, latitude: accurate ? tcLatitude : null, longitude: accurate ? tcLongitude : null, accuracy: accurate ? gpsAccuracyMeters : null, locationVerified: accurate, firstLocationCapturedAt: accurate ? checkInTime : null, updatedById: req.user.id },
-          update: { agentName: agent.name, loginName: agent.loginName || externalAgentId, ...locationAssignment, latitude: accurate ? tcLatitude : null, longitude: accurate ? tcLongitude : null, accuracy: accurate ? gpsAccuracyMeters : null, locationVerified: accurate, firstLocationCapturedAt: accurate ? checkInTime : null, isOnHold: false, updatedById: req.user.id },
-        });
-      }
       await tx.moolaAgentTransfer.updateMany({ where: { externalAgentId, recipientTcId: req.user.id, status: 'PENDING', acceptedAt: { not: null } }, data: { status: 'COMPLETED', completedAt: checkInTime } });
       return created;
     }, { maxWait: 10000, timeout: 15000 });

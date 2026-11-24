@@ -20,6 +20,8 @@ import ListPagination from '../components/ListPagination';
 import { useAuth } from '../AuthContext';
 import { getAgentPack, getVisitDrafts, saveVisitDraft } from '../offline/store';
 import { MOOLA_PLUS_NETWORK, useNetwork } from '../NetworkContext';
+import { acquireBestLocation, distanceMeters, GPS_MAX_FIX_AGE_MS } from '../utils/geolocation';
+import { hasSavedMoolaLocation } from '../utils/visit-location';
 
 const makeClientVisitId = () => `CLT-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
 const kigaliDateKey = (date = new Date()) => {
@@ -28,82 +30,6 @@ const kigaliDateKey = (date = new Date()) => {
   return `${values.year}-${values.month}-${values.day}`;
 };
 const coverageIsActive = (agent, now = new Date()) => Boolean(agent?.coverageEndsAt && new Date(agent.coverageEndsAt) > now && agent.lastQualifiedVisitAt && new Date(agent.lastQualifiedVisitAt) <= now);
-const distanceMeters = (a, b) => {
-  const radians = (degrees) => degrees * Math.PI / 180;
-  const latitudeDelta = radians(b.latitude - a.latitude);
-  const longitudeDelta = radians(b.longitude - a.longitude);
-  const value = Math.sin(latitudeDelta / 2) ** 2 + Math.cos(radians(a.latitude)) * Math.cos(radians(b.latitude)) * Math.sin(longitudeDelta / 2) ** 2;
-  return 6371000 * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
-};
-const acquireBestLocation = ({ durationMs = 60000, maxAccuracyMeters = 50, onProgress } = {}) => new Promise((resolve, reject) => {
-  if (!navigator.geolocation?.watchPosition) { reject(new Error('This browser does not provide GPS readings.')); return; }
-  const readings = [];
-  let watchId = null;
-  let finished = false;
-  const cleanup = () => {
-    window.clearTimeout(timer);
-    if (watchId != null) navigator.geolocation.clearWatch(watchId);
-  };
-  const finish = (error, result) => {
-    if (finished) return;
-    finished = true;
-    cleanup();
-    if (error) reject(error);
-    else resolve(result);
-  };
-  const makeFix = () => {
-    const candidates = readings.filter((reading) => Date.now() - reading.timestamp <= 15000 && reading.coords.accuracy <= maxAccuracyMeters)
-      .sort((a, b) => a.coords.accuracy - b.coords.accuracy).slice(0, 5);
-    if (candidates.length < 3) return null;
-    const median = (values) => {
-      const sorted = [...values].sort((a, b) => a - b);
-      const middle = Math.floor(sorted.length / 2);
-      return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
-    };
-    const latitude = median(candidates.map((reading) => reading.coords.latitude));
-    const longitude = median(candidates.map((reading) => reading.coords.longitude));
-    const spread = candidates.map((reading) => distanceMeters(reading.coords, { latitude, longitude })).sort((a, b) => a - b);
-    const p80Spread = spread[Math.min(spread.length - 1, Math.ceil(spread.length * 0.8) - 1)];
-    const accuracy = Math.ceil(Math.max(median(candidates.map((reading) => reading.coords.accuracy)), p80Spread));
-    const newest = candidates.reduce((latest, reading) => reading.timestamp > latest.timestamp ? reading : latest, candidates[0]);
-    const oldestTimestamp = candidates.reduce((earliest, reading) => reading.timestamp < earliest ? reading.timestamp : earliest, candidates[0].timestamp);
-    if (newest.timestamp - oldestTimestamp < 2000 || Date.now() - newest.timestamp > 15000 || accuracy > maxAccuracyMeters) return null;
-    return {
-      coords: { latitude, longitude, accuracy },
-      timestamp: new Date(newest.timestamp).toISOString(),
-      sampleCount: candidates.length,
-    };
-  };
-  const timer = window.setTimeout(() => {
-    const fix = makeFix();
-    if (fix) return finish(null, fix);
-    const count = readings.length;
-    finish(new Error(count < 3
-      ? `GPS stabilized at ${count}/3 fresh readings. Keep the device still in an open area and retry.`
-      : `The GPS readings are not steady or accurate enough (need ±${maxAccuracyMeters} m or better). Move to an open area, keep the device still, and retry.`));
-  }, durationMs);
-  try {
-    watchId = navigator.geolocation.watchPosition((position) => {
-      const timestamp = Number(position.timestamp);
-      const coords = position.coords;
-      const now = Date.now();
-      if (!Number.isFinite(timestamp) || timestamp <= 0 || now - timestamp > 15000 || timestamp - now > 30000) return;
-      if (![coords?.latitude, coords?.longitude, coords?.accuracy].every(Number.isFinite)
-        || coords.latitude < -90 || coords.latitude > 90 || coords.longitude < -180 || coords.longitude > 180
-        || coords.accuracy < 0 || coords.accuracy > 1000) return;
-      if (readings.some((reading) => reading.timestamp === timestamp)) return;
-      readings.push({ coords, timestamp });
-      if (readings.length > 8) readings.shift();
-      onProgress?.(readings.length);
-      const candidate = makeFix();
-      if (candidate) finish(null, candidate);
-    }, (error) => {
-      if (error.code === 1) finish(new Error('Location access was denied. Allow location access in browser settings, then try again.'));
-      else if (error.code === 3 && !readings.length) finish(new Error('GPS timed out before a reading arrived. Move to an open area and retry.'));
-    }, { enableHighAccuracy: true, maximumAge: 0, timeout: durationMs });
-  } catch (error) { finish(error); }
-});
-
 const STEPS = ['Select Agent', 'Check In', 'Photo', 'Report', 'Review'];
 const isAgentLocationQuestion = (text) => /\bagent\s+(district|sector|cell|village|venue)\s+location\b/i.test(String(text || ''));
 const withoutDuplicateVisitQuestions = (items) => items.filter((item) => !isAgentLocationQuestion(item.text));
@@ -187,6 +113,9 @@ export default function VisitWorkflow() {
   const [checkInLoading, setCheckInLoading] = useState(false);
   const [locationCaptureLoading, setLocationCaptureLoading] = useState(false);
   const [gpsReadingCount, setGpsReadingCount] = useState(0);
+  const gpsRequestRef = useRef(null);
+
+  useEffect(() => () => { gpsRequestRef.current?.abort(); }, [network]);
   
   const [photoPreview, setPhotoPreview] = useState(null);
   const [photoFile, setPhotoFile] = useState(null);
@@ -263,6 +192,9 @@ export default function VisitWorkflow() {
     setVisitId(null);
     setClientVisitId(null);
     setOfflineVisit(false);
+    setCheckInLoading(false);
+    setLocationCaptureLoading(false);
+    setGpsReadingCount(0);
     setError(null);
   }, [network]);
 
@@ -639,13 +571,13 @@ export default function VisitWorkflow() {
   };
 
   const captureAgentLocation = () => {
-    if (!selectedAgent) return;
+    if (!selectedAgent || locationCaptureLoading || checkInLoading) return;
     const incomingTransfer = selectedAgent.transfers?.find((transfer) => transfer.status === 'PENDING');
     if (incomingTransfer && !incomingTransfer.acceptedAt) {
       setError('The receiving TC must accept this transfer from the dashboard before recording the new location.');
       return;
     }
-    const needsLocationCapture = Boolean(selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || !selectedAgent.locationVerified || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt));
+    const needsLocationCapture = isMoolaPlus ? !hasSavedMoolaLocation(selectedAgent) : Boolean(selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || !selectedAgent.locationVerified || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt));
     const transferNeedsLocationCapture = Boolean(incomingTransfer?.acceptedAt && needsLocationCapture);
     const locationAssignment = {
       territoryId: firstVisitFields.territoryId || selectedAgent.territoryId,
@@ -664,15 +596,20 @@ export default function VisitWorkflow() {
       setError('Enter the agent’s venue before capturing the first-visit location.');
       return;
     }
+    const controller = new AbortController();
+    gpsRequestRef.current?.abort();
+    gpsRequestRef.current = controller;
     const saveLocation = async (capturedLocation) => {
+      if (controller.signal.aborted) return;
       try {
         if (!navigator.onLine) throw new Error('OFFLINE');
         const captureUrl = isMoolaPlus
           ? `/api/v1/visits/moola-plus/agents/${encodeURIComponent(selectedAgent.id)}/location/capture`
           : `/api/v1/agents/${selectedAgent.id}/location/capture`;
-        const { data } = await api.post(captureUrl, capturedLocation);
+        const { data } = await api.post(captureUrl, capturedLocation, { timeout: 30_000, signal: controller.signal });
+        if (controller.signal.aborted) return;
         setSelectedAgent(isMoolaPlus
-          ? { ...selectedAgent, ...data, territory: { name: workTerritories.find((item) => item.id === data.territoryId)?.name || selectedAgent.territory?.name || '' }, pendingLocation: capturedLocation, locationSynced: true }
+          ? { ...selectedAgent, ...data, id: selectedAgent.id, territory: { name: workTerritories.find((item) => item.id === data.territoryId)?.name || selectedAgent.territory?.name || '' }, pendingLocation: capturedLocation, locationSynced: true }
           : { ...data, pendingLocation: capturedLocation, locationSynced: true });
         setFirstVisitFields((current) => ({
           ...current,
@@ -687,6 +624,7 @@ export default function VisitWorkflow() {
         setGpsStatus(null);
         setError(null);
       } catch (err) {
+        if (controller.signal.aborted) return;
         if (!err.response && (err.message === 'OFFLINE' || !navigator.onLine)) {
           if (isMoolaPlus) setError('Moola Plus location capture needs a live connection so the saved coordinates can be verified. Reconnect and retry.');
           else if (capturedLocation.accuracy > 20) setError('GPS accuracy must be 20 m or better. Move to an open area and capture again.');
@@ -700,8 +638,8 @@ export default function VisitWorkflow() {
             setGpsStatus(null);
             setError(null);
           }
-        } else setError(err.response?.data?.error || 'Could not save the agent location. Try again in an open area.');
-      } finally { setLocationCaptureLoading(false); }
+        } else setError(err.response?.data?.error || (err.code === 'ECONNABORTED' ? 'Saving the location timed out. Check your connection, then retry.' : 'Could not save the agent location. Please retry.'));
+      } finally { if (gpsRequestRef.current === controller) setLocationCaptureLoading(false); }
     };
     if (selectedAgent.firstVisitLocationCapturedAt && !needsLocationCapture) {
       if (selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || selectedAgent.gpsAccuracy == null) {
@@ -717,19 +655,25 @@ export default function VisitWorkflow() {
     setLocationCaptureLoading(true);
     setError(null);
     setGpsReadingCount(0);
-    acquireBestLocation({ maxAccuracyMeters: 20, onProgress: setGpsReadingCount }).then(async (fix) => {
+    acquireBestLocation({ maxAccuracyMeters: 20, onProgress: setGpsReadingCount, signal: controller.signal }).then(async (fix) => {
       const capturedLocation = {
         latitude: fix.coords.latitude, longitude: fix.coords.longitude, accuracy: fix.coords.accuracy,
         gpsCapturedAt: fix.timestamp, gpsSampleCount: fix.sampleCount, ...locationAssignment,
       };
       await saveLocation(capturedLocation);
     }).catch((err) => {
+      if (controller.signal.aborted) return;
       setError(`Could not capture a fresh GPS reading: ${err.message}. Try near an open window or outside.`);
       setLocationCaptureLoading(false);
     });
   };
 
   const handleCheckIn = async () => {
+    if (!selectedAgent || checkInLoading || locationCaptureLoading) return;
+    if (isMoolaPlus && !hasSavedMoolaLocation(selectedAgent)) { setError('Capture and save the agent’s first location before checking in.'); return; }
+    const controller = new AbortController();
+    gpsRequestRef.current?.abort();
+    gpsRequestRef.current = controller;
     const stableId = clientVisitId || makeClientVisitId();
     let coordinates = null;
     let knownLocation = selectedAgent.pendingLocation || {
@@ -742,7 +686,16 @@ export default function VisitWorkflow() {
     setGpsReadingCount(0);
     setError(null);
     try {
-      const position = await acquireBestLocation({ maxAccuracyMeters: 50, onProgress: setGpsReadingCount });
+      let checkInAgent = selectedAgent;
+      if (navigator.onLine && selectedAgent.pendingLocation && !selectedAgent.locationSynced) {
+        const { data: updatedAgent } = await api.post(`/api/v1/agents/${selectedAgent.id}/location/capture`, selectedAgent.pendingLocation, { timeout: 30_000, signal: controller.signal });
+        checkInAgent = { ...updatedAgent, pendingLocation: selectedAgent.pendingLocation, locationSynced: true };
+        setSelectedAgent(checkInAgent);
+      }
+      const position = await acquireBestLocation({
+        maxAccuracyMeters: 50, onProgress: setGpsReadingCount, signal: controller.signal,
+        target: knownLocation?.latitude != null && knownLocation?.longitude != null ? { ...knownLocation, radiusMeters } : undefined,
+      });
       coordinates = position ? {
         latitude: position.coords.latitude,
         longitude: position.coords.longitude,
@@ -801,12 +754,6 @@ export default function VisitWorkflow() {
         await startLocally();
         return;
       }
-      let checkInAgent = selectedAgent;
-      if (selectedAgent.pendingLocation && !selectedAgent.locationSynced) {
-        const { data: updatedAgent } = await api.post(`/api/v1/agents/${selectedAgent.id}/location/capture`, selectedAgent.pendingLocation);
-        checkInAgent = { ...updatedAgent, pendingLocation: selectedAgent.pendingLocation, locationSynced: true };
-        setSelectedAgent(checkInAgent);
-      }
       const checkInPayload = {
         visitId: stableId,
         ...(isMoolaPlus ? {
@@ -820,8 +767,9 @@ export default function VisitWorkflow() {
         ...(coordinates ? { tcLatitude: coordinates.latitude, tcLongitude: coordinates.longitude, gpsAccuracyMeters: coordinates.accuracy } : {}),
       };
       const { data: visit } = isMoolaPlus
-        ? await api.post('/api/v1/visits/moola-plus/check-in', checkInPayload)
-        : await api.post('/api/v1/visits/check-in', checkInPayload);
+        ? await api.post('/api/v1/visits/moola-plus/check-in', checkInPayload, { timeout: 30_000, signal: controller.signal })
+        : await api.post('/api/v1/visits/check-in', checkInPayload, { timeout: 30_000, signal: controller.signal });
+      if (controller.signal.aborted) return;
       if (visit.locationStatus !== 'VERIFIED' || visit.locationMethod !== 'GPS') {
         throw new Error('The server could not verify this GPS check-in. No visit was started. Capture your location again at the agent’s place.');
       }
@@ -844,6 +792,7 @@ export default function VisitWorkflow() {
       setCurrentStep(2);
       await persistDraft({ clientVisitId: stableId, serverVisitId: visit.id, selectedAgent: checkInAgent, checkInCoordinates: coordinates, gpsData: nextGpsData, locationMethod: 'GPS', currentStep: 2 });
     } catch (err) {
+      if (controller.signal.aborted) return;
       if (!err.response && (!navigator.onLine || err.message === 'Network Error')) {
         if (isMoolaPlus) {
           setGpsStatus('error');
@@ -862,6 +811,9 @@ export default function VisitWorkflow() {
               locationMethod: 'GPS',
               publicId: stableId,
             };
+            if (localGpsData.locationStatus !== 'VERIFIED' || Date.now() - Date.parse(coordinates.timestamp) > GPS_MAX_FIX_AGE_MS) {
+              throw new Error('The GPS check-in could not be verified. Capture a fresh location inside the agent’s allowed radius before continuing.');
+            }
             setClientVisitId(stableId); setVisitId(stableId); setOfflineVisit(true); setLocationMethod('GPS'); setCheckInCoordinates(coordinates); setGpsData(localGpsData); setMetricEligible(null); setGpsStatus('success'); setCurrentStep(2);
             await persistDraft({ clientVisitId: stableId, serverVisitId: null, selectedAgent, checkInCoordinates: coordinates, gpsData: localGpsData, locationMethod: 'GPS', currentStep: 2 });
           } catch (offlineError) { setGpsStatus('error'); setError(offlineError.message || 'Could not save this visit for offline sync.'); }
@@ -871,7 +823,7 @@ export default function VisitWorkflow() {
         setError(err.response?.data?.error || err.message || 'Failed to check in. Please try again.');
       }
     } finally {
-      setCheckInLoading(false);
+      if (gpsRequestRef.current === controller) setCheckInLoading(false);
     }
   };
 
@@ -1118,11 +1070,8 @@ export default function VisitWorkflow() {
   const needsLocationCapture = Boolean(selectedAgent && (selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || !selectedAgent.locationVerified || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt)));
   const transferNeedsLocationCapture = Boolean(activeIncomingTransfer?.acceptedAt && needsLocationCapture);
   const showLocationCapture = Boolean(selectedAgent && !isMoolaPlus && (!selectedAgent.firstVisitCompletedAt || needsLocationCapture));
-  const showMoolaLocationCapture = Boolean(isMoolaPlus && selectedAgent && (
-    !selectedAgent.locationVerified || selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null
-    || !firstVisitFields.sectorId || !firstVisitFields.cellId || !firstVisitFields.villageId || !firstVisitFields.venue.trim()
-  ));
-  const moolaLocationReady = Boolean(selectedAgent?.locationVerified && selectedAgent?.registeredLatitude != null && selectedAgent?.registeredLongitude != null && firstVisitFields.sectorId && firstVisitFields.cellId && firstVisitFields.villageId && firstVisitFields.venue.trim());
+  const moolaLocationReady = hasSavedMoolaLocation(selectedAgent);
+  const showMoolaLocationCapture = Boolean(isMoolaPlus && selectedAgent && !moolaLocationReady);
   const relocationNeedsLocationCapture = Boolean(needsLocationCapture && selectedAgent?.firstVisitCompletedAt && !transferNeedsLocationCapture);
 
   if (visitCompleted) {
@@ -1290,7 +1239,7 @@ export default function VisitWorkflow() {
       {/* STEP 2: GPS Check-In */}
       {currentStep === 1 && selectedAgent && (
         <div className="visit-workflow-step space-y-6">
-          <button onClick={() => setCurrentStep(0)} className="text-[#202a4e] font-medium flex items-center mb-2 hover:underline">
+          <button onClick={() => { gpsRequestRef.current?.abort(); setCheckInLoading(false); setLocationCaptureLoading(false); setCurrentStep(0); }} className="text-[#202a4e] font-medium flex items-center mb-2 hover:underline">
             <ArrowLeft className="w-4 h-4 mr-1" /> Back to selection
           </button>
           
@@ -1303,9 +1252,9 @@ export default function VisitWorkflow() {
 
           {waitingForTransferReview && <div className="rounded-xl border border-amber-200 bg-amber-50 p-5 text-amber-950"><h3 className="font-semibold">Transfer awaiting your review</h3><p className="mt-1 text-sm">Open the dashboard notification, call the agent, and confirm they are in your district before accepting. You cannot visit or record their location yet.</p><button type="button" className="btn btn-secondary mt-3" onClick={() => navigate('/dashboard')}>Open dashboard requests</button></div>}
           {isMoolaPlus && selectedAgent.moolaPendingRelocation && <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950"><strong>Relocation request awaiting review</strong><p className="mt-1">You can resume visits after an administrator reviews the destination district.</p></div>}
-          {isMoolaPlus && !selectedAgent.moolaPendingRelocation && <div className="rounded-xl border border-[#d8e3dc] bg-[#f4f7f4] p-4 text-sm text-[#354b3e]"><strong>{selectedAgent.locationVerified ? 'Saved Moola Plus location' : 'First visit or relocated location'}</strong><p className="mt-1">{selectedAgent.locationVerified ? 'Check in is compared with this saved field GPS.' : 'Choose the agent’s official area and venue. A precise GPS reading at check-in saves the location; uncertain readings are held for review.'}</p></div>}
+          {isMoolaPlus && !selectedAgent.moolaPendingRelocation && <div className="rounded-xl border border-[#d8e3dc] bg-[#f4f7f4] p-4 text-sm text-[#354b3e]"><strong>{selectedAgent.locationVerified ? 'Saved Moola Plus location' : 'First visit or relocated location'}</strong><p className="mt-1">{selectedAgent.locationVerified ? 'Check in is compared with this saved field GPS.' : 'Choose the agent’s official area and venue. Capture the first location while you are with the agent, then check in using the saved GPS location.'}</p></div>}
           {showMoolaLocationCapture && !selectedAgent.moolaPendingRelocation && <div className="first-visit-location-panel">
-            <div className="first-visit-location-intro"><span className="first-visit-location-mark"><MapPin size={18} aria-hidden="true" /></span><div><span className="first-visit-location-kicker">MOOLA PLUS FIELD LOCATION</span><h3>Set the agent’s area and venue</h3><p>Choose the official district, sector, cell and village. GPS is captured with this check-in.</p></div></div>
+            <div className="first-visit-location-intro"><span className="first-visit-location-mark"><MapPin size={18} aria-hidden="true" /></span><div><span className="first-visit-location-kicker">MOOLA PLUS FIELD LOCATION</span><h3>Set the agent’s area and venue</h3><p>Choose the official district, sector, cell, village and venue, then capture the agent’s first location before checking in.</p></div></div>
             <div className="grid gap-3 sm:grid-cols-2">
               <label className="text-sm font-medium text-gray-700">District<select className="form-select mt-1 w-full" value={firstVisitFields.territoryId} onChange={(event) => setFirstVisitFields((current) => ({ ...current, territoryId: event.target.value, sectorId: '', cellId: '', cellName: '', villageId: '', villageName: '' }))}><option value="">Choose district</option>{workTerritories.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
               <label className="text-sm font-medium text-gray-700">Sector<select className="form-select mt-1 w-full" value={firstVisitFields.sectorId} onChange={(event) => setFirstVisitFields((current) => ({ ...current, sectorId: event.target.value, cellId: '', cellName: '', villageId: '', villageName: '' }))} disabled={!locationDistrict}><option value="">Choose sector</option>{locationSectors.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
@@ -1313,6 +1262,10 @@ export default function VisitWorkflow() {
               <label className="text-sm font-medium text-gray-700">Village<select className="form-select mt-1 w-full" value={firstVisitFields.villageId} onChange={(event) => { const village = locationVillages.find((item) => item.id === event.target.value); setFirstVisitFields((current) => ({ ...current, villageId: village?.id || '', villageName: village?.name || '' })); }} disabled={!locationCell}><option value="">Choose village</option>{locationVillages.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
               <label className="text-sm font-medium text-gray-700 sm:col-span-2">Venue<input className="form-select mt-1 w-full" type="text" value={firstVisitFields.venue} onChange={(event) => setFirstVisitFields((current) => ({ ...current, venue: event.target.value }))} placeholder="Market, building or business centre" maxLength={200} required /></label>
             </div>
+            <button type="button" onClick={captureAgentLocation} disabled={locationCaptureLoading || checkInLoading || waitingForTransferReview || !locationDistrict || !locationSector || !firstVisitFields.cellId || !firstVisitFields.villageId || !firstVisitFields.venue.trim()} className="btn btn-primary mt-4 w-full justify-center disabled:opacity-50">
+              <MapPin size={17} />{locationCaptureLoading ? `Collecting GPS readings (${Math.min(gpsReadingCount, 3)}/3)… checking accuracy` : selectedAgent.firstVisitCompletedAt ? 'Capture relocated location' : 'Capture first location'}
+            </button>
+            <p className="first-visit-area-hint mt-2" role="status">Choose the district, sector, cell, village and venue to enable capture. Check-in becomes available after the location is saved.</p>
           </div>}
           {transferRequested ? <div className="rounded-xl border border-green-200 bg-green-50 p-5 text-green-900">
             <h3 className="font-semibold">Transfer request sent</h3>
@@ -1417,7 +1370,7 @@ export default function VisitWorkflow() {
 
             <button
               onClick={() => handleCheckIn()}
-              disabled={checkInLoading || waitingForTransferReview || Boolean(isMoolaPlus && selectedAgent.moolaPendingRelocation) || gpsStatus === 'success' || (isMoolaPlus ? !(firstVisitFields.territoryId || workTerritoryId) || !moolaLocationReady : selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || (!selectedAgent.locationVerified && !selectedAgent.pendingLocation) || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.pendingLocation))}
+              disabled={checkInLoading || locationCaptureLoading || waitingForTransferReview || Boolean(isMoolaPlus && selectedAgent.moolaPendingRelocation) || gpsStatus === 'success' || (isMoolaPlus ? !(firstVisitFields.territoryId || workTerritoryId) || !moolaLocationReady : selectedAgent.registeredLatitude == null || selectedAgent.registeredLongitude == null || (!selectedAgent.locationVerified && !selectedAgent.pendingLocation) || (!selectedAgent.firstVisitCompletedAt && !selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.pendingLocation))}
               className="btn btn-primary w-full justify-center py-4 text-base disabled:opacity-50"
             >
               <MapPin className="w-6 h-6 mr-2" />

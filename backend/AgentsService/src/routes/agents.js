@@ -2023,7 +2023,7 @@ router.post('/:id/location/capture', authenticateToken, requireTerritoryAccess, 
     if (typeof lat !== 'number' || !Number.isFinite(lat) || lat < -90 || lat > 90 || typeof lon !== 'number' || !Number.isFinite(lon) || lon < -180 || lon > 180 || typeof gpsAccuracy !== 'number' || !Number.isFinite(gpsAccuracy) || gpsAccuracy < 0 || gpsAccuracy > 20) {
       return res.status(400).json({ error: 'A precise GPS reading with accuracy of 20 metres or better is required. Move to an open area and try again.' });
     }
-    const reusingSavedCoordinates = Boolean(agent.locationVerified && agent.registeredLatitude === lat && agent.registeredLongitude === lon);
+    const reusingSavedCoordinates = Boolean(agent.locationVerified && agent.firstVisitLocationCapturedAt && agent.registeredLatitude === lat && agent.registeredLongitude === lon);
     if (!reusingSavedCoordinates) {
       const evidence = validateGpsEvidence(req.body.gpsCapturedAt, req.body.gpsSampleCount, { maxAgeMs: 5 * 60 * 1000 });
       if (!evidence.ok) return res.status(evidence.status).json({ error: evidence.error });

@@ -6,15 +6,17 @@ function validateGpsEvidence(gpsCapturedAt, gpsSampleCount, {
   futureToleranceMs = 30_000,
   requireEvidence = true,
 } = {}) {
-  if ((gpsCapturedAt == null || gpsSampleCount == null) && !requireEvidence) {
+  if (gpsCapturedAt == null && gpsSampleCount == null && !requireEvidence) {
     return { ok: true, legacy: true };
   }
   if (gpsCapturedAt == null || gpsSampleCount == null) {
     return { ok: false, status: 400, error: 'Collect at least three fresh GPS readings before continuing.' };
   }
 
-  const capturedAt = new Date(gpsCapturedAt);
-  const sampleCount = Number(gpsSampleCount);
+  const validTimestampType = typeof gpsCapturedAt === 'string' && gpsCapturedAt.trim().length > 0
+    || typeof gpsCapturedAt === 'number' && Number.isFinite(gpsCapturedAt) && gpsCapturedAt > 0;
+  const capturedAt = validTimestampType ? new Date(gpsCapturedAt) : new Date(NaN);
+  const sampleCount = gpsSampleCount;
   if (!Number.isFinite(capturedAt.getTime()) || !Number.isInteger(sampleCount) || sampleCount < MIN_GPS_SAMPLES || sampleCount > 20) {
     return { ok: false, status: 400, error: 'The GPS fix is incomplete. Collect at least three fresh readings and retry.' };
   }
