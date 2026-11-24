@@ -19,6 +19,8 @@ async function syncOne(draft) {
       tcLatitude: current.tcLatitude,
       tcLongitude: current.tcLongitude,
       gpsAccuracyMeters: current.gpsAccuracyMeters,
+      gpsCapturedAt: current.gpsCapturedAt || current.checkInTime,
+      gpsSampleCount: current.gpsSampleCount,
       locationMethod: current.locationMethod || current.gpsData?.locationMethod || 'GPS',
       visitDate: current.visitDate,
       checkInTime: current.checkInTime,
@@ -42,7 +44,7 @@ async function syncOne(draft) {
   if (!serverVisit.report && current.reportPayload) {
     await api.post(`/api/v1/visits/${current.serverVisitId}/report`, current.reportPayload);
   }
-  if (!['COMPLETED', 'FLAGGED'].includes(serverVisit.visitStatus)) {
+  if (serverVisit.visitStatus !== 'COMPLETED') {
     await api.put(`/api/v1/visits/${current.serverVisitId}/check-out`);
   }
   await deleteVisitDraft(current.clientVisitId);

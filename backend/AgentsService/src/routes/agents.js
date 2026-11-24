@@ -7,6 +7,7 @@ const requireAgentRegistrationEnabled = require('../middleware/registration');
 const { logAction } = require('../utils/auditLog');
 const { decryptPii, encryptPii } = require('../../../shared/pii');
 const { advisoryTransactionLock } = require('../../../shared/advisory-locks');
+const { validateGpsEvidence } = require('../../../shared/gps-evidence');
 const { coverageState, kigaliDateKey, latestQualifiedVisits } = require('../../../shared/visit-coverage');
 
 const queryIds = (value) => (Array.isArray(value) ? value : value ? [value] : []).map(String).filter(Boolean);
@@ -2022,6 +2023,11 @@ router.post('/:id/location/capture', authenticateToken, requireTerritoryAccess, 
     if (typeof lat !== 'number' || !Number.isFinite(lat) || lat < -90 || lat > 90 || typeof lon !== 'number' || !Number.isFinite(lon) || lon < -180 || lon > 180 || typeof gpsAccuracy !== 'number' || !Number.isFinite(gpsAccuracy) || gpsAccuracy < 0 || gpsAccuracy > 20) {
       return res.status(400).json({ error: 'A precise GPS reading with accuracy of 20 metres or better is required. Move to an open area and try again.' });
     }
+    const reusingSavedCoordinates = Boolean(agent.locationVerified && agent.registeredLatitude === lat && agent.registeredLongitude === lon);
+    if (!reusingSavedCoordinates) {
+      const evidence = validateGpsEvidence(req.body.gpsCapturedAt, req.body.gpsSampleCount, { maxAgeMs: 5 * 60 * 1000 });
+      if (!evidence.ok) return res.status(evidence.status).json({ error: evidence.error });
+    }
     if (agent.firstVisitLocationCapturedAt && !needsLocationCapture && !pendingTransfer) {
       if (sameCapture && Math.abs(agent.registeredLatitude - lat) < 1e-7 && Math.abs(agent.registeredLongitude - lon) < 1e-7) {
         if (agent.venue === venue) return res.json(agent);
@@ -2065,7 +2071,7 @@ router.post('/:id/location/capture', authenticateToken, requireTerritoryAccess, 
       return tx.agent.findUnique({ where: { id: agent.id }, include: { territory: true, sector: true, cell: true, village: true } });
     }, { maxWait: 10000, timeout: 15000 });
     await logAction(req.user.id, pendingTransfer ? 'COMPLETE_AGENT_TRANSFER_LOCATION' : agent.firstVisitCompletedAt || agent.firstVisitLocationCapturedAt ? 'CAPTURE_AGENT_LOCATION' : 'CAPTURE_FIRST_VISIT_LOCATION', 'Agent', agent.id, {
-      latitude: lat, longitude: lon, accuracy: gpsAccuracy, territoryId, sectorId, cellId: updated.cellId, villageId: updated.villageId, transferId: pendingTransfer?.id || null,
+      latitude: lat, longitude: lon, accuracy: gpsAccuracy, gpsCapturedAt: req.body.gpsCapturedAt || null, gpsSampleCount: req.body.gpsSampleCount || null, territoryId, sectorId, cellId: updated.cellId, villageId: updated.villageId, transferId: pendingTransfer?.id || null,
       venue, territoryName: updated.territory?.name, sectorName: updated.sector?.name, cellName: updated.cell?.name, villageName: updated.village?.name,
     }, req);
     res.status(201).json(updated);

@@ -35,28 +35,71 @@ const distanceMeters = (a, b) => {
   const value = Math.sin(latitudeDelta / 2) ** 2 + Math.cos(radians(a.latitude)) * Math.cos(radians(b.latitude)) * Math.sin(longitudeDelta / 2) ** 2;
   return 6371000 * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
 };
-const acquireBestLocation = (durationMs = 45000) => new Promise((resolve, reject) => {
+const acquireBestLocation = ({ durationMs = 60000, maxAccuracyMeters = 50, onProgress } = {}) => new Promise((resolve, reject) => {
   if (!navigator.geolocation?.watchPosition) { reject(new Error('This browser does not provide GPS readings.')); return; }
-  let best = null;
-  let goodReadings = 0;
+  const readings = [];
   let watchId = null;
-  const finish = (error) => {
+  let finished = false;
+  const cleanup = () => {
     window.clearTimeout(timer);
     if (watchId != null) navigator.geolocation.clearWatch(watchId);
-    if (error && !best) reject(error);
-    else if (best) resolve(best);
-    else reject(new Error('No location reading was received. Move near a window or outdoors and try again.'));
   };
-  const timer = window.setTimeout(() => finish(), durationMs);
+  const finish = (error, result) => {
+    if (finished) return;
+    finished = true;
+    cleanup();
+    if (error) reject(error);
+    else resolve(result);
+  };
+  const makeFix = () => {
+    const candidates = readings.filter((reading) => Date.now() - reading.timestamp <= 15000 && reading.coords.accuracy <= maxAccuracyMeters)
+      .sort((a, b) => a.coords.accuracy - b.coords.accuracy).slice(0, 5);
+    if (candidates.length < 3) return null;
+    const median = (values) => {
+      const sorted = [...values].sort((a, b) => a - b);
+      const middle = Math.floor(sorted.length / 2);
+      return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+    };
+    const latitude = median(candidates.map((reading) => reading.coords.latitude));
+    const longitude = median(candidates.map((reading) => reading.coords.longitude));
+    const spread = candidates.map((reading) => distanceMeters(reading.coords, { latitude, longitude })).sort((a, b) => a - b);
+    const p80Spread = spread[Math.min(spread.length - 1, Math.ceil(spread.length * 0.8) - 1)];
+    const accuracy = Math.ceil(Math.max(median(candidates.map((reading) => reading.coords.accuracy)), p80Spread));
+    const newest = candidates.reduce((latest, reading) => reading.timestamp > latest.timestamp ? reading : latest, candidates[0]);
+    const oldestTimestamp = candidates.reduce((earliest, reading) => reading.timestamp < earliest ? reading.timestamp : earliest, candidates[0].timestamp);
+    if (newest.timestamp - oldestTimestamp < 2000 || Date.now() - newest.timestamp > 15000 || accuracy > maxAccuracyMeters) return null;
+    return {
+      coords: { latitude, longitude, accuracy },
+      timestamp: new Date(newest.timestamp).toISOString(),
+      sampleCount: candidates.length,
+    };
+  };
+  const timer = window.setTimeout(() => {
+    const fix = makeFix();
+    if (fix) return finish(null, fix);
+    const count = readings.length;
+    finish(new Error(count < 3
+      ? `GPS stabilized at ${count}/3 fresh readings. Keep the device still in an open area and retry.`
+      : `The GPS readings are not steady or accurate enough (need ±${maxAccuracyMeters} m or better). Move to an open area, keep the device still, and retry.`));
+  }, durationMs);
   try {
     watchId = navigator.geolocation.watchPosition((position) => {
-      const timestamp = Number(position.timestamp) || Date.now();
-      if (Date.now() - timestamp > 30000 || !Number.isFinite(position.coords?.accuracy)) return;
-      if (!best || position.coords.accuracy < best.coords.accuracy) best = position;
-      if (position.coords.accuracy <= 30) goodReadings += 1;
-      if (goodReadings >= 2) finish();
+      const timestamp = Number(position.timestamp);
+      const coords = position.coords;
+      const now = Date.now();
+      if (!Number.isFinite(timestamp) || timestamp <= 0 || now - timestamp > 15000 || timestamp - now > 30000) return;
+      if (![coords?.latitude, coords?.longitude, coords?.accuracy].every(Number.isFinite)
+        || coords.latitude < -90 || coords.latitude > 90 || coords.longitude < -180 || coords.longitude > 180
+        || coords.accuracy < 0 || coords.accuracy > 1000) return;
+      if (readings.some((reading) => reading.timestamp === timestamp)) return;
+      readings.push({ coords, timestamp });
+      if (readings.length > 8) readings.shift();
+      onProgress?.(readings.length);
+      const candidate = makeFix();
+      if (candidate) finish(null, candidate);
     }, (error) => {
       if (error.code === 1) finish(new Error('Location access was denied. Allow location access in browser settings, then try again.'));
+      else if (error.code === 3 && !readings.length) finish(new Error('GPS timed out before a reading arrived. Move to an open area and retry.'));
     }, { enableHighAccuracy: true, maximumAge: 0, timeout: durationMs });
   } catch (error) { finish(error); }
 });
@@ -143,6 +186,7 @@ export default function VisitWorkflow() {
   const [checkInCoordinates, setCheckInCoordinates] = useState(null);
   const [checkInLoading, setCheckInLoading] = useState(false);
   const [locationCaptureLoading, setLocationCaptureLoading] = useState(false);
+  const [gpsReadingCount, setGpsReadingCount] = useState(0);
   
   const [photoPreview, setPhotoPreview] = useState(null);
   const [photoFile, setPhotoFile] = useState(null);
@@ -578,6 +622,8 @@ export default function VisitWorkflow() {
       tcLatitude: coordinates?.latitude,
       tcLongitude: coordinates?.longitude,
       gpsAccuracyMeters: coordinates?.accuracy,
+      gpsCapturedAt: coordinates?.timestamp,
+      gpsSampleCount: coordinates?.sampleCount,
       visitDate: coordinates?.timestamp || new Date().toISOString(),
       checkInTime: coordinates?.timestamp || new Date().toISOString(),
       gpsData: captured.gpsData,
@@ -670,8 +716,12 @@ export default function VisitWorkflow() {
     if (!navigator.geolocation) { setError('This browser does not support GPS location.'); return; }
     setLocationCaptureLoading(true);
     setError(null);
-    acquireBestLocation().then(async ({ coords }) => {
-      const capturedLocation = { latitude: coords.latitude, longitude: coords.longitude, accuracy: coords.accuracy, ...locationAssignment };
+    setGpsReadingCount(0);
+    acquireBestLocation({ maxAccuracyMeters: 20, onProgress: setGpsReadingCount }).then(async (fix) => {
+      const capturedLocation = {
+        latitude: fix.coords.latitude, longitude: fix.coords.longitude, accuracy: fix.coords.accuracy,
+        gpsCapturedAt: fix.timestamp, gpsSampleCount: fix.sampleCount, ...locationAssignment,
+      };
       await saveLocation(capturedLocation);
     }).catch((err) => {
       setError(`Could not capture a fresh GPS reading: ${err.message}. Try near an open window or outside.`);
@@ -689,14 +739,16 @@ export default function VisitWorkflow() {
     };
     setCheckInLoading(true);
     setGpsStatus('acquiring');
+    setGpsReadingCount(0);
     setError(null);
     try {
-      const position = await acquireBestLocation();
+      const position = await acquireBestLocation({ maxAccuracyMeters: 50, onProgress: setGpsReadingCount });
       coordinates = position ? {
         latitude: position.coords.latitude,
         longitude: position.coords.longitude,
         accuracy: position.coords.accuracy,
-        timestamp: new Date(position.timestamp || Date.now()).toISOString(),
+        timestamp: position.timestamp,
+        sampleCount: position.sampleCount,
       } : null;
       if (isMoolaPlus && !navigator.onLine) throw new Error('Moola Plus visits need a live connection to check the upstream agent registry.');
       knownLocation = selectedAgent.pendingLocation || {
@@ -763,11 +815,16 @@ export default function VisitWorkflow() {
           venue: firstVisitFields.venue,
         } : { agentId: selectedAgent.id }),
         locationMethod: 'GPS',
+        gpsCapturedAt: coordinates.timestamp,
+        gpsSampleCount: coordinates.sampleCount,
         ...(coordinates ? { tcLatitude: coordinates.latitude, tcLongitude: coordinates.longitude, gpsAccuracyMeters: coordinates.accuracy } : {}),
       };
       const { data: visit } = isMoolaPlus
         ? await api.post('/api/v1/visits/moola-plus/check-in', checkInPayload)
         : await api.post('/api/v1/visits/check-in', checkInPayload);
+      if (visit.locationStatus !== 'VERIFIED' || visit.locationMethod !== 'GPS') {
+        throw new Error('The server could not verify this GPS check-in. No visit was started. Capture your location again at the agent’s place.');
+      }
       const nextGpsData = {
         distance: visit.distanceMeters == null ? null : Math.round(visit.distanceMeters),
         radius: visit.radiusMeters,
@@ -782,7 +839,7 @@ export default function VisitWorkflow() {
       setLocationMethod('GPS');
       setCheckInCoordinates(coordinates);
       setGpsData(nextGpsData);
-      setMetricEligible(visit.visitStatus === 'FLAGGED' ? false : null);
+      setMetricEligible(null);
       setGpsStatus('success');
       setCurrentStep(2);
       await persistDraft({ clientVisitId: stableId, serverVisitId: visit.id, selectedAgent: checkInAgent, checkInCoordinates: coordinates, gpsData: nextGpsData, locationMethod: 'GPS', currentStep: 2 });
@@ -1304,7 +1361,7 @@ export default function VisitWorkflow() {
               {selectedAgent.firstVisitLocationCapturedAt && !needsLocationCapture ? <><p className="mt-3 text-sm font-medium text-green-800">The territory and GPS capture are locked.</p><button onClick={captureAgentLocation} disabled={locationCaptureLoading || selectedAgent.firstVisitCompletedAt || !firstVisitFields.venue.trim() || firstVisitFields.venue.trim() === String(selectedAgent.venue || '').trim()} className="btn btn-secondary mt-3 w-full justify-center disabled:opacity-50" type="button">
                 <MapPin size={17} />{locationCaptureLoading ? 'Saving venue…' : 'Save venue'}
               </button></> : <button onClick={captureAgentLocation} disabled={locationCaptureLoading || !locationSector || !firstVisitFields.cellId || !firstVisitFields.villageId || !firstVisitFields.venue.trim()} className="btn btn-primary mt-4 w-full justify-center disabled:opacity-50" type="button">
-                <MapPin size={17} />{locationCaptureLoading ? 'Capturing precise location…' : transferNeedsLocationCapture ? 'Capture new transfer location' : relocationNeedsLocationCapture ? 'Capture relocated location' : 'Capture first-visit location'}
+                <MapPin size={17} />{locationCaptureLoading ? `Collecting GPS readings (${Math.min(gpsReadingCount, 3)}/3)… checking accuracy` : transferNeedsLocationCapture ? 'Capture new transfer location' : relocationNeedsLocationCapture ? 'Capture relocated location' : 'Capture first-visit location'}
               </button>}
               {!selectedAgent.firstVisitLocationCapturedAt && !selectedAgent.transfers?.some((transfer) => transfer.status === 'PENDING') && !selectedAgent.transferRequest && <div className="mt-4 border-t border-[#e5e8ef] pt-3">
                 <button type="button" className="text-sm font-semibold text-[#202a4e] underline" onClick={openTransferPanel}>The agent moved to another district?</button>
@@ -1337,7 +1394,7 @@ export default function VisitWorkflow() {
             )}
             {gpsStatus === 'acquiring' && (
               <div className="bg-blue-50 text-blue-700 p-4 rounded-md flex items-center border border-blue-200">
-                <RefreshCw className="w-5 h-5 mr-3 animate-spin" /> Locating you...
+                <RefreshCw className="w-5 h-5 mr-3 animate-spin" /> Collecting fresh GPS readings ({Math.min(gpsReadingCount, 3)}/3) and checking accuracy… Keep the device still in an open area.
               </div>
             )}
             {gpsStatus === 'success' && gpsData && gpsData.locationStatus === 'VERIFIED' && (

@@ -821,11 +821,11 @@ router.get('/dashboard', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC'
       prisma.$queryRaw`
           SELECT
             COUNT(*) FILTER (WHERE v."countsForMetrics" = TRUE) AS "totalVisits",
-            COUNT(*) FILTER (WHERE v."countsForMetrics" = TRUE AND v."visitStatus"::text IN ('COMPLETED', 'FLAGGED')) AS "completedVisits",
-            COUNT(DISTINCT v."agentId") FILTER (WHERE v."countsForMetrics" = TRUE AND v."visitStatus"::text IN ('COMPLETED', 'FLAGGED')) AS "uniqueAgentsVisited",
-            COUNT(*) FILTER (WHERE v."countsForMetrics" = TRUE AND v."visitStatus"::text IN ('COMPLETED', 'FLAGGED') AND v."locationStatus"::text = 'VERIFIED') AS "verifiedVisits",
+            COUNT(*) FILTER (WHERE v."countsForMetrics" = TRUE AND v."visitStatus"::text = 'COMPLETED') AS "completedVisits",
+            COUNT(DISTINCT v."agentId") FILTER (WHERE v."countsForMetrics" = TRUE AND v."visitStatus"::text = 'COMPLETED') AS "uniqueAgentsVisited",
+            COUNT(*) FILTER (WHERE v."countsForMetrics" = TRUE AND v."visitStatus"::text = 'COMPLETED' AND v."locationStatus"::text = 'VERIFIED') AS "verifiedVisits",
             COUNT(*) FILTER (WHERE v."countsForMetrics" = TRUE AND (v."visitStatus"::text = 'FLAGGED' OR v."locationStatus"::text IS DISTINCT FROM 'VERIFIED')) AS "flaggedVisitsCount",
-            AVG(v."distanceMeters") FILTER (WHERE v."countsForMetrics" = TRUE) AS "averageDistance"
+            AVG(v."distanceMeters") FILTER (WHERE v."countsForMetrics" = TRUE AND v."visitStatus"::text = 'COMPLETED') AS "averageDistance"
           FROM "Visit" v
           WHERE v."visitDate" >= ${range.gte} AND v."visitDate" < ${range.lt}
             AND v."network"::text = 'IREMBO'
@@ -951,12 +951,12 @@ router.get('/visits', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC', '
         },
         orderBy: [{ visitDate: 'desc' }, { id: 'desc' }],
       }),
-      prisma.visit.count({ where: { AND: [baseWhere, { countsForMetrics: true, visitStatus: { in: ['COMPLETED', 'FLAGGED'] } }] } }),
-      prisma.visit.count({ where: { AND: [baseWhere, { countsForMetrics: true, visitStatus: { in: ['COMPLETED', 'FLAGGED'] }, locationStatus: 'VERIFIED' }] } }),
+      prisma.visit.count({ where: { AND: [baseWhere, { countsForMetrics: true, visitStatus: 'COMPLETED' }] } }),
+      prisma.visit.count({ where: { AND: [baseWhere, { countsForMetrics: true, visitStatus: 'COMPLETED', locationStatus: 'VERIFIED' }] } }),
       prisma.visit.count({ where: { AND: [baseWhere, { countsForMetrics: true, OR: [{ visitStatus: 'FLAGGED' }, { locationStatus: { not: 'VERIFIED' } }] }] } }),
       prisma.visit.count({ where: { AND: [baseWhere, { countsForMetrics: true, photos: { some: {} } }] } }),
     ]);
-    const metricVisitWhere = { AND: [baseWhere, { countsForMetrics: true, visitStatus: { in: ['COMPLETED', 'FLAGGED'] } }] };
+    const metricVisitWhere = { AND: [baseWhere, { countsForMetrics: true, visitStatus: 'COMPLETED' }] };
     const uniqueAgentGroups = await prisma.visit.groupBy({
       by: [String(req.query.network || '').toUpperCase() === 'MOOLA_PLUS' ? 'externalAgentId' : 'agentId'],
       where: metricVisitWhere,
@@ -1096,8 +1096,8 @@ router.get('/coverage', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC',
         ? { sectorId: territory.id, championId: req.user.id, status: 'ACTIVE', isOnHold: false }
         : { territoryId: territory.id, status: 'ACTIVE', isOnHold: false };
       const visitWhere = req.user.role === 'CHAMPION'
-        ? { countsForMetrics: true, visitStatus: { in: ['COMPLETED', 'FLAGGED'] }, agent: { sectorId: territory.id, championId: req.user.id }, ...(visitDate ? { visitDate } : {}) }
-        : { countsForMetrics: true, visitStatus: { in: ['COMPLETED', 'FLAGGED'] }, territoryId: territory.id, ...(visitDate ? { visitDate } : {}) };
+        ? { countsForMetrics: true, visitStatus: 'COMPLETED', agent: { sectorId: territory.id, championId: req.user.id }, ...(visitDate ? { visitDate } : {}) }
+        : { countsForMetrics: true, visitStatus: 'COMPLETED', territoryId: territory.id, ...(visitDate ? { visitDate } : {}) };
       const totalAgents = await prisma.agent.count({ where: agentWhere });
       const visits = await prisma.visit.findMany({ where: visitWhere, select: { agentId: true } });
       const uniqueAgentsVisited = new Set(visits.map(({ agentId }) => agentId)).size;

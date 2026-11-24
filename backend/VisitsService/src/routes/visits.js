@@ -10,6 +10,7 @@ const { logAction } = require('../utils/auditLog');
 const { advisoryTransactionLock } = require('../../../shared/advisory-locks');
 const { calculateDistance } = require('../utils/gps');
 const { ACCEPTED_LOCATION_STATUSES, COMPLETED_VISIT_STATUSES } = require('../../../shared/visit-coverage');
+const { validateGpsEvidence } = require('../../../shared/gps-evidence');
 
 const router = express.Router();
 const storage = multer.diskStorage({
@@ -261,6 +262,12 @@ router.post('/moola-plus/agents/:externalAgentId/location/capture', authenticate
       return res.status(400).json({ error: 'Choose the assigned district and capture a valid GPS location.' });
     }
     if (accuracy > 20) return res.status(422).json({ error: `GPS accuracy is ±${Math.round(accuracy)} m. First-location capture needs 20 m accuracy or better; move to a clearer location and retry.` });
+    const savedLocation = await prisma.moolaAgentLocation.findUnique({ where: { externalAgentId }, select: { latitude: true, longitude: true, locationVerified: true } });
+    const reusingSavedCoordinates = Boolean(savedLocation?.locationVerified && savedLocation.latitude === latitude && savedLocation.longitude === longitude);
+    if (!reusingSavedCoordinates) {
+      const evidence = validateGpsEvidence(req.body.gpsCapturedAt, req.body.gpsSampleCount, { maxAgeMs: 5 * 60 * 1000 });
+      if (!evidence.ok) return res.status(evidence.status).json({ error: evidence.error });
+    }
     if (!(req.user.assignedTerritories || []).includes(territoryId)) return res.status(403).json({ error: 'This district is outside your assigned territory.' });
     const [agent, territory, locationResult] = await Promise.all([
       getUpstreamMoolaAgent(req, externalAgentId),
@@ -301,7 +308,7 @@ router.post('/moola-plus/agents/:externalAgentId/location/capture', authenticate
       });
       return saved;
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, 'CAPTURE_FIRST_VISIT_LOCATION', 'MoolaPlusAgent', externalAgentId, { territoryId, accuracyMeters: accuracy }, req);
+    await logAction(req.user.id, 'CAPTURE_FIRST_VISIT_LOCATION', 'MoolaPlusAgent', externalAgentId, { territoryId, accuracyMeters: accuracy, gpsCapturedAt: req.body.gpsCapturedAt || null, gpsSampleCount: req.body.gpsSampleCount || null }, req);
     res.status(201).json({
       ...result,
       territoryId: result.territoryId, sectorId: result.sectorId, cellId: result.cellId, villageId: result.villageId,
@@ -541,8 +548,10 @@ router.post('/moola-plus/check-in', authenticateToken, requireTerritoryAccess, r
     const territoryId = String(req.body.territoryId || '').trim();
     const { tcLatitude, tcLongitude, gpsAccuracyMeters } = req.body;
     const hasGps = validCoordinates(tcLatitude, tcLongitude, gpsAccuracyMeters);
+    const gpsEvidence = validateGpsEvidence(req.body.gpsCapturedAt, req.body.gpsSampleCount, { maxAgeMs: 30_000 });
     const requestedVisitId = typeof req.body.visitId === 'string' ? req.body.visitId.trim() : '';
     if (!externalAgentId || externalAgentId.length > 200 || !territoryId || !hasGps) return res.status(400).json({ error: 'Choose an agent and assigned district, then capture a fresh GPS location to check in.' });
+    if (!gpsEvidence.ok) return res.status(gpsEvidence.status).json({ error: gpsEvidence.error });
     if (requestedVisitId && (requestedVisitId.length > 80 || !/^[A-Za-z0-9_-]+$/.test(requestedVisitId))) return res.status(400).json({ error: 'The client visit ID is invalid.' });
     if (!(req.user.assignedTerritories || []).includes(territoryId)) return res.status(403).json({ error: 'This district is outside your assigned territory.' });
     const [agent, territory, config, existingVisit] = await Promise.all([
@@ -627,7 +636,7 @@ router.post('/moola-plus/check-in', authenticateToken, requireTerritoryAccess, r
       await tx.moolaAgentTransfer.updateMany({ where: { externalAgentId, recipientTcId: req.user.id, status: 'PENDING', acceptedAt: { not: null } }, data: { status: 'COMPLETED', completedAt: checkInTime } });
       return created;
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, 'CREATE_VISIT', 'MoolaPlusVisit', visit.id, { visitId: visit.visitId, externalAgentId, territoryId, locationStatus: visit.locationStatus, locationMethod: visit.locationMethod }, req);
+    await logAction(req.user.id, 'CREATE_VISIT', 'MoolaPlusVisit', visit.id, { visitId: visit.visitId, externalAgentId, territoryId, locationStatus: visit.locationStatus, locationMethod: visit.locationMethod, gpsCapturedAt: gpsEvidence.capturedAt.toISOString(), gpsSampleCount: gpsEvidence.sampleCount }, req);
     res.status(201).json({ ...visit, radiusMeters });
   } catch (error) {
     console.error('Moola Plus check-in error:', error.code || error.name);
@@ -717,8 +726,10 @@ router.post('/check-in', authenticateToken, requireTerritoryAccess, requireRole(
   try {
     const { agentId, tcLatitude, tcLongitude, gpsAccuracyMeters } = req.body;
     const hasGps = validCoordinates(tcLatitude, tcLongitude, gpsAccuracyMeters);
+    const gpsEvidence = validateGpsEvidence(req.body.gpsCapturedAt, req.body.gpsSampleCount, { maxAgeMs: 30_000 });
     const requestedVisitId = typeof req.body.visitId === 'string' ? req.body.visitId.trim() : '';
     if (!agentId || !hasGps) return res.status(400).json({ error: 'Choose an agent and capture a fresh GPS location to check in.' });
+    if (!gpsEvidence.ok) return res.status(gpsEvidence.status).json({ error: gpsEvidence.error });
     if (requestedVisitId && (requestedVisitId.length > 80 || !/^[A-Za-z0-9_-]+$/.test(requestedVisitId))) return res.status(400).json({ error: 'The client visit ID is invalid.' });
 
     const agent = await prisma.agent.findUnique({
@@ -803,7 +814,7 @@ router.post('/check-in', authenticateToken, requireTerritoryAccess, requireRole(
       if (pendingTransfer) await tx.agentTransfer.update({ where: { id: pendingTransfer.id }, data: { status: 'COMPLETED', completedAt: created.checkInTime } });
       return created;
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, 'CREATE_VISIT', 'Visit', visit.id, { visitId: visit.visitId, locationStatus, locationMethod: visit.locationMethod }, req);
+    await logAction(req.user.id, 'CREATE_VISIT', 'Visit', visit.id, { visitId: visit.visitId, locationStatus, locationMethod: visit.locationMethod, gpsCapturedAt: gpsEvidence.capturedAt.toISOString(), gpsSampleCount: gpsEvidence.sampleCount }, req);
     if (firstVisit) await logAction(req.user.id, pendingTransfer ? 'COMPLETE_AGENT_TRANSFER' : 'COMPLETE_AGENT_FIRST_VISIT', 'Agent', agent.id, {
       agentName: agent.name, agentCode: agent.agentId, territoryId: agent.territoryId,
       sectorId: agent.sectorId, cellId: agent.cellId, villageId: agent.villageId, transferId: pendingTransfer?.id || null,
@@ -899,9 +910,12 @@ router.put('/:id/check-out', authenticateToken, requireRole('ADMIN', 'MANAGER', 
     const visit = await prisma.visit.findUnique({ where: { id: req.params.id }, include: { photos: true, report: true } });
     if (!visit) return res.status(404).json({ error: 'Visit not found.' });
     if (req.user.role === 'TC' && visit.tcId !== req.user.id) return res.status(403).json({ error: 'You cannot complete this visit.' });
+    if (visit.visitStatus === 'COMPLETED') return res.json(visit);
+    if (visit.visitStatus !== 'STARTED') return res.status(409).json({ error: 'This visit is not open for completion. Start a new check-in at the agent’s location.' });
+    if (visit.locationStatus !== 'VERIFIED' || visit.locationMethod !== 'GPS') return res.status(409).json({ error: 'This visit has no verified GPS check-in and cannot continue. Start again at the agent’s location.' });
     if (!visit.photos.length) return res.status(400).json({ error: 'Capture a visit photo before checking out.' });
     if (!visit.report) return res.status(400).json({ error: 'Complete the visit report before checking out.' });
-    const visitStatus = visit.locationStatus === 'VERIFIED' ? 'COMPLETED' : 'FLAGGED';
+    const visitStatus = 'COMPLETED';
     const checkOutTime = new Date();
     const updatedVisit = await prisma.$transaction(async (tx) => {
       let countsForMetrics = false;
@@ -1050,6 +1064,11 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
       const hasGps = validCoordinates(tcLatitude, tcLongitude, accuracy);
       if (!hasGps) return res.status(400).json({ error: 'An offline visit needs a fresh GPS reading.' });
       if (accuracy > 50) return res.status(422).json({ error: 'GPS accuracy must be 50 metres or better before an offline visit can sync.' });
+      const visitDate = new Date(item.visitDate || item.checkInTime || Date.now());
+      const checkInTime = new Date(item.checkInTime || item.visitDate || Date.now());
+      if (Number.isNaN(visitDate.getTime()) || Number.isNaN(checkInTime.getTime())) return res.status(400).json({ error: 'An offline visit has an invalid visit time.' });
+      const gpsEvidence = validateGpsEvidence(item.gpsCapturedAt, item.gpsSampleCount, { referenceTime: checkInTime, maxAgeMs: 30_000, requireEvidence: false });
+      if (!gpsEvidence.ok) return res.status(gpsEvidence.status).json({ error: gpsEvidence.error });
       const needsLocationCapture = Boolean(agent.registeredLatitude == null || agent.registeredLongitude == null || !agent.locationVerified || (!agent.firstVisitCompletedAt && !agent.firstVisitLocationCapturedAt));
       let registeredLatitude = agent.registeredLatitude;
       let registeredLongitude = agent.registeredLongitude;
@@ -1064,6 +1083,8 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
         if (!captured || typeof captured.latitude !== 'number' || typeof captured.longitude !== 'number' || typeof captured.accuracy !== 'number' || !Number.isFinite(captured.latitude) || !Number.isFinite(captured.longitude) || !Number.isFinite(captured.accuracy) || captured.latitude < -90 || captured.latitude > 90 || captured.longitude < -180 || captured.longitude > 180 || captured.accuracy < 0 || captured.accuracy > 20) {
           return res.status(400).json({ error: 'Capture the agent’s cell, village and GPS location with accuracy of 20 metres or better before syncing the first visit.' });
         }
+        const agentGpsEvidence = validateGpsEvidence(captured.gpsCapturedAt, captured.gpsSampleCount, { referenceTime: checkInTime, maxAgeMs: 10 * 60 * 1000, requireEvidence: false });
+        if (!agentGpsEvidence.ok) return res.status(agentGpsEvidence.status).json({ error: agentGpsEvidence.error });
         venue = String(captured.venue || '').trim();
         if (!venue) return res.status(400).json({ error: 'The offline first-visit record needs the agent’s venue.' });
         if (venue.length > 200) return res.status(400).json({ error: 'Venue must be 200 characters or fewer.' });
@@ -1109,9 +1130,6 @@ router.post('/sync', authenticateToken, requireTerritoryAccess, requireRole('TC'
       if (!agent.firstVisitCompletedAt && !needsLocationCapture && !agent.firstVisitLocationCapturedAt) return res.status(400).json({ error: 'The first-visit GPS capture is missing. Refresh the agent record before syncing.' });
       const distanceMeters = hasGps ? calculateDistance(tcLatitude, tcLongitude, registeredLatitude, registeredLongitude) : null;
       if (distanceMeters == null || distanceMeters > radiusMeters) return res.status(403).json({ error: `You are ${Math.round(distanceMeters || 0)} metres from the agent’s saved location. Sync is allowed only within the configured ${radiusMeters} metre radius.` });
-      const visitDate = new Date(item.visitDate || item.checkInTime || Date.now());
-      const checkInTime = new Date(item.checkInTime || item.visitDate || Date.now());
-      if (Number.isNaN(visitDate.getTime()) || Number.isNaN(checkInTime.getTime())) return res.status(400).json({ error: 'An offline visit has an invalid visit time.' });
       const existingVisit = await prisma.visit.findUnique({ where: { visitId: item.visitId }, select: { id: true, tcId: true, agentId: true, countsForMetrics: true } });
       if (existingVisit && (existingVisit.tcId !== req.user.id || existingVisit.agentId !== agent.id)) return res.status(409).json({ error: 'This client visit ID already belongs to another visit.' });
       validated.push({ item, agent, territoryId, sectorId, cellId, villageId, venue, transfer, tcLatitude, tcLongitude, accuracy, hasGps, distanceMeters, registeredLatitude, registeredLongitude, registeredAccuracy, needsLocationCapture, existingVisit, visitDate, checkInTime });
