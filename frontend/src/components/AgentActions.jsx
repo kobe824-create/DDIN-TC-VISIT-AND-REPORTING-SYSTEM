@@ -8,6 +8,7 @@ export default function AgentActions({ agent, assignedTerritories = [], onAgentC
   const [territories, setTerritories] = useState([]);
   const [territoriesStatus, setTerritoriesStatus] = useState('idle');
   const [mode, setMode] = useState('');
+  const [territoryId, setTerritoryId] = useState(agent.territoryId || '');
   const [sectorId, setSectorId] = useState(agent.sectorId || '');
   const [cellId, setCellId] = useState(agent.cellId || '');
   const [villageId, setVillageId] = useState(agent.villageId || '');
@@ -26,7 +27,8 @@ export default function AgentActions({ agent, assignedTerritories = [], onAgentC
 
   const assigned = useMemo(() => assignedIds(assignedTerritories), [assignedTerritories]);
   const districts = useMemo(() => territories.filter((item) => item.type === 'DISTRICT' && item.isActive && assigned.includes(item.id)), [territories, assigned]);
-  const sectors = useMemo(() => territories.filter((item) => item.type === 'SECTOR' && item.isActive && item.parentId === agent.territoryId), [territories, agent.territoryId]);
+  const formTerritoryId = mode === 'INITIAL' ? territoryId : agent.territoryId;
+  const sectors = useMemo(() => territories.filter((item) => item.type === 'SECTOR' && item.isActive && item.parentId === formTerritoryId), [territories, formTerritoryId]);
   const cells = useMemo(() => territories.filter((item) => item.type === 'CELL' && item.isActive && item.parentId === sectorId), [territories, sectorId]);
   const villages = useMemo(() => territories.filter((item) => item.type === 'VILLAGE' && item.isActive && item.parentId === cellId), [territories, cellId]);
   const activeTransfer = agent.transfers?.find((item) => item.status === 'PENDING');
@@ -51,6 +53,12 @@ export default function AgentActions({ agent, assignedTerritories = [], onAgentC
     setError('');
     setNotice('');
     setReason('');
+    const initialDistrictId = assigned.includes(agent.territoryId) ? agent.territoryId : '';
+    setTerritoryId(nextMode === 'INITIAL' ? initialDistrictId : agent.territoryId);
+    setSectorId(nextMode === 'INITIAL' && !initialDistrictId ? '' : (agent.sectorId || ''));
+    setCellId(nextMode === 'INITIAL' && !initialDistrictId ? '' : (agent.cellId || ''));
+    setVillageId(nextMode === 'INITIAL' && !initialDistrictId ? '' : (agent.villageId || ''));
+    setVenue(nextMode === 'INITIAL' && !initialDistrictId ? '' : (agent.venue || ''));
     void loadTerritories();
   };
 
@@ -58,21 +66,22 @@ export default function AgentActions({ agent, assignedTerritories = [], onAgentC
     event.preventDefault();
     setError('');
     setNotice('');
-    if (!agent.territoryId || !sectorId || !cellId || !villageId || !venue.trim()) {
-      setError('Choose the agent’s sector, cell and village, and enter the venue.');
+    const destinationTerritoryId = mode === 'INITIAL' ? territoryId : agent.territoryId;
+    if (!destinationTerritoryId || !sectorId || !cellId || !villageId || !venue.trim()) {
+      setError('Choose the district, sector, cell and village, and enter the venue.');
       return;
     }
     setSaving(true);
     try {
       if (mode === 'INITIAL') {
         const { data } = await api.patch(`/api/v1/agents/${encodeURIComponent(agent.id)}/location-details`, {
-          territoryId: agent.territoryId, sectorId, cellId, villageId, venue: venue.trim(),
+          territoryId: destinationTerritoryId, sectorId, cellId, villageId, venue: venue.trim(),
         });
         onAgentChange?.({ ...agent, ...data });
         setNotice('Location details saved. Any later change must be sent to an administrator.');
       } else {
         const { data } = await api.post(`/api/v1/agents/${encodeURIComponent(agent.id)}/relocation-requests`, {
-          territoryId: agent.territoryId, sectorId, cellId, villageId, venue: venue.trim(), reason: reason.trim(),
+          territoryId: destinationTerritoryId, sectorId, cellId, villageId, venue: venue.trim(), reason: reason.trim(),
         });
         const targetDistrict = districts.find((item) => item.id === data.toTerritoryId);
         const request = {
@@ -139,17 +148,17 @@ export default function AgentActions({ agent, assignedTerritories = [], onAgentC
     {relocation ? <div className="agent-request-status" role="status"><strong>Location change awaiting administrator review</strong><span>{relocation.destinationPath || relocation.toTerritory?.name ? `Destination: ${relocation.destinationPath || relocation.toTerritory?.name}${relocation.destinationVenue || relocation.toVenue ? ` · ${relocation.destinationVenue || relocation.toVenue}` : ''} · ` : ''}Requested {relocation.requestedAt ? new Date(relocation.requestedAt).toLocaleDateString() : 'just now'} · the saved location stays active until approval.</span></div>
       : activeTransfer ? <div className="agent-request-status"><strong>{activeTransfer.acceptedAt ? 'Transfer accepted — record the new location before visiting' : `Transfer request pending in ${currentTransfer}`}</strong><span>{activeTransfer.acceptedAt ? 'Open Start visit to capture the agent’s current GPS and village.' : 'The agent remains assigned to this district until the receiving TC reviews the request.'}</span></div>
         : !hasSavedLocationDetails ? <>
-          <div className="agent-request-status"><strong>Current district: {currentDistrict}</strong><span>Fill in the sector, cell, village and venue. This save is available once; later corrections go to an administrator.</span></div>
-          {mode !== 'INITIAL' && <button type="button" className="agent-transfer-toggle" onClick={() => openLocationForm('INITIAL')}><MapPin size={15} />Complete agent location details</button>}
-          {mode === 'INITIAL' && <LocationForm {...{ mode, agent, sectors, cells, villages, sectorId, setSectorId, cellId, setCellId, villageId, setVillageId, venue, setVenue, reason, setReason, saving, error, territoriesStatus, onSubmit: submitLocation, onCancel: () => setMode('') }} />}
+          <div className="agent-request-status"><strong>First location assignment</strong><span>Choose one of your assigned districts and complete the location details once. Later moves require administrator review.</span></div>
+          {mode !== 'INITIAL' && <button type="button" className="agent-transfer-toggle" onClick={() => openLocationForm('INITIAL')}><MapPin size={15} />Set first agent location</button>}
+          {mode === 'INITIAL' && <LocationForm {...{ mode, agent, districts, territoryId, setTerritoryId, sectors, cells, villages, sectorId, setSectorId, cellId, setCellId, villageId, setVillageId, venue, setVenue, reason, setReason, saving, error, territoriesStatus, onSubmit: submitLocation, onCancel: () => setMode('') }} />}
         </> : <>
-          <div className="agent-request-status"><strong>Location details saved once</strong><span>For a later move or correction inside {currentDistrict}, send a request to an administrator. Moving to another district still uses the TC transfer process.</span></div>
-          {mode !== 'REQUEST' && <button type="button" className="agent-transfer-toggle" onClick={() => openLocationForm('REQUEST')}><MapPin size={15} />Request a location change</button>}
-          {mode === 'REQUEST' && <LocationForm {...{ mode, agent, sectors, cells, villages, sectorId, setSectorId, cellId, setCellId, villageId, setVillageId, venue, setVenue, reason, setReason, saving, error, territoriesStatus, onSubmit: submitLocation, onCancel: () => setMode('') }} />}
+          <div className="agent-request-status"><strong>Location details saved once</strong><span>Moves inside {currentDistrict} need administrator approval. Transfers to another TC’s district use the separate transfer request below.</span></div>
+          {mode !== 'REQUEST' && <button type="button" className="agent-transfer-toggle" onClick={() => openLocationForm('REQUEST')}><MapPin size={15} />Relocate within territory</button>}
+          {mode === 'REQUEST' && <LocationForm {...{ mode, agent, districts, territoryId: agent.territoryId, setTerritoryId, sectors, cells, villages, sectorId, setSectorId, cellId, setCellId, villageId, setVillageId, venue, setVenue, reason, setReason, saving, error, territoriesStatus, onSubmit: submitLocation, onCancel: () => setMode('') }} />}
         </>}
 
     <div className="agent-transfer-section">
-      {activeTransfer || relocation ? null : <>
+      {activeTransfer || relocation || !hasSavedLocationDetails ? null : <>
         <button type="button" className="agent-transfer-toggle" onClick={openTransfer}><ArrowRightLeft size={15} />{transferOpen ? 'Close transfer request' : 'Transfer to another TC’s district'}</button>
         {transferOpen && <form className="agent-relocation-form" onSubmit={requestTransfer}>
           <label>Destination district<select value={transferTerritoryId} onChange={(event) => { const target = transferTargets.find((item) => item.id === event.target.value); setTransferTerritoryId(event.target.value); setRecipientTcId(target?.coordinators?.[0]?.id || ''); }} required disabled={transferTargetsStatus !== 'loaded' || !transferTargets.length}><option value="">{transferTargetsStatus === 'loading' ? 'Loading districts…' : 'Choose district'}</option>{transferTargets.map((item) => <option key={item.id} value={item.id}>{item.name}{item.province ? ` — ${item.province}` : ''}</option>)}</select></label>
@@ -168,17 +177,20 @@ export default function AgentActions({ agent, assignedTerritories = [], onAgentC
   </section>;
 }
 
-function LocationForm({ mode, agent, sectors, cells, villages, sectorId, setSectorId, cellId, setCellId, villageId, setVillageId, venue, setVenue, reason, setReason, saving, error, territoriesStatus, onSubmit, onCancel }) {
+function LocationForm({ mode, agent, districts, territoryId, setTerritoryId, sectors, cells, villages, sectorId, setSectorId, cellId, setCellId, villageId, setVillageId, venue, setVenue, reason, setReason, saving, error, territoriesStatus, onSubmit, onCancel }) {
+  const districtName = districts.find((item) => item.id === territoryId)?.name || agent.territory?.name || '';
   return <form className="agent-relocation-form" onSubmit={onSubmit}>
-    <h4>{mode === 'INITIAL' ? 'Complete location details' : 'Request an administrator-approved change'}</h4>
-    <label>District<input value={agent.territory?.name || agent.territoryId} readOnly /></label>
+    <h4>{mode === 'INITIAL' ? 'Set first location' : 'Request in-territory relocation'}</h4>
+    {mode === 'INITIAL'
+      ? <label>District<select value={territoryId} onChange={(event) => { setTerritoryId(event.target.value); setSectorId(''); setCellId(''); setVillageId(''); }} required disabled={territoriesStatus !== 'loaded' || !districts.length}><option value="">Choose an assigned district</option>{districts.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+      : <label>District<input value={districtName || agent.territoryId} readOnly /></label>}
     <div className="agent-relocation-grid">
-      <label>Sector<select value={sectorId} onChange={(event) => { setSectorId(event.target.value); setCellId(''); setVillageId(''); }} required disabled={territoriesStatus !== 'loaded'}><option value="">Choose sector</option>{sectors.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+      <label>Sector<select value={sectorId} onChange={(event) => { setSectorId(event.target.value); setCellId(''); setVillageId(''); }} required disabled={territoriesStatus !== 'loaded' || !territoryId}><option value="">Choose sector</option>{sectors.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
       <label>Cell<select value={cellId} onChange={(event) => { setCellId(event.target.value); setVillageId(''); }} required disabled={territoriesStatus !== 'loaded' || !sectorId}><option value="">Choose cell</option>{cells.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
       <label>Village<select value={villageId} onChange={(event) => setVillageId(event.target.value)} required disabled={territoriesStatus !== 'loaded' || !cellId}><option value="">Choose village</option>{villages.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
     </div>
     <label>Venue<input className="input" maxLength={200} value={venue} onChange={(event) => setVenue(event.target.value)} placeholder="Agent’s business or service location" required /></label>
-    {mode === 'REQUEST' && <label className="agent-request-reason">Reason<textarea rows={2} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Why does the location need to change?" /></label>}
+    {mode === 'REQUEST' && <label className="agent-request-reason">Reason<textarea rows={2} maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Why does the location need to change?" required /></label>}
     {error && <p className="agent-request-error" role="alert">{error}</p>}
     <div className="agent-request-actions"><button className="btn btn-primary" type="submit" disabled={saving || territoriesStatus !== 'loaded' || !sectorId || !cellId || !villageId || !venue.trim()}><Send size={15} />{saving ? (mode === 'INITIAL' ? 'Saving…' : 'Sending request…') : mode === 'INITIAL' ? 'Save location once' : 'Send request to admin'}</button><button className="btn btn-secondary" type="button" onClick={onCancel} disabled={saving}>Cancel</button></div>
   </form>;

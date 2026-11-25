@@ -504,11 +504,14 @@ async function ensureIremboFieldAgent(req, agentCode) {
   const source = await fetchIremboSourceAgent(req, code);
   if (source.localAgentId) {
     const linked = await prisma.agent.findUnique({ where: { id: source.localAgentId } });
-    if (linked) return linked;
+    if (linked) {
+      if (req.user.role === 'TC' && linked.tcLocationDetailsCompletedAt && !(req.user.assignedTerritories || []).includes(linked.territoryId)) throw Object.assign(new Error('This Irembo agent is outside your assigned district.'), { statusCode: 403 });
+      return linked;
+    }
   }
   const existing = await prisma.agent.findFirst({ where: { agentId: { equals: String(source.agentId || code), mode: 'insensitive' } } });
   if (existing) {
-    if (req.user.role === 'TC' && !(req.user.assignedTerritories || []).includes(existing.territoryId)) throw Object.assign(new Error('This Irembo agent is outside your assigned district.'), { statusCode: 403 });
+    if (req.user.role === 'TC' && existing.tcLocationDetailsCompletedAt && !(req.user.assignedTerritories || []).includes(existing.territoryId)) throw Object.assign(new Error('This Irembo agent is outside your assigned district.'), { statusCode: 403 });
     return existing;
   }
 
@@ -520,9 +523,12 @@ async function ensureIremboFieldAgent(req, agentCode) {
   const districtMatches = allAreas.filter((area) => area.type === 'DISTRICT'
     && normalizeAreaLabel(area.name) === normalizeAreaLabel(source.district)
     && (!province || area.parentId === province.id));
-  if (districtMatches.length !== 1) throw Object.assign(new Error('This Irembo record is not linked because its district does not match one active system district.'), { statusCode: 409 });
-  const territory = districtMatches[0];
-  if (req.user.role === 'TC' && !(req.user.assignedTerritories || []).includes(territory.id)) throw Object.assign(new Error('This Irembo agent is outside your assigned district.'), { statusCode: 403 });
+  let territory = districtMatches.length === 1 ? districtMatches[0] : null;
+  if (req.user.role === 'TC' && (!territory || !(req.user.assignedTerritories || []).includes(territory.id))) {
+    const assignedDistrictIds = req.user.assignedTerritories || [];
+    territory = allAreas.filter((area) => area.type === 'DISTRICT' && assignedDistrictIds.includes(area.id)).sort((a, b) => a.name.localeCompare(b.name))[0] || null;
+  }
+  if (!territory) throw Object.assign(new Error('This Irembo record has no matching active district. Ask an administrator to confirm its territory.'), { statusCode: 409 });
   const findChild = (type, parentId, name) => allAreas.find((area) => area.type === type && area.parentId === parentId && normalizeAreaLabel(area.name) === normalizeAreaLabel(name));
   const sector = findChild('SECTOR', territory.id, source.sector);
   const cell = sector && findChild('CELL', sector.id, source.cell);
@@ -1584,8 +1590,9 @@ router.patch('/movement-notices/:id/read', authenticateToken, requireRole('TC'),
 });
 
 router.get('/:id/transfer-targets', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
-  const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, territoryId: true, firstVisitLocationCapturedAt: true, firstVisitCompletedAt: true } });
+  const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, territoryId: true, firstVisitLocationCapturedAt: true, firstVisitCompletedAt: true, tcLocationDetailsCompletedAt: true } });
   if (!agent) return res.status(404).json({ error: 'Agent not found.' });
+  if (!agent.tcLocationDetailsCompletedAt) return res.status(409).json({ error: 'Complete the agent’s first location assignment before requesting a TC transfer.' });
   if (!(req.user.assignedTerritories || []).includes(agent.territoryId)) return res.status(403).json({ error: 'This agent is outside your assigned district.' });
   const assignments = await prisma.tcTerritoryAssignment.findMany({
     where: { isActive: true, territoryId: { notIn: req.user.assignedTerritories || [] }, territory: { is: { type: 'DISTRICT', isActive: true } }, tc: { is: { role: 'TC', isActive: true } } },
@@ -1604,7 +1611,7 @@ router.get('/:id/transfer-targets', authenticateToken, requireTerritoryAccess, r
 router.post('/irembo/:agentCode/field-record', authenticateToken, requireTerritoryAccess, requireRole('ADMIN', 'TC'), async (req, res) => {
   try {
     const agent = await ensureIremboFieldAgent(req, req.params.agentCode);
-    if (req.user.role === 'TC' && !(req.user.assignedTerritories || []).includes(agent.territoryId)) return res.status(403).json({ error: 'This Irembo agent is outside your assigned district.' });
+    if (req.user.role === 'TC' && agent.tcLocationDetailsCompletedAt && !(req.user.assignedTerritories || []).includes(agent.territoryId)) return res.status(403).json({ error: 'This Irembo agent is outside your assigned district.' });
     await logAction(req.user.id, 'LINK_IREMBO_FIELD_RECORD', 'Agent', agent.id, { agentCode: agent.agentId }, req);
     res.json(agent);
   } catch (error) {
@@ -1723,8 +1730,9 @@ router.put('/transfer-holds/:id/route', authenticateToken, requireRole('ADMIN'),
 
 router.post('/:id/transfer', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
   try {
-    const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, territoryId: true, name: true, agentId: true, phoneNumber: true } });
+    const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, territoryId: true, name: true, agentId: true, phoneNumber: true, tcLocationDetailsCompletedAt: true } });
     if (!agent) return res.status(404).json({ error: 'Agent not found.' });
+    if (!agent.tcLocationDetailsCompletedAt) return res.status(409).json({ error: 'Complete the agent’s first location assignment before requesting a TC transfer.' });
     if (!(req.user.assignedTerritories || []).includes(agent.territoryId)) return res.status(403).json({ error: 'This agent is outside your assigned district.' });
     if (!String(agent.phoneNumber || '').trim()) return res.status(409).json({ error: 'Add the agent’s phone number before requesting a transfer so the receiving TC can call and confirm their location.' });
     const toTerritoryId = String(req.body.toTerritoryId || '');
@@ -1866,7 +1874,6 @@ router.patch('/:id/location-details', authenticateToken, requireTerritoryAccess,
       venue: true, tcLocationDetailsCompletedAt: true, registeredLatitude: true, registeredLongitude: true,
     } });
     if (!agent) return res.status(404).json({ error: 'Agent not found.' });
-    if (!(req.user.assignedTerritories || []).includes(agent.territoryId)) return res.status(403).json({ error: 'This agent is outside your assigned district.' });
     if (agent.tcLocationDetailsCompletedAt) return res.status(409).json({ error: 'These location details have already been saved once. Send a relocation request to an administrator for any correction.' });
 
     const territoryId = String(req.body.territoryId || agent.territoryId).trim();
@@ -1874,13 +1881,15 @@ router.patch('/:id/location-details', authenticateToken, requireTerritoryAccess,
     const cellId = String(req.body.cellId || '').trim();
     const villageId = String(req.body.villageId || '').trim();
     const venue = String(req.body.venue || '').trim();
-    if (territoryId !== agent.territoryId) return res.status(400).json({ error: 'This one-time update is limited to the agent’s current district. Use a transfer to move the agent to another TC.' });
+    if (!(req.user.assignedTerritories || []).includes(territoryId)) return res.status(403).json({ error: 'Choose a district assigned to your account for this first location assignment.' });
+    const destinationDistrict = await prisma.territory.findUnique({ where: { id: territoryId }, select: { id: true, type: true, isActive: true } });
+    if (!destinationDistrict || destinationDistrict.type !== 'DISTRICT' || !destinationDistrict.isActive) return res.status(400).json({ error: 'Choose an active district.' });
     if (!venue) return res.status(400).json({ error: 'Enter the agent’s venue.' });
     if (venue.length > 200) return res.status(400).json({ error: 'Venue must be 200 characters or fewer.' });
     const hierarchyError = await validateAgentHierarchy({ territoryId, sectorId, cellId, villageId });
     if (hierarchyError) return res.status(400).json({ error: hierarchyError });
     const address = await areaAddress({ villageId });
-    const locationChanged = agent.sectorId !== sectorId || agent.cellId !== cellId || agent.villageId !== villageId || agent.venue !== venue;
+    const locationChanged = agent.territoryId !== territoryId || agent.sectorId !== sectorId || agent.cellId !== cellId || agent.villageId !== villageId || agent.venue !== venue;
     const saved = await prisma.$transaction(async (tx) => {
       await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
       const [current, pendingRequest, pendingTransfer] = await Promise.all([
@@ -1905,7 +1914,7 @@ router.patch('/:id/location-details', authenticateToken, requireTerritoryAccess,
     }, { maxWait: 10000, timeout: 15000 });
     await logAction(req.user.id, 'SAVE_TC_AGENT_LOCATION_DETAILS', 'Agent', agent.id, {
       agentName: agent.name, agentCode: agent.agentId,
-      from: { sectorId: agent.sectorId, cellId: agent.cellId, villageId: agent.villageId, venue: agent.venue },
+      from: { territoryId: agent.territoryId, sectorId: agent.sectorId, cellId: agent.cellId, villageId: agent.villageId, venue: agent.venue },
       to: { territoryId, sectorId, cellId, villageId, venue }, gpsCleared: locationChanged,
     }, req);
     res.json(saved);
@@ -2161,7 +2170,7 @@ router.get('/:id', authenticateToken, requireTerritoryAccess, requireRole('ADMIN
         prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, status: 'PENDING' }, select: { id: true } }),
         prisma.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'APPROVED' }, select: { id: true } }),
       ]);
-      if (!assignments.some((assignment) => assignment.territoryId === agent.territoryId) && !pendingTransfer) return res.status(403).json({ error: 'Access denied to this agent.' });
+      if (!assignments.some((assignment) => assignment.territoryId === agent.territoryId) && !pendingTransfer && agent.tcLocationDetailsCompletedAt) return res.status(403).json({ error: 'Access denied to this agent.' });
       agent.tcRelocationUsed = Boolean(approvedRelocation);
     }
     if (req.user.role === 'CHAMPION' && agent.championId !== req.user.id) return res.status(403).json({ error: 'Access denied to this agent.' });
