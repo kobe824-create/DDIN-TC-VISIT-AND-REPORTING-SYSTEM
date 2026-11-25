@@ -1590,9 +1590,8 @@ router.patch('/movement-notices/:id/read', authenticateToken, requireRole('TC'),
 });
 
 router.get('/:id/transfer-targets', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
-  const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, territoryId: true, firstVisitLocationCapturedAt: true, firstVisitCompletedAt: true, tcLocationDetailsCompletedAt: true } });
+  const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, territoryId: true, tcLocationDetailsCompletedAt: true } });
   if (!agent) return res.status(404).json({ error: 'Agent not found.' });
-  if (!agent.tcLocationDetailsCompletedAt) return res.status(409).json({ error: 'Complete the agent’s first location assignment before requesting a TC transfer.' });
   if (!(req.user.assignedTerritories || []).includes(agent.territoryId)) return res.status(403).json({ error: 'This agent is outside your assigned district.' });
   const assignments = await prisma.tcTerritoryAssignment.findMany({
     where: { isActive: true, territoryId: { notIn: req.user.assignedTerritories || [] }, territory: { is: { type: 'DISTRICT', isActive: true } }, tc: { is: { role: 'TC', isActive: true } } },
@@ -1732,9 +1731,7 @@ router.post('/:id/transfer', authenticateToken, requireTerritoryAccess, requireR
   try {
     const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: { id: true, territoryId: true, name: true, agentId: true, phoneNumber: true, tcLocationDetailsCompletedAt: true } });
     if (!agent) return res.status(404).json({ error: 'Agent not found.' });
-    if (!agent.tcLocationDetailsCompletedAt) return res.status(409).json({ error: 'Complete the agent’s first location assignment before requesting a TC transfer.' });
     if (!(req.user.assignedTerritories || []).includes(agent.territoryId)) return res.status(403).json({ error: 'This agent is outside your assigned district.' });
-    if (!String(agent.phoneNumber || '').trim()) return res.status(409).json({ error: 'Add the agent’s phone number before requesting a transfer so the receiving TC can call and confirm their location.' });
     const toTerritoryId = String(req.body.toTerritoryId || '');
     const recipientTcId = String(req.body.recipientTcId || '');
     const destination = toTerritoryId ? await prisma.territory.findUnique({ where: { id: toTerritoryId }, select: { id: true, type: true, isActive: true } }) : null;
@@ -1743,34 +1740,52 @@ router.post('/:id/transfer', authenticateToken, requireTerritoryAccess, requireR
     }
     const receiverAssignment = await prisma.tcTerritoryAssignment.findFirst({ where: { tcId: recipientTcId, territoryId: toTerritoryId, isActive: true, tc: { is: { role: 'TC', isActive: true } } } });
     if (!receiverAssignment) return res.status(400).json({ error: 'Choose an active coordinator assigned to the destination district.' });
-    const transfer = await prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx) => {
       await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
-      const existingTransfer = await tx.agentTransfer.findFirst({ where: { agentId: agent.id, status: 'PENDING' } });
+      const [existingTransfer, pendingRelocation, completedTransfer, approvedRelocation] = await Promise.all([
+        tx.agentTransfer.findFirst({ where: { agentId: agent.id, status: { in: ['PENDING', 'ON_HOLD'] } } }),
+        tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'PENDING' }, select: { id: true } }),
+        tx.agentTransfer.findFirst({ where: { agentId: agent.id, OR: [{ status: 'COMPLETED' }, { acceptedAt: { not: null } }] }, select: { id: true } }),
+        tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'APPROVED' }, select: { id: true } }),
+      ]);
       if (existingTransfer) {
         const conflict = new Error('This agent already has a pending territory transfer.');
         conflict.statusCode = 409;
         throw conflict;
       }
-      const pendingRelocation = await tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'PENDING' }, select: { id: true } });
       if (pendingRelocation) {
         const conflict = new Error('This agent already has a relocation request awaiting admin review.');
         conflict.statusCode = 409;
         throw conflict;
       }
-      return tx.agentTransfer.create({ data: {
+      const hasUsedTcMove = Boolean(completedTransfer || approvedRelocation);
+      const now = new Date();
+      const transfer = await tx.agentTransfer.create({ data: {
         agentId: agent.id,
         fromTerritoryId: agent.territoryId,
         toTerritoryId,
         requestedByTcId: req.user.id,
         recipientTcId,
         reason: String(req.body.reason || '').trim().slice(0, 500) || null,
+        ...(hasUsedTcMove ? { status: 'ON_HOLD', reviewNote: 'Additional TC transfer requires administrator review.' } : { status: 'COMPLETED', acceptedAt: now, reviewedAt: now, completedAt: now }),
       }, include: { toTerritory: true, recipientTc: { select: { id: true, firstName: true, lastName: true } } } });
+      if (!hasUsedTcMove) {
+        const moved = await tx.agent.updateMany({ where: { id: agent.id, territoryId: agent.territoryId }, data: {
+          territoryId: toTerritoryId, sectorId: null, cellId: null, villageId: null, venue: null, address: null,
+          registeredLatitude: null, registeredLongitude: null, gpsAccuracy: null, locationVerified: false,
+          firstVisitLocationCapturedAt: null, firstVisitCompletedAt: null, tcLocationDetailsCompletedAt: null, isOnHold: false,
+        } });
+        if (!moved.count) throw Object.assign(new Error('The agent’s district changed. Reload the profile and try again.'), { statusCode: 409 });
+      } else {
+        await tx.agent.updateMany({ where: { id: agent.id, territoryId: agent.territoryId }, data: { isOnHold: true } });
+      }
+      return { transfer, hasUsedTcMove };
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, 'REQUEST_AGENT_TRANSFER', 'Agent', agent.id, {
-      agentName: agent.name, agentCode: agent.agentId, transferId: transfer.id, fromTerritoryId: agent.territoryId,
-      toTerritoryId, toTerritoryName: transfer.toTerritory.name, recipientTcId, recipientTcName: `${transfer.recipientTc.firstName} ${transfer.recipientTc.lastName}`.trim(),
+    await logAction(req.user.id, result.hasUsedTcMove ? 'REQUEST_ADMIN_AGENT_TRANSFER' : 'COMPLETE_FIRST_AGENT_TRANSFER', 'Agent', agent.id, {
+      agentName: agent.name, agentCode: agent.agentId, transferId: result.transfer.id, fromTerritoryId: agent.territoryId,
+      toTerritoryId, toTerritoryName: result.transfer.toTerritory.name, recipientTcId, recipientTcName: `${result.transfer.recipientTc.firstName} ${result.transfer.recipientTc.lastName}`.trim(),
     }, req);
-    res.status(201).json(transfer);
+    res.status(201).json({ ...result.transfer, tcMoveUsed: true, adminReviewRequired: result.hasUsedTcMove });
   } catch (error) {
     console.error('Agent transfer request failed:', error.code || error.name);
     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
@@ -1871,17 +1886,18 @@ router.patch('/:id/location-details', authenticateToken, requireTerritoryAccess,
   try {
     const agent = await prisma.agent.findUnique({ where: { id: req.params.id }, select: {
       id: true, agentId: true, name: true, territoryId: true, sectorId: true, cellId: true, villageId: true,
-      venue: true, tcLocationDetailsCompletedAt: true, registeredLatitude: true, registeredLongitude: true,
+      venue: true, tcLocationDetailsCompletedAt: true, registeredLatitude: true, registeredLongitude: true, isOnHold: true,
     } });
     if (!agent) return res.status(404).json({ error: 'Agent not found.' });
-    if (agent.tcLocationDetailsCompletedAt) return res.status(409).json({ error: 'These location details have already been saved once. Send a relocation request to an administrator for any correction.' });
 
     const territoryId = String(req.body.territoryId || agent.territoryId).trim();
     const sectorId = String(req.body.sectorId || '').trim();
     const cellId = String(req.body.cellId || '').trim();
     const villageId = String(req.body.villageId || '').trim();
     const venue = String(req.body.venue || '').trim();
-    if (!(req.user.assignedTerritories || []).includes(territoryId)) return res.status(403).json({ error: 'Choose a district assigned to your account for this first location assignment.' });
+    if (!(req.user.assignedTerritories || []).includes(agent.territoryId)) return res.status(403).json({ error: 'This agent is outside your assigned district.' });
+    if (territoryId !== agent.territoryId) return res.status(403).json({ error: 'This action can only locate the agent inside the TC’s current district. Use the separate transfer action to change districts.' });
+    if (agent.isOnHold) return res.status(409).json({ error: 'This agent is on hold until an administrator assigns a coordinator.' });
     const destinationDistrict = await prisma.territory.findUnique({ where: { id: territoryId }, select: { id: true, type: true, isActive: true } });
     if (!destinationDistrict || destinationDistrict.type !== 'DISTRICT' || !destinationDistrict.isActive) return res.status(400).json({ error: 'Choose an active district.' });
     if (!venue) return res.status(400).json({ error: 'Enter the agent’s venue.' });
@@ -1892,32 +1908,44 @@ router.patch('/:id/location-details', authenticateToken, requireTerritoryAccess,
     const locationChanged = agent.territoryId !== territoryId || agent.sectorId !== sectorId || agent.cellId !== cellId || agent.villageId !== villageId || agent.venue !== venue;
     const saved = await prisma.$transaction(async (tx) => {
       await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
-      const [current, pendingRequest, pendingTransfer] = await Promise.all([
+      const [current, pendingRequest, pendingTransfer, completedTransfer, approvedRelocation] = await Promise.all([
         tx.agent.findUnique({ where: { id: agent.id }, select: { territoryId: true, sectorId: true, cellId: true, villageId: true, venue: true, tcLocationDetailsCompletedAt: true } }),
         tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'PENDING' }, select: { id: true } }),
         tx.agentTransfer.findFirst({ where: { agentId: agent.id, status: { in: ['PENDING', 'ON_HOLD'] } }, select: { id: true } }),
+        tx.agentTransfer.findFirst({ where: { agentId: agent.id, OR: [{ status: 'COMPLETED' }, { acceptedAt: { not: null } }] }, select: { id: true } }),
+        tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'APPROVED' }, select: { id: true } }),
       ]);
       if (!current || current.territoryId !== agent.territoryId) throw Object.assign(new Error('The agent’s territory changed. Reload the profile and try again.'), { statusCode: 409 });
       if (current.sectorId !== agent.sectorId || current.cellId !== agent.cellId || current.villageId !== agent.villageId || current.venue !== agent.venue) throw Object.assign(new Error('The agent’s location changed. Reload the profile before saving these details.'), { statusCode: 409 });
-      if (current.tcLocationDetailsCompletedAt) throw Object.assign(new Error('These location details have already been saved once. Send a relocation request to an administrator for any correction.'), { statusCode: 409 });
+      if (completedTransfer || approvedRelocation) throw Object.assign(new Error('The TC one-time move has already been used. Send a relocation request to an administrator.'), { statusCode: 409 });
       if (pendingRequest || pendingTransfer) throw Object.assign(new Error('Resolve the pending transfer or relocation request before saving location details.'), { statusCode: 409 });
+      const locationChanged = current.sectorId !== sectorId || current.cellId !== cellId || current.villageId !== villageId || current.venue !== venue;
+      if (!locationChanged && current.tcLocationDetailsCompletedAt) throw Object.assign(new Error('The agent is already recorded at this location.'), { statusCode: 400 });
+      const now = new Date();
       const updated = await tx.agent.updateMany({
-        where: { id: agent.id, territoryId: agent.territoryId, tcLocationDetailsCompletedAt: null },
+        where: { id: agent.id, territoryId: agent.territoryId },
         data: {
           territoryId, sectorId, cellId, villageId, venue, address,
-          ...(locationChanged ? { registeredLatitude: null, registeredLongitude: null, gpsAccuracy: null, locationVerified: false } : {}),
-          tcLocationDetailsCompletedAt: new Date(),
+          ...(locationChanged ? { registeredLatitude: null, registeredLongitude: null, gpsAccuracy: null, locationVerified: false, firstVisitLocationCapturedAt: null, firstVisitCompletedAt: null } : {}),
+          tcLocationDetailsCompletedAt: current.tcLocationDetailsCompletedAt || now,
         },
       });
-      if (!updated.count) throw Object.assign(new Error('These location details were already saved. Reload the profile to see the latest information.'), { statusCode: 409 });
+      if (!updated.count) throw Object.assign(new Error('The agent’s location changed. Reload the profile and try again.'), { statusCode: 409 });
+      await tx.agentRelocationRequest.create({ data: {
+        agentId: agent.id, fromTerritoryId: agent.territoryId, toTerritoryId: territoryId, toSectorId: sectorId,
+        toCellId: cellId, toVillageId: villageId, toVenue: venue,
+        reason: String(req.body.reason || 'TC one-time in-territory location action').trim().slice(0, 500),
+        requestedByTcId: req.user.id, reviewedById: req.user.id, status: 'APPROVED', requestedAt: now, reviewedAt: now,
+        reviewNote: 'Initial one-time TC move completed directly within the assigned district.',
+      } });
       return tx.agent.findUnique({ where: { id: agent.id }, include: { territory: true, sector: true, cell: true, village: true } });
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, 'SAVE_TC_AGENT_LOCATION_DETAILS', 'Agent', agent.id, {
+    await logAction(req.user.id, 'COMPLETE_FIRST_AGENT_IN_TERRITORY_MOVE', 'Agent', agent.id, {
       agentName: agent.name, agentCode: agent.agentId,
       from: { territoryId: agent.territoryId, sectorId: agent.sectorId, cellId: agent.cellId, villageId: agent.villageId, venue: agent.venue },
       to: { territoryId, sectorId, cellId, villageId, venue }, gpsCleared: locationChanged,
     }, req);
-    res.json(saved);
+    res.json({ ...saved, tcMoveUsed: true });
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
     console.error('TC agent location details save failed:', error.code || error.name);
@@ -1932,7 +1960,6 @@ router.post('/:id/relocation-requests', authenticateToken, requireTerritoryAcces
     if (!agent) return res.status(404).json({ error: 'Agent not found.' });
     const assignedTerritories = req.user.assignedTerritories || [];
     if (!assignedTerritories.includes(agent.territoryId)) return res.status(403).json({ error: 'This agent is outside your assigned district.' });
-    if (!agent.tcLocationDetailsCompletedAt) return res.status(409).json({ error: 'Save the agent’s location details once before requesting a later change.' });
     const toTerritoryId = String(req.body.territoryId || '').trim();
     const toSectorId = String(req.body.sectorId || '').trim();
     const toCellId = String(req.body.cellId || '').trim();
@@ -1948,8 +1975,8 @@ router.post('/:id/relocation-requests', authenticateToken, requireTerritoryAcces
     }
     const request = await prisma.$transaction(async (tx) => {
       await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
-      const currentAgent = await tx.agent.findUnique({ where: { id: agent.id }, select: { territoryId: true, sectorId: true, cellId: true, villageId: true, venue: true, tcLocationDetailsCompletedAt: true } });
-      if (!currentAgent || currentAgent.territoryId !== agent.territoryId || currentAgent.sectorId !== agent.sectorId || currentAgent.cellId !== agent.cellId || currentAgent.villageId !== agent.villageId || currentAgent.venue !== agent.venue || !currentAgent.tcLocationDetailsCompletedAt) {
+      const currentAgent = await tx.agent.findUnique({ where: { id: agent.id }, select: { territoryId: true, sectorId: true, cellId: true, villageId: true, venue: true } });
+      if (!currentAgent || currentAgent.territoryId !== agent.territoryId || currentAgent.sectorId !== agent.sectorId || currentAgent.cellId !== agent.cellId || currentAgent.villageId !== agent.villageId || currentAgent.venue !== agent.venue) {
         const conflict = new Error('The agent changed while this request was being prepared. Reload the profile and try again.');
         conflict.statusCode = 409;
         throw conflict;
@@ -2159,18 +2186,20 @@ router.get('/:id', authenticateToken, requireTerritoryAccess, requireRole('ADMIN
       where: { id: req.params.id },
       include: {
         territory: true, sector: true, cell: true, village: true, champion: true,
-        transfers: { where: { status: 'PENDING' }, select: { id: true, fromTerritoryId: true, toTerritoryId: true, status: true, acceptedAt: true, requestedAt: true, recipientTcId: true, toTerritory: { select: { id: true, name: true } } } },
+        transfers: { where: { status: { in: ['PENDING', 'ON_HOLD'] } }, select: { id: true, fromTerritoryId: true, toTerritoryId: true, status: true, acceptedAt: true, requestedAt: true, recipientTcId: true, toTerritory: { select: { id: true, name: true } } } },
         relocationRequests: { where: { status: 'PENDING' }, orderBy: { requestedAt: 'desc' }, take: 1, select: { id: true, toTerritoryId: true, toSectorId: true, toCellId: true, toVillageId: true, toVenue: true, status: true, requestedAt: true, toTerritory: { select: { name: true } } } },
       }
     });
     if (!agent) return res.status(404).json({ error: 'Not found' });
     if (req.user.role === 'TC') {
-      const [assignments, pendingTransfer, approvedRelocation] = await Promise.all([
+      const [assignments, pendingTransfer, completedTransfer, approvedRelocation] = await Promise.all([
         prisma.tcTerritoryAssignment.findMany({ where: { tcId: req.user.id, isActive: true }, select: { territoryId: true } }),
-        prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, status: 'PENDING' }, select: { id: true } }),
+        prisma.agentTransfer.findFirst({ where: { agentId: agent.id, recipientTcId: req.user.id, status: { in: ['PENDING', 'ON_HOLD'] } }, select: { id: true } }),
+        prisma.agentTransfer.findFirst({ where: { agentId: agent.id, OR: [{ status: 'COMPLETED' }, { acceptedAt: { not: null } }] }, select: { id: true } }),
         prisma.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'APPROVED' }, select: { id: true } }),
       ]);
       if (!assignments.some((assignment) => assignment.territoryId === agent.territoryId) && !pendingTransfer && agent.tcLocationDetailsCompletedAt) return res.status(403).json({ error: 'Access denied to this agent.' });
+      agent.tcMoveUsed = Boolean(completedTransfer || approvedRelocation);
       agent.tcRelocationUsed = Boolean(approvedRelocation);
     }
     if (req.user.role === 'CHAMPION' && agent.championId !== req.user.id) return res.status(403).json({ error: 'Access denied to this agent.' });
