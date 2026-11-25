@@ -48,9 +48,21 @@ export default function IremboAgentDetail() {
       setError(err.response?.data?.error || 'Could not prepare this Irembo agent for a visit.');
     } finally { setLinking(false); }
   };
+  const prepareLocationDetails = async () => {
+    if (!agent?.agentId) return;
+    setLinking(true);
+    setError('');
+    try {
+      const fieldAgentId = agent.localAgentId || (await api.post(`/api/v1/agents/irembo/${encodeURIComponent(agent.agentId || agent.id)}/field-record`)).data.id;
+      const { data } = await api.get(`/api/v1/agents/${encodeURIComponent(fieldAgentId)}`);
+      setLocalAgent(data);
+    } catch (err) {
+      setError(err.response?.data?.error || 'Could not prepare this agent’s location details.');
+    } finally { setLinking(false); }
+  };
 
   return <div className="page agent-detail-page network-agent-detail-page">
-    <PageHeader title={agent?.name || 'Irembo agent'} subtitle={agent?.agentId || 'Agent profile from the Irembo feed.'} breadcrumbs={[{ label: 'Agents', href: '/agents' }, { label: agent?.name || 'Irembo agent' }]} actions={<div className="flex gap-2"><button className="btn btn-secondary" onClick={() => navigate('/agents')}><ArrowLeft size={16} />Back to agents</button>{canVisit && <button className="btn btn-primary" onClick={startVisit} disabled={linking || !agent?.agentId}><Play size={15} />{linking ? 'Preparing visit…' : 'Start visit'}</button>}{['ADMIN', 'TC'].includes(user?.role?.toUpperCase()) && agent?.localAgentId && <button className="btn btn-secondary" onClick={() => navigate(`/agents/${encodeURIComponent(agent.localAgentId)}`)}>Field record</button>}</div>} />
+    <PageHeader title={agent?.name || 'Irembo agent'} subtitle={agent?.agentId || 'Agent profile from the Irembo feed.'} breadcrumbs={[{ label: 'Agents', href: '/agents' }, { label: agent?.name || 'Irembo agent' }]} actions={<div className="flex gap-2"><button className="btn btn-secondary" onClick={() => navigate('/agents')}><ArrowLeft size={16} />Back to agents</button>{canVisit && <button className="btn btn-primary" onClick={startVisit} disabled={linking || !agent?.agentId}><Play size={15} />{linking ? 'Preparing visit…' : 'Start visit'}</button>}{canVisit && !localAgent && <button className="btn btn-secondary" onClick={prepareLocationDetails} disabled={linking || !agent?.agentId}><MapPin size={15} />{linking ? 'Preparing…' : 'Add location details'}</button>}{['ADMIN', 'TC'].includes(user?.role?.toUpperCase()) && agent?.localAgentId && <button className="btn btn-secondary" onClick={() => navigate(`/agents/${encodeURIComponent(agent.localAgentId)}`)}>Field record</button>}</div>} />
     {error && <ErrorState message={error} onRetry={load} />}
     {loading ? <LoadingState message="Loading agent profile…" /> : !error && agent && <>
       <section className="agent-profile-grid network-agent-profile-grid">
