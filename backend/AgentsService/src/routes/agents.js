@@ -1882,13 +1882,14 @@ router.patch('/:id/location-details', authenticateToken, requireTerritoryAccess,
     const cellId = String(req.body.cellId || '').trim();
     const villageId = String(req.body.villageId || '').trim();
     const venue = String(req.body.venue || '').trim();
-    if (territoryId !== agent.territoryId) return res.status(400).json({ error: 'This one-time update is limited to the agent’s current district. Use a transfer to move the agent to another TC.' });
+    const assignedTerritories = req.user.assignedTerritories || [];
+    if (!assignedTerritories.includes(territoryId)) return res.status(403).json({ error: 'Choose a district assigned to your TC account.' });
     if (!venue) return res.status(400).json({ error: 'Enter the agent’s venue.' });
     if (venue.length > 200) return res.status(400).json({ error: 'Venue must be 200 characters or fewer.' });
     const hierarchyError = await validateAgentHierarchy({ territoryId, sectorId, cellId, villageId });
     if (hierarchyError) return res.status(400).json({ error: hierarchyError });
     const address = await areaAddress({ villageId });
-    const locationChanged = agent.sectorId !== sectorId || agent.cellId !== cellId || agent.villageId !== villageId || agent.venue !== venue;
+    const locationChanged = agent.territoryId !== territoryId || agent.sectorId !== sectorId || agent.cellId !== cellId || agent.villageId !== villageId || agent.venue !== venue;
     const saved = await prisma.$transaction(async (tx) => {
       await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
       const [current, pendingRequest, pendingTransfer] = await Promise.all([
@@ -1900,6 +1901,13 @@ router.patch('/:id/location-details', authenticateToken, requireTerritoryAccess,
       if (current.sectorId !== agent.sectorId || current.cellId !== agent.cellId || current.villageId !== agent.villageId || current.venue !== agent.venue) throw Object.assign(new Error('The agent’s location changed. Reload the profile before saving these details.'), { statusCode: 409 });
       if (current.tcLocationDetailsCompletedAt) throw Object.assign(new Error('These location details have already been saved once. Send a relocation request to an administrator for any correction.'), { statusCode: 409 });
       if (pendingRequest || pendingTransfer) throw Object.assign(new Error('Resolve the pending transfer or relocation request before saving location details.'), { statusCode: 409 });
+      if (territoryId !== agent.territoryId) {
+        const [approvedRelocation, completedTcTransfer] = await Promise.all([
+          tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'APPROVED' }, select: { id: true } }),
+          tx.agentTransfer.findFirst({ where: { agentId: agent.id, status: 'COMPLETED', adminRoutedAt: null }, select: { id: true } }),
+        ]);
+        if (approvedRelocation || completedTcTransfer) throw Object.assign(new Error('This agent has already had a TC move. Ask an administrator to handle any further transfer or relocation.'), { statusCode: 409 });
+      }
       const updated = await tx.agent.updateMany({
         where: { id: agent.id, territoryId: agent.territoryId, tcLocationDetailsCompletedAt: null },
         data: {
