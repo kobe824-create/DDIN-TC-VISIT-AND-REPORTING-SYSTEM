@@ -2472,6 +2472,11 @@ html, body, #root {
 .movement-status.rejected, .movement-status.cancelled { color: #a94f43; background: #fff0ec; }
 .movement-list-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 18px 0 12px; }
 .movement-list-toolbar > small { color: #738074; font-size: 12px; }
+.movement-filter-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); align-items: end; gap: 12px; margin: 0 18px 16px; padding: 14px; border: 1px solid #e7ebe6; border-radius: 11px; background: #fafbf9; }
+.movement-filter-grid > label { display: grid; gap: 6px; color: #5e6d61; font-size: 11px; font-weight: 700; }
+.movement-filter-grid .input { width: 100%; min-height: 38px; color: #34443a; font-size: 12px; }
+.movement-search-field { grid-column: span 2; }
+.movement-clear-filters { min-height: 38px; justify-content: center; }
 .movement-kind-filters, .admin-inbox-filters { display: flex; align-items: center; gap: 5px; padding: 4px; border: 1px solid #e3e8e2; border-radius: 10px; background: #f8faf8; }
 .movement-kind-filters button, .admin-inbox-filters button { min-height: 34px; padding: 7px 12px; border: 0; border-radius: 7px; color: #657267; background: transparent; font: inherit; font-size: 12px; font-weight: 650; cursor: pointer; }
 .movement-kind-filters button.active, .admin-inbox-filters button.active { color: #273c34; background: #fff; box-shadow: 0 1px 4px rgb(24 39 30 / 10%); }
@@ -2535,9 +2540,15 @@ html, body, #root {
   .admin-inbox-bulk-actions > span { margin-right: 0; }
   .admin-inbox-bulk-actions .btn { flex: 1; justify-content: center; }
   .movement-list-toolbar { align-items: flex-start; flex-direction: column; }
+  .movement-filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-right: 12px; margin-left: 12px; padding: 11px; }
+  .movement-search-field { grid-column: span 2; }
   .movement-detail-grid { grid-template-columns: 1fr; }
   .movement-detail-hero { align-items: flex-start; flex-wrap: wrap; padding: 16px; }
   .movement-detail-hero > .status-badge { margin-left: 50px; }
+}
+@media (max-width: 420px) {
+  .movement-filter-grid { grid-template-columns: minmax(0, 1fr); }
+  .movement-search-field { grid-column: auto; }
 }
 @media (max-width: 640px) {
   .territory-group-builder { padding: 14px; }

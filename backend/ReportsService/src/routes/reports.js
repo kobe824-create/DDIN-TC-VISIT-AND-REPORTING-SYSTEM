@@ -1018,37 +1018,75 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
     const todayKey = kigaliDateKey(new Date());
     const selected = selectedDateWindow(String(req.query.fromDate || ''), String(req.query.toDate || ''), todayKey);
     if (selected.error) return res.status(400).json({ error: selected.error });
+
     const requestedAt = { gte: selected.range.gte, lt: selected.range.lt };
-    const transferWhere = { requestedAt };
-    const relocationWhere = { requestedAt };
+    const territoryId = String(req.query.territoryId || '').trim();
+    const tcId = String(req.query.tcId || '').trim();
+    const kindFilter = ['TRANSFER', 'RELOCATION'].includes(String(req.query.kind || '').toUpperCase())
+      ? String(req.query.kind).toUpperCase() : 'ALL';
+    const statusFilter = String(req.query.status || '').trim().toUpperCase();
+    const allowedStatuses = new Set(['PENDING', 'ACCEPTED_GPS_PENDING', 'COMPLETED', 'APPROVED', 'REJECTED', 'ON_HOLD', 'CANCELLED']);
+    const safeStatus = allowedStatuses.has(statusFilter) ? statusFilter : 'ALL';
+    const search = String(req.query.search || '').trim().toLocaleLowerCase();
+    const sortBy = ['DATE_ASC', 'TERRITORY', 'TC', 'AGENT'].includes(String(req.query.sortBy || '').toUpperCase())
+      ? String(req.query.sortBy).toUpperCase() : 'DATE_DESC';
+    const requestedPage = Number(req.query.page || 1);
+    const safePage = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+    const limit = 25;
+
+    const territoryScope = territoryId
+      ? { OR: [{ fromTerritoryId: territoryId }, { toTerritoryId: territoryId }] }
+      : {};
+    const transferWhere = {
+      requestedAt,
+      ...(tcId ? { requestedByTcId: tcId } : {}),
+      ...territoryScope,
+    };
+    const relocationWhere = {
+      requestedAt,
+      ...(tcId ? { requestedByTcId: tcId } : {}),
+      ...territoryScope,
+    };
     const auditWhere = { action: 'ADMIN_RELOCATE_AGENT', resourceType: 'Agent', createdAt: requestedAt };
-    const [transfers, relocations, transferStatusCounts, acceptedTransfers, relocationStatusCounts, adminRelocationCount, adminMoves] = await Promise.all([
+
+    const [transfers, relocations, adminMoves, territoryOptions, coordinatorOptions] = await Promise.all([
       prisma.agentTransfer.findMany({
-        where: transferWhere, orderBy: [{ requestedAt: 'desc' }, { id: 'desc' }], take: 500,
+        where: transferWhere,
+        orderBy: [{ requestedAt: 'desc' }, { id: 'desc' }],
         include: {
           agent: { select: { id: true, agentId: true, name: true, phoneNumber: true } },
           fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } },
-          requestedByTc: { select: { firstName: true, lastName: true, username: true } },
+          requestedByTc: { select: { id: true, firstName: true, lastName: true, username: true } },
           recipientTc: { select: { firstName: true, lastName: true, username: true } },
         },
       }),
       prisma.agentRelocationRequest.findMany({
-        where: relocationWhere, orderBy: [{ requestedAt: 'desc' }, { id: 'desc' }], take: 500,
+        where: relocationWhere,
+        orderBy: [{ requestedAt: 'desc' }, { id: 'desc' }],
         include: {
           agent: { select: { id: true, agentId: true, name: true, phoneNumber: true } },
           fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } },
-          requestedByTc: { select: { firstName: true, lastName: true, username: true } },
+          requestedByTc: { select: { id: true, firstName: true, lastName: true, username: true } },
           reviewedBy: { select: { firstName: true, lastName: true, username: true } },
         },
       }),
-      prisma.agentTransfer.groupBy({ by: ['status'], where: transferWhere, _count: { _all: true } }),
-      prisma.agentTransfer.count({ where: { ...transferWhere, status: 'PENDING', acceptedAt: { not: null } } }),
-      prisma.agentRelocationRequest.groupBy({ by: ['status'], where: relocationWhere, _count: { _all: true } }),
-      prisma.auditLog.count({ where: auditWhere }),
-      prisma.auditLog.findMany({ where: auditWhere, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 500, include: { user: { select: { firstName: true, lastName: true, username: true } } } }),
+      tcId ? Promise.resolve([]) : prisma.auditLog.findMany({
+        where: auditWhere,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        include: { user: { select: { firstName: true, lastName: true, username: true } } },
+      }),
+      prisma.territory.findMany({
+        where: { type: 'DISTRICT', isActive: true },
+        select: { id: true, name: true },
+        orderBy: { name: 'asc' },
+      }),
+      prisma.user.findMany({
+        where: { role: 'TC', isActive: true },
+        select: { id: true, firstName: true, lastName: true, username: true },
+        orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }, { username: 'asc' }],
+      }),
     ]);
-    const transferCounts = Object.fromEntries(transferStatusCounts.map((row) => [row.status, row._count._all]));
-    const relocationCounts = Object.fromEntries(relocationStatusCounts.map((row) => [row.status, row._count._all]));
+
     const moveAgentIds = [...new Set(adminMoves.map(({ resourceId }) => resourceId).filter(Boolean))];
     const detailTerritoryIds = [...new Set([
       ...relocations.flatMap(({ toTerritoryId, toSectorId, toCellId, toVillageId }) => [toTerritoryId, toSectorId, toCellId, toVillageId]),
@@ -1061,19 +1099,24 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
     const agentById = new Map(moveAgents.map((agent) => [agent.id, agent]));
     const territoryById = new Map(moveTerritories.map((territory) => [territory.id, territory.name]));
     const personName = (person) => [person?.firstName, person?.lastName].filter(Boolean).join(' ') || person?.username || '—';
+
     const rows = [
       ...transfers.map((item) => ({
-        id: `transfer-${item.id}`, kind: 'TRANSFER', agentName: item.agent.name, agentNumber: item.agent.agentId,
-        agentId: item.agent.id,
-        phoneNumber: item.agent.phoneNumber, from: item.fromTerritory.name, to: item.toTerritory.name,
+        id: 'transfer-' + item.id, kind: 'TRANSFER', agentName: item.agent.name, agentNumber: item.agent.agentId,
+        agentId: item.agent.id, phoneNumber: item.agent.phoneNumber,
+        from: item.fromTerritory.name, to: item.toTerritory.name,
+        fromTerritoryId: item.fromTerritoryId, toTerritoryId: item.toTerritoryId,
+        requestedByTcId: item.requestedByTcId,
         requestedBy: personName(item.requestedByTc), reviewedBy: item.acceptedAt ? personName(item.recipientTc) : '—',
         status: item.status === 'COMPLETED' ? 'COMPLETED' : item.acceptedAt ? 'ACCEPTED_GPS_PENDING' : item.status,
         requestedAt: item.requestedAt, reviewedAt: item.acceptedAt || item.reviewedAt, completedAt: item.completedAt, reason: item.reason || '',
       })),
       ...relocations.map((item) => ({
-        id: `relocation-${item.id}`, kind: 'RELOCATION', agentName: item.agent.name, agentNumber: item.agent.agentId,
+        id: 'relocation-' + item.id, kind: 'RELOCATION', agentName: item.agent.name, agentNumber: item.agent.agentId,
         agentId: item.agent.id, phoneNumber: item.agent.phoneNumber, from: item.fromTerritory.name,
         to: [item.toTerritory.name, item.toSectorId, item.toCellId, item.toVillageId].map((value) => territoryById.get(value) || value).filter(Boolean).concat(item.toVenue ? [item.toVenue] : []).join(' · '),
+        fromTerritoryId: item.fromTerritoryId, toTerritoryId: item.toTerritoryId,
+        requestedByTcId: item.requestedByTcId,
         requestedBy: personName(item.requestedByTc), reviewedBy: item.reviewedBy ? personName(item.reviewedBy) : '—',
         status: item.status, requestedAt: item.requestedAt, reviewedAt: item.reviewedAt, completedAt: item.reviewedAt, reason: item.reason || '',
       })),
@@ -1081,33 +1124,78 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
         const details = entry.details || {};
         const agent = agentById.get(entry.resourceId) || {};
         const actor = personName(entry.user);
-        const path = (prefix) => [details[`${prefix}TerritoryId`], details[`${prefix}SectorId`], details[`${prefix}CellId`], details[`${prefix}VillageId`]].map((id) => territoryById.get(id)).filter(Boolean).join(' · ');
+        const path = (prefix) => [details[prefix + 'TerritoryId'], details[prefix + 'SectorId'], details[prefix + 'CellId'], details[prefix + 'VillageId']].map((id) => territoryById.get(id)).filter(Boolean).join(' · ');
         return {
-          id: `admin-${entry.id}`, kind: 'ADMIN_RELOCATION', agentName: details.agentName || agent.name || 'Agent', agentNumber: details.agentCode || agent.agentId || '',
-          agentId: entry.resourceId,
-          phoneNumber: agent.phoneNumber || '', from: path('from') || territoryById.get(details.fromTerritoryId) || '—', to: path('to') || territoryById.get(details.toTerritoryId) || '—',
-          requestedBy: actor, reviewedBy: actor, status: 'COMPLETED', requestedAt: entry.createdAt, reviewedAt: entry.createdAt, completedAt: entry.createdAt, reason: details.reason || '',
+          id: 'admin-' + entry.id, kind: 'ADMIN_RELOCATION', agentName: details.agentName || agent.name || 'Agent',
+          agentNumber: details.agentCode || agent.agentId || '', agentId: entry.resourceId, phoneNumber: agent.phoneNumber || '',
+          from: path('from') || territoryById.get(details.fromTerritoryId) || '—',
+          to: path('to') || territoryById.get(details.toTerritoryId) || '—',
+          fromTerritoryId: details.fromTerritoryId || '', toTerritoryId: details.toTerritoryId || '',
+          requestedByTcId: '',
+          requestedBy: actor, reviewedBy: actor, status: 'COMPLETED',
+          requestedAt: entry.createdAt, reviewedAt: entry.createdAt, completedAt: entry.createdAt, reason: details.reason || '',
         };
       }),
-    ].sort((a, b) => new Date(b.requestedAt) - new Date(a.requestedAt));
-    const transferTotal = Object.values(transferCounts).reduce((sum, value) => sum + value, 0);
-    const transferCompleted = transferCounts.COMPLETED || 0;
-    const acceptedTotal = transferCompleted + acceptedTransfers;
-    const relocationTotal = Object.values(relocationCounts).reduce((sum, value) => sum + value, 0);
-    const reviewedRelocations = (relocationCounts.APPROVED || 0) + (relocationCounts.REJECTED || 0);
+    ];
+
+    const filteredRows = rows.filter((event) => {
+      if (kindFilter === 'TRANSFER' && event.kind !== 'TRANSFER') return false;
+      if (kindFilter === 'RELOCATION' && event.kind === 'TRANSFER') return false;
+      if (safeStatus !== 'ALL' && event.status !== safeStatus) return false;
+      if (territoryId && event.fromTerritoryId !== territoryId && event.toTerritoryId !== territoryId) return false;
+      if (tcId && event.requestedByTcId !== tcId) return false;
+      if (search) {
+        const searchable = [event.agentName, event.agentNumber, event.phoneNumber, event.from, event.to, event.requestedBy, event.reviewedBy, event.status, event.reason].join(' ').toLocaleLowerCase();
+        if (!searchable.includes(search)) return false;
+      }
+      return true;
+    });
+
+    const compareText = (left, right) => String(left || '').localeCompare(String(right || ''), undefined, { sensitivity: 'base' });
+    filteredRows.sort((left, right) => {
+      if (sortBy === 'DATE_ASC') return new Date(left.requestedAt) - new Date(right.requestedAt) || compareText(left.id, right.id);
+      if (sortBy === 'TERRITORY') return compareText(left.from, right.from) || compareText(left.to, right.to) || (new Date(right.requestedAt) - new Date(left.requestedAt));
+      if (sortBy === 'TC') return compareText(left.requestedBy, right.requestedBy) || (new Date(right.requestedAt) - new Date(left.requestedAt));
+      if (sortBy === 'AGENT') return compareText(left.agentName, right.agentName) || (new Date(right.requestedAt) - new Date(left.requestedAt));
+      return new Date(right.requestedAt) - new Date(left.requestedAt) || compareText(right.id, left.id);
+    });
+
+    const transferRows = filteredRows.filter((event) => event.kind === 'TRANSFER');
+    const tcRelocationRows = filteredRows.filter((event) => event.kind === 'RELOCATION');
+    const adminRelocationRows = filteredRows.filter((event) => event.kind === 'ADMIN_RELOCATION');
+    const transferRequests = transferRows.length;
+    const transfersCompleted = transferRows.filter((event) => event.status === 'COMPLETED').length;
+    const transfersAccepted = transfersCompleted + transferRows.filter((event) => event.status === 'ACCEPTED_GPS_PENDING').length;
+    const transfersAwaitingReview = transferRows.filter((event) => event.status === 'PENDING').length;
+    const reviewedRelocations = tcRelocationRows.filter((event) => ['APPROVED', 'REJECTED'].includes(event.status));
+    const relocationsApproved = tcRelocationRows.filter((event) => event.status === 'APPROVED').length;
+    const relocationsRejected = tcRelocationRows.filter((event) => event.status === 'REJECTED').length;
+    const requestedPageCount = Math.ceil(filteredRows.length / limit);
+    const page = Math.min(safePage, Math.max(requestedPageCount, 1));
+
     res.json({
       selectedRange: { fromDate: selected.fromDate, toDate: selected.toDate },
+      selectedFilters: { territoryId, tcId, kind: kindFilter, status: safeStatus, search, sortBy },
+      filters: { territories: territoryOptions, coordinators: coordinatorOptions.map((tc) => ({ ...tc, name: personName(tc) })) },
+      meta: { total: filteredRows.length, page, limit, pages: requestedPageCount },
       summary: {
-        transferRequests: transferTotal, transfersAccepted: acceptedTotal, transfersCompleted: transferCompleted,
-        transfersAwaitingReview: Math.max(0, (transferCounts.PENDING || 0) - acceptedTransfers),
-        transferAcceptanceRate: transferTotal ? Number((acceptedTotal / transferTotal * 100).toFixed(1)) : 0,
-        transferCompletionRate: acceptedTotal ? Number((transferCompleted / acceptedTotal * 100).toFixed(1)) : 0,
-        relocationRequests: relocationTotal, relocationsApproved: relocationCounts.APPROVED || 0,
-        relocationsRejected: relocationCounts.REJECTED || 0, relocationsAwaitingReview: relocationCounts.PENDING || 0,
-        relocationApprovalRate: reviewedRelocations ? Number(((relocationCounts.APPROVED || 0) / reviewedRelocations * 100).toFixed(1)) : 0,
-        adminRelocations: adminRelocationCount,
+        transferRequests,
+        transfersAccepted,
+        transfersCompleted,
+        transfersAwaitingReview,
+        transferAcceptanceRate: transferRequests ? Number((transfersAccepted / transferRequests * 100).toFixed(1)) : 0,
+        transferCompletionRate: transfersAccepted ? Number((transfersCompleted / transfersAccepted * 100).toFixed(1)) : 0,
+        relocationRequests: tcRelocationRows.length,
+        relocationsApproved,
+        relocationsRejected,
+        relocationsAwaitingReview: tcRelocationRows.filter((event) => event.status === 'PENDING').length,
+        relocationApprovalRate: reviewedRelocations.length ? Number((relocationsApproved / reviewedRelocations.length * 100).toFixed(1)) : 0,
+        tcRelocations: tcRelocationRows.length,
+        adminRelocations: adminRelocationRows.length,
+        totalRelocations: tcRelocationRows.length + adminRelocationRows.length,
+        totalMovements: filteredRows.length,
       },
-      events: rows.slice(0, 1000), eventLimitReached: rows.length > 1000,
+      events: filteredRows.slice((page - 1) * limit, page * limit),
     });
   } catch (error) {
     console.error('Movement report error:', error.code || error.name);

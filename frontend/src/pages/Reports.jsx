@@ -18,6 +18,14 @@ function IremboReports() {
   const [searchParams] = useSearchParams();
   const [tab, setTab] = useState(searchParams.get('tab') === 'movements' ? 'movements' : 'visits');
   const [movementKind, setMovementKind] = useState('ALL');
+  const [movementStatusFilter, setMovementStatusFilter] = useState('ALL');
+  const [movementTerritoryId, setMovementTerritoryId] = useState('');
+  const [movementTcId, setMovementTcId] = useState('');
+  const [movementSearch, setMovementSearch] = useState('');
+  const [movementQuery, setMovementQuery] = useState('');
+  const [movementSortBy, setMovementSortBy] = useState('DATE_DESC');
+  const [movementPage, setMovementPage] = useState(1);
+  const [movementFilters, setMovementFilters] = useState({ territories: [], coordinators: [] });
   const [visits, setVisits] = useState([]);
   const [verificationVisits, setVerificationVisits] = useState([]);
   const [coverage, setCoverage] = useState([]);
@@ -72,12 +80,25 @@ function IremboReports() {
     if (!isAdmin) return;
     setMovementLoading(true); setMovementError('');
     try {
-      const { data } = await api.get('/api/v1/reports/movements', { params: { fromDate, toDate } });
+      const { data } = await api.get('/api/v1/reports/movements', { params: {
+        fromDate, toDate, territoryId: movementTerritoryId, tcId: movementTcId,
+        kind: movementKind, status: movementStatusFilter, search: movementQuery,
+        sortBy: movementSortBy, page: movementPage, limit: 25,
+      } });
       setMovementReport(data);
+      setMovementFilters(data.filters || { territories: [], coordinators: [] });
+      if (data.meta?.page && data.meta.page !== movementPage) setMovementPage(data.meta.page);
     } catch (err) { setMovementError(err.response?.data?.error || 'Could not load transfer and relocation activity.'); }
     finally { setMovementLoading(false); }
-  }, [fromDate, toDate, isAdmin]);
+  }, [fromDate, toDate, isAdmin, movementTerritoryId, movementTcId, movementKind, movementStatusFilter, movementQuery, movementSortBy, movementPage]);
   useEffect(() => { if (tab === 'movements') loadMovements(); }, [tab, loadMovements]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setMovementQuery(movementSearch.trim());
+      setMovementPage(1);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [movementSearch]);
   useEffect(() => {
     if (coveragePage > Math.max(Math.ceil(coverage.length / pageSize), 1)) setCoveragePage(Math.max(Math.ceil(coverage.length / pageSize), 1));
   }, [coverage.length, coveragePage, pageSize]);
@@ -105,12 +126,11 @@ function IremboReports() {
     setVisitsPage(1);
     setVerificationPage(1);
     setCoveragePage(1);
+    setMovementPage(1);
   };
   const tabs = [{ id: 'visits', label: 'Visit activity', icon: MapPin }, { id: 'coverage', label: 'Territory coverage', icon: UsersRound }, { id: 'verification', label: 'GPS verification', icon: ShieldCheck }, ...(isAdmin ? [{ id: 'movements', label: 'Transfers & relocations', icon: ArrowRightLeft }] : [])];
   const movementStats = movementReport?.summary || {};
-  const movementEvents = (movementReport?.events || []).filter((event) => movementKind === 'ALL'
-    || (movementKind === 'TRANSFER' && event.kind === 'TRANSFER')
-    || (movementKind === 'RELOCATION' && event.kind !== 'TRANSFER'));
+  const movementEvents = movementReport?.events || [];
   const movementStatus = (event) => event.status === 'ACCEPTED_GPS_PENDING' ? 'Accepted · first visit GPS pending' : event.status === 'PENDING' ? (event.kind === 'TRANSFER' ? 'Awaiting TC review' : 'Awaiting admin review') : event.status.replaceAll('_', ' ').toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase());
 
   return <div className="reports-page page">
@@ -127,23 +147,31 @@ function IremboReports() {
           {movementError && <ErrorState message={movementError} onRetry={loadMovements} />}
           {movementLoading ? <LoadingState message="Loading transfer and relocation activity…" /> : !movementError && <>
             <section className="report-metrics movement-metrics">
-              <div><span className="report-metric-icon orange"><ArrowRightLeft size={16} /></span><span><small>Transfer requests</small><strong>{(movementStats.transferRequests || 0).toLocaleString()}</strong><em>{movementStats.transferAcceptanceRate || 0}% accepted</em></span></div>
-              <div><span className="report-metric-icon green"><ShieldCheck size={16} /></span><span><small>Transfers completed</small><strong>{(movementStats.transfersCompleted || 0).toLocaleString()}</strong><em>{movementStats.transferCompletionRate || 0}% of accepted</em></span></div>
-              <div><span className="report-metric-icon amber"><MapPin size={16} /></span><span><small>Relocation requests</small><strong>{(movementStats.relocationRequests || 0).toLocaleString()}</strong><em>{movementStats.relocationApprovalRate || 0}% approved</em></span></div>
-              <div><span className="report-metric-icon blue"><UsersRound size={16} /></span><span><small>Admin relocations</small><strong>{(movementStats.adminRelocations || 0).toLocaleString()}</strong><em>{movementStats.relocationsAwaitingReview || 0} requests awaiting review</em></span></div>
+              <div><span className="report-metric-icon orange"><ArrowRightLeft size={16} /></span><span><small>Transfers</small><strong>{(movementStats.transferRequests || 0).toLocaleString()}</strong><em>{movementStats.transfersCompleted || 0} completed · {movementStats.transfersAwaitingReview || 0} awaiting review</em></span></div>
+              <div><span className="report-metric-icon amber"><MapPin size={16} /></span><span><small>TC relocations</small><strong>{(movementStats.tcRelocations ?? movementStats.relocationRequests ?? 0).toLocaleString()}</strong><em>{movementStats.relocationsApproved || 0} approved · {movementStats.relocationsAwaitingReview || 0} awaiting review</em></span></div>
+              <div><span className="report-metric-icon blue"><UsersRound size={16} /></span><span><small>Admin relocations</small><strong>{(movementStats.adminRelocations || 0).toLocaleString()}</strong><em>Completed moves recorded by administrators</em></span></div>
+              <div><span className="report-metric-icon green"><ShieldCheck size={16} /></span><span><small>Combined movements</small><strong>{(movementStats.totalMovements || 0).toLocaleString()}</strong><em>{(movementStats.totalRelocations || 0).toLocaleString()} relocations and transfers</em></span></div>
             </section>
-            <div className="movement-rate-strip"><span>{movementStats.transfersAwaitingReview || 0} transfers awaiting receiving-TC review</span><span>{movementStats.relocationsRejected || 0} relocation requests declined</span><span>{movementStats.relocationsApproved || 0} relocation requests approved</span></div>
+            <div className="movement-rate-strip"><span>{movementStats.transferAcceptanceRate || 0}% of transfers accepted</span><span>{movementStats.relocationsRejected || 0} relocation requests declined</span><span>{movementStats.relocationApprovalRate || 0}% of reviewed TC relocations approved</span></div>
             <div className="movement-list-toolbar">
               <div className="movement-kind-filters" role="tablist" aria-label="Filter movement report">
-                {[['ALL', 'All movements'], ['TRANSFER', 'Transfers'], ['RELOCATION', 'Relocations']].map(([value, label]) => <button type="button" key={value} role="tab" aria-selected={movementKind === value} className={movementKind === value ? 'active' : ''} onClick={() => setMovementKind(value)}>{label}</button>)}
+                {[['ALL', 'All movements'], ['TRANSFER', 'Transfers'], ['RELOCATION', 'Relocations']].map(([value, label]) => <button type="button" key={value} role="tab" aria-selected={movementKind === value} className={movementKind === value ? 'active' : ''} onClick={() => { setMovementKind(value); setMovementPage(1); }}>{label}</button>)}
               </div>
               <small>Open any row to see the full movement record.</small>
             </div>
+            <div className="movement-filter-grid">
+              <label>District / territory<select className="input" value={movementTerritoryId} onChange={(event) => { setMovementTerritoryId(event.target.value); setMovementPage(1); }}><option value="">All territories</option>{movementFilters.territories.map((territory) => <option key={territory.id} value={territory.id}>{territory.name}</option>)}</select></label>
+              <label>TC<select className="input" value={movementTcId} onChange={(event) => { setMovementTcId(event.target.value); setMovementPage(1); }}><option value="">All coordinators</option>{movementFilters.coordinators.map((tc) => <option key={tc.id} value={tc.id}>{tc.name}{tc.username ? ' · ' + tc.username : ''}</option>)}</select></label>
+              <label>Status<select className="input" value={movementStatusFilter} onChange={(event) => { setMovementStatusFilter(event.target.value); setMovementPage(1); }}><option value="ALL">All statuses</option><option value="PENDING">Pending review</option><option value="ACCEPTED_GPS_PENDING">Accepted · GPS pending</option><option value="COMPLETED">Completed</option><option value="APPROVED">Approved</option><option value="REJECTED">Rejected</option><option value="ON_HOLD">On hold</option><option value="CANCELLED">Cancelled</option></select></label>
+              <label>Sort by<select className="input" value={movementSortBy} onChange={(event) => { setMovementSortBy(event.target.value); setMovementPage(1); }}><option value="DATE_DESC">Newest first</option><option value="DATE_ASC">Oldest first</option><option value="TERRITORY">Territory</option><option value="TC">TC name</option><option value="AGENT">Agent name</option></select></label>
+              <label className="movement-search-field">Search<input className="input" type="search" value={movementSearch} onChange={(event) => setMovementSearch(event.target.value)} placeholder="Agent, phone, TC, territory, or note" /></label>
+              <button type="button" className="btn btn-secondary movement-clear-filters" onClick={() => { setMovementKind('ALL'); setMovementStatusFilter('ALL'); setMovementTerritoryId(''); setMovementTcId(''); setMovementSearch(''); setMovementQuery(''); setMovementSortBy('DATE_DESC'); setMovementPage(1); }}>Clear filters</button>
+            </div>
             <div className="table-scroll"><table className="data-table report-table movement-table"><thead><tr><th>Type</th><th>Agent & contact</th><th>From</th><th>To</th><th>Requested by</th><th>Reviewed by</th><th>Status</th><th>Date</th></tr></thead><tbody>
               {movementEvents.map((event) => <tr key={event.id} className="movement-report-row" tabIndex={0} role="link" aria-label={`Open ${event.kind === 'TRANSFER' ? 'transfer' : 'relocation'} record for ${event.agentName}`} onClick={() => navigate(`/reports/movements/${encodeURIComponent(event.id)}`)} onKeyDown={(keyboardEvent) => { if (keyboardEvent.key === 'Enter' || keyboardEvent.key === ' ') { keyboardEvent.preventDefault(); navigate(`/reports/movements/${encodeURIComponent(event.id)}`); } }}><td>{event.kind === 'TRANSFER' ? 'Transfer' : event.kind === 'RELOCATION' ? 'TC relocation' : 'Admin relocation'}</td><td><strong>{event.agentName}</strong><small className="visit-subtext">{event.agentNumber}{event.phoneNumber ? ` · ${event.phoneNumber}` : ''}</small></td><td>{event.from}</td><td>{event.to}</td><td>{event.requestedBy}</td><td>{event.reviewedBy}</td><td><span className={`movement-status ${event.status.toLowerCase().replaceAll('_', '-')}`}>{movementStatus(event)}</span></td><td>{day(event.requestedAt)}</td></tr>)}
-              {!movementEvents.length && <tr><td className="report-empty" colSpan="8">{movementReport?.events?.length ? 'No movements match this filter.' : 'No transfers or relocations were recorded during this period.'}</td></tr>}
+              {!movementEvents.length && <tr><td className="report-empty" colSpan="8">{movementReport?.meta?.total ? 'No movements match these filters.' : 'No transfers or relocations match this period and filter set.'}</td></tr>}
             </tbody></table></div>
-            {movementReport?.eventLimitReached && <p className="card-footnote">Showing the latest 1,000 events. Summary rates include all records in the selected date range.</p>}
+            <ListPagination page={movementReport?.meta?.page || movementPage} pages={movementReport?.meta?.pages || 0} total={movementReport?.meta?.total || 0} pageSize={25} showPageSize={false} onPageChange={setMovementPage} />
           </>}
         </>}
         <div className="card-footnote"><ShieldCheck size={14} /><span>Coverage = unique active agents visited ÷ active agents in each territory. Repeat visits remain listed but are excluded from report totals and coverage.</span></div>
