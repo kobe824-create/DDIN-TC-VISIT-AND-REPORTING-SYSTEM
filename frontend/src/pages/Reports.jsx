@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { ArrowLeft, Download, FileBarChart2, MapPin, Printer, ShieldCheck, UsersRound, ArrowRightLeft } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '../api';
 import { useAuth } from '../AuthContext';
 import PageHeader from '../components/PageHeader';
@@ -15,7 +15,9 @@ const day = (value) => value ? new Intl.DateTimeFormat('en-GB', { dateStyle: 'me
 function IremboReports() {
   const { user } = useAuth();
   const navigate = useNavigate();
-  const [tab, setTab] = useState('visits');
+  const [searchParams] = useSearchParams();
+  const [tab, setTab] = useState(searchParams.get('tab') === 'movements' ? 'movements' : 'visits');
+  const [movementKind, setMovementKind] = useState('ALL');
   const [visits, setVisits] = useState([]);
   const [verificationVisits, setVerificationVisits] = useState([]);
   const [coverage, setCoverage] = useState([]);
@@ -106,6 +108,9 @@ function IremboReports() {
   };
   const tabs = [{ id: 'visits', label: 'Visit activity', icon: MapPin }, { id: 'coverage', label: 'Territory coverage', icon: UsersRound }, { id: 'verification', label: 'GPS verification', icon: ShieldCheck }, ...(isAdmin ? [{ id: 'movements', label: 'Transfers & relocations', icon: ArrowRightLeft }] : [])];
   const movementStats = movementReport?.summary || {};
+  const movementEvents = (movementReport?.events || []).filter((event) => movementKind === 'ALL'
+    || (movementKind === 'TRANSFER' && event.kind === 'TRANSFER')
+    || (movementKind === 'RELOCATION' && event.kind !== 'TRANSFER'));
   const movementStatus = (event) => event.status === 'ACCEPTED_GPS_PENDING' ? 'Accepted · first visit GPS pending' : event.status === 'PENDING' ? (event.kind === 'TRANSFER' ? 'Awaiting TC review' : 'Awaiting admin review') : event.status.replaceAll('_', ' ').toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase());
 
   return <div className="reports-page page">
@@ -128,9 +133,15 @@ function IremboReports() {
               <div><span className="report-metric-icon blue"><UsersRound size={16} /></span><span><small>Admin relocations</small><strong>{(movementStats.adminRelocations || 0).toLocaleString()}</strong><em>{movementStats.relocationsAwaitingReview || 0} requests awaiting review</em></span></div>
             </section>
             <div className="movement-rate-strip"><span>{movementStats.transfersAwaitingReview || 0} transfers awaiting receiving-TC review</span><span>{movementStats.relocationsRejected || 0} relocation requests declined</span><span>{movementStats.relocationsApproved || 0} relocation requests approved</span></div>
+            <div className="movement-list-toolbar">
+              <div className="movement-kind-filters" role="tablist" aria-label="Filter movement report">
+                {[['ALL', 'All movements'], ['TRANSFER', 'Transfers'], ['RELOCATION', 'Relocations']].map(([value, label]) => <button type="button" key={value} role="tab" aria-selected={movementKind === value} className={movementKind === value ? 'active' : ''} onClick={() => setMovementKind(value)}>{label}</button>)}
+              </div>
+              <small>Open any row to see the full movement record.</small>
+            </div>
             <div className="table-scroll"><table className="data-table report-table movement-table"><thead><tr><th>Type</th><th>Agent & contact</th><th>From</th><th>To</th><th>Requested by</th><th>Reviewed by</th><th>Status</th><th>Date</th></tr></thead><tbody>
-              {(movementReport?.events || []).map((event) => <tr key={event.id}><td>{event.kind === 'TRANSFER' ? 'Transfer' : event.kind === 'RELOCATION' ? 'TC relocation request' : 'Admin relocation'}</td><td><strong>{event.agentName}</strong><small className="visit-subtext">{event.agentNumber}{event.phoneNumber ? ` · ${event.phoneNumber}` : ''}</small></td><td>{event.from}</td><td>{event.to}</td><td>{event.requestedBy}</td><td>{event.reviewedBy}</td><td><span className={`movement-status ${event.status.toLowerCase().replaceAll('_', '-')}`}>{movementStatus(event)}</span></td><td>{day(event.requestedAt)}</td></tr>)}
-              {!movementReport?.events?.length && <tr><td className="report-empty" colSpan="8">No transfers or relocations were recorded during this period.</td></tr>}
+              {movementEvents.map((event) => <tr key={event.id} className="movement-report-row" tabIndex={0} role="link" aria-label={`Open ${event.kind === 'TRANSFER' ? 'transfer' : 'relocation'} record for ${event.agentName}`} onClick={() => navigate(`/reports/movements/${encodeURIComponent(event.id)}`)} onKeyDown={(keyboardEvent) => { if (keyboardEvent.key === 'Enter' || keyboardEvent.key === ' ') { keyboardEvent.preventDefault(); navigate(`/reports/movements/${encodeURIComponent(event.id)}`); } }}><td>{event.kind === 'TRANSFER' ? 'Transfer' : event.kind === 'RELOCATION' ? 'TC relocation' : 'Admin relocation'}</td><td><strong>{event.agentName}</strong><small className="visit-subtext">{event.agentNumber}{event.phoneNumber ? ` · ${event.phoneNumber}` : ''}</small></td><td>{event.from}</td><td>{event.to}</td><td>{event.requestedBy}</td><td>{event.reviewedBy}</td><td><span className={`movement-status ${event.status.toLowerCase().replaceAll('_', '-')}`}>{movementStatus(event)}</span></td><td>{day(event.requestedAt)}</td></tr>)}
+              {!movementEvents.length && <tr><td className="report-empty" colSpan="8">{movementReport?.events?.length ? 'No movements match this filter.' : 'No transfers or relocations were recorded during this period.'}</td></tr>}
             </tbody></table></div>
             {movementReport?.eventLimitReached && <p className="card-footnote">Showing the latest 1,000 events. Summary rates include all records in the selected date range.</p>}
           </>}

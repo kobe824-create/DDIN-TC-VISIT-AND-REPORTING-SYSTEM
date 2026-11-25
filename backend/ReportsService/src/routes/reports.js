@@ -78,6 +78,40 @@ function csvCell(value) {
 const DDIN_REPORTS_BASE_URL = (process.env.DDIN_REPORTS_API_BASE_URL
   || 'https://core-api.ddin.rw/v1/agency/thirdpartyagency/services/reports').replace(/\/$/, '');
 const DDIN_AGENT_LIST_URL = process.env.DDIN_AGENT_LIST_API_URL || `${DDIN_REPORTS_BASE_URL}/agents/list`;
+
+router.get('/admin-inbox/state', authenticateToken, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const states = await prisma.adminInboxRequestState.findMany({
+      where: { adminId: req.user.id },
+      select: { requestKey: true, readAt: true, acknowledgedAt: true },
+    });
+    res.json(states);
+  } catch (error) {
+    console.error('Admin inbox state load failed:', error.code || error.name);
+    res.status(500).json({ error: 'Could not load request inbox state.' });
+  }
+});
+
+router.post('/admin-inbox/state', authenticateToken, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const action = String(req.body.action || '').toUpperCase();
+    const keys = [...new Set(Array.isArray(req.body.requestKeys) ? req.body.requestKeys.map((key) => String(key || '').trim()) : [])];
+    if (!['READ', 'ACKNOWLEDGE'].includes(action)) return res.status(400).json({ error: 'Choose read or acknowledge.' });
+    if (!keys.length || keys.length > 500 || keys.some((key) => !key || key.length > 220)) {
+      return res.status(400).json({ error: 'Choose between 1 and 500 valid inbox items.' });
+    }
+    const now = new Date();
+    await prisma.$transaction(keys.map((requestKey) => prisma.adminInboxRequestState.upsert({
+      where: { adminId_requestKey: { adminId: req.user.id, requestKey } },
+      create: { adminId: req.user.id, requestKey, readAt: now, ...(action === 'ACKNOWLEDGE' ? { acknowledgedAt: now } : {}) },
+      update: { readAt: now, ...(action === 'ACKNOWLEDGE' ? { acknowledgedAt: now } : {}) },
+    })));
+    res.json({ updated: keys.length, action, at: now });
+  } catch (error) {
+    console.error('Admin inbox state update failed:', error.code || error.name);
+    res.status(500).json({ error: 'Could not update request inbox state.' });
+  }
+});
 const DDIN_DEPOSITS_URL = process.env.DDIN_AGENT_DEPOSITS_API_URL || `${DDIN_REPORTS_BASE_URL}/float/manual-deposit/per-agent`;
 const DDIN_BALANCE_URL = process.env.DDIN_FLOAT_BALANCE_API_URL || `${DDIN_REPORTS_BASE_URL}/float/balance`;
 const IREMBO_ACTIVITY_FEED_URL = String(process.env.IREMBO_ACTIVITY_FEED_URL || '').trim();
@@ -1016,7 +1050,10 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
     const transferCounts = Object.fromEntries(transferStatusCounts.map((row) => [row.status, row._count._all]));
     const relocationCounts = Object.fromEntries(relocationStatusCounts.map((row) => [row.status, row._count._all]));
     const moveAgentIds = [...new Set(adminMoves.map(({ resourceId }) => resourceId).filter(Boolean))];
-    const detailTerritoryIds = [...new Set(adminMoves.flatMap(({ details }) => [details?.fromTerritoryId, details?.toTerritoryId, details?.fromSectorId, details?.toSectorId, details?.fromCellId, details?.toCellId, details?.fromVillageId, details?.toVillageId]).filter(Boolean))];
+    const detailTerritoryIds = [...new Set([
+      ...relocations.flatMap(({ toTerritoryId, toSectorId, toCellId, toVillageId }) => [toTerritoryId, toSectorId, toCellId, toVillageId]),
+      ...adminMoves.flatMap(({ details }) => [details?.fromTerritoryId, details?.toTerritoryId, details?.fromSectorId, details?.toSectorId, details?.fromCellId, details?.toCellId, details?.fromVillageId, details?.toVillageId]),
+    ].filter(Boolean))];
     const [moveAgents, moveTerritories] = await Promise.all([
       moveAgentIds.length ? prisma.agent.findMany({ where: { id: { in: moveAgentIds } }, select: { id: true, agentId: true, name: true, phoneNumber: true } }) : [],
       detailTerritoryIds.length ? prisma.territory.findMany({ where: { id: { in: detailTerritoryIds } }, select: { id: true, name: true } }) : [],
@@ -1027,6 +1064,7 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
     const rows = [
       ...transfers.map((item) => ({
         id: `transfer-${item.id}`, kind: 'TRANSFER', agentName: item.agent.name, agentNumber: item.agent.agentId,
+        agentId: item.agent.id,
         phoneNumber: item.agent.phoneNumber, from: item.fromTerritory.name, to: item.toTerritory.name,
         requestedBy: personName(item.requestedByTc), reviewedBy: item.acceptedAt ? personName(item.recipientTc) : '—',
         status: item.status === 'COMPLETED' ? 'COMPLETED' : item.acceptedAt ? 'ACCEPTED_GPS_PENDING' : item.status,
@@ -1034,7 +1072,8 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
       })),
       ...relocations.map((item) => ({
         id: `relocation-${item.id}`, kind: 'RELOCATION', agentName: item.agent.name, agentNumber: item.agent.agentId,
-        phoneNumber: item.agent.phoneNumber, from: item.fromTerritory.name, to: item.toTerritory.name,
+        agentId: item.agent.id, phoneNumber: item.agent.phoneNumber, from: item.fromTerritory.name,
+        to: [item.toTerritory.name, item.toSectorId, item.toCellId, item.toVillageId].map((value) => territoryById.get(value) || value).filter(Boolean).concat(item.toVenue ? [item.toVenue] : []).join(' · '),
         requestedBy: personName(item.requestedByTc), reviewedBy: item.reviewedBy ? personName(item.reviewedBy) : '—',
         status: item.status, requestedAt: item.requestedAt, reviewedAt: item.reviewedAt, completedAt: item.reviewedAt, reason: item.reason || '',
       })),
@@ -1045,6 +1084,7 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
         const path = (prefix) => [details[`${prefix}TerritoryId`], details[`${prefix}SectorId`], details[`${prefix}CellId`], details[`${prefix}VillageId`]].map((id) => territoryById.get(id)).filter(Boolean).join(' · ');
         return {
           id: `admin-${entry.id}`, kind: 'ADMIN_RELOCATION', agentName: details.agentName || agent.name || 'Agent', agentNumber: details.agentCode || agent.agentId || '',
+          agentId: entry.resourceId,
           phoneNumber: agent.phoneNumber || '', from: path('from') || territoryById.get(details.fromTerritoryId) || '—', to: path('to') || territoryById.get(details.toTerritoryId) || '—',
           requestedBy: actor, reviewedBy: actor, status: 'COMPLETED', requestedAt: entry.createdAt, reviewedAt: entry.createdAt, completedAt: entry.createdAt, reason: details.reason || '',
         };
@@ -1072,6 +1112,76 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
   } catch (error) {
     console.error('Movement report error:', error.code || error.name);
     res.status(500).json({ error: 'Could not load transfer and relocation activity.' });
+  }
+});
+
+router.get('/movements/:eventKey', authenticateToken, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const match = String(req.params.eventKey || '').match(/^(transfer|relocation|admin)-([0-9a-f-]{36})$/i);
+    if (!match) return res.status(400).json({ error: 'This movement link is not valid.' });
+    const [, eventType, id] = match;
+    const personName = (person) => [person?.firstName, person?.lastName].filter(Boolean).join(' ') || person?.username || '—';
+    let event;
+    if (eventType === 'transfer') {
+      const item = await prisma.agentTransfer.findUnique({ where: { id }, include: {
+        agent: { select: { id: true, agentId: true, name: true, phoneNumber: true } },
+        fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } },
+        requestedByTc: { select: { firstName: true, lastName: true, username: true } },
+        recipientTc: { select: { firstName: true, lastName: true, username: true } },
+      } });
+      if (!item) return res.status(404).json({ error: 'This transfer was not found.' });
+      event = {
+        id: `transfer-${item.id}`, kind: 'TRANSFER', agentId: item.agent.id, agentName: item.agent.name,
+        agentNumber: item.agent.agentId, phoneNumber: item.agent.phoneNumber, from: item.fromTerritory.name,
+        to: item.toTerritory.name, fromTerritory: item.fromTerritory, toTerritory: item.toTerritory,
+        requestedBy: personName(item.requestedByTc), reviewedBy: item.acceptedAt ? personName(item.recipientTc) : '—',
+        status: item.status === 'COMPLETED' ? 'COMPLETED' : item.acceptedAt ? 'ACCEPTED_GPS_PENDING' : item.status,
+        requestedAt: item.requestedAt, reviewedAt: item.acceptedAt || item.reviewedAt, completedAt: item.completedAt,
+        reason: item.reason || '', reviewNote: item.reviewNote || '',
+      };
+    } else if (eventType === 'relocation') {
+      const item = await prisma.agentRelocationRequest.findUnique({ where: { id }, include: {
+        agent: { select: { id: true, agentId: true, name: true, phoneNumber: true } },
+        fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } },
+        requestedByTc: { select: { firstName: true, lastName: true, username: true } },
+        reviewedBy: { select: { firstName: true, lastName: true, username: true } },
+      } });
+      if (!item) return res.status(404).json({ error: 'This relocation was not found.' });
+      const areaIds = [item.toSectorId, item.toCellId, item.toVillageId].filter(Boolean);
+      const areas = areaIds.length ? await prisma.territory.findMany({ where: { id: { in: areaIds } }, select: { id: true, name: true, type: true } }) : [];
+      const areaById = new Map(areas.map((area) => [area.id, area]));
+      const toPath = [item.toTerritory.name, item.toSectorId, item.toCellId, item.toVillageId].map((value) => areaById.get(value)?.name || value).filter(Boolean);
+      if (item.toVenue) toPath.push(item.toVenue);
+      event = {
+        id: `relocation-${item.id}`, kind: 'RELOCATION', agentId: item.agent.id, agentName: item.agent.name,
+        agentNumber: item.agent.agentId, phoneNumber: item.agent.phoneNumber, from: item.fromTerritory.name,
+        to: toPath.join(' · '), fromTerritory: item.fromTerritory, toTerritory: item.toTerritory,
+        destinationPath: toPath.join(' · '), requestedBy: personName(item.requestedByTc), reviewedBy: personName(item.reviewedBy),
+        status: item.status, requestedAt: item.requestedAt, reviewedAt: item.reviewedAt, completedAt: item.reviewedAt,
+        reason: item.reason || '', reviewNote: item.reviewNote || '', destinationVenue: item.toVenue || '',
+      };
+    } else {
+      const entry = await prisma.auditLog.findFirst({ where: { id, action: 'ADMIN_RELOCATE_AGENT', resourceType: 'Agent' }, include: { user: { select: { firstName: true, lastName: true, username: true } } } });
+      if (!entry) return res.status(404).json({ error: 'This relocation was not found.' });
+      const details = entry.details || {};
+      const areaIds = [details.fromTerritoryId, details.fromSectorId, details.fromCellId, details.fromVillageId, details.toTerritoryId, details.toSectorId, details.toCellId, details.toVillageId].filter(Boolean);
+      const areas = areaIds.length ? await prisma.territory.findMany({ where: { id: { in: areaIds } }, select: { id: true, name: true } }) : [];
+      const areaById = new Map(areas.map((area) => [area.id, area.name]));
+      const path = (prefix) => [details[`${prefix}TerritoryId`], details[`${prefix}SectorId`], details[`${prefix}CellId`], details[`${prefix}VillageId`]].map((value) => areaById.get(value)).filter(Boolean).join(' · ');
+      const agent = entry.resourceId ? await prisma.agent.findUnique({ where: { id: entry.resourceId }, select: { id: true, agentId: true, name: true, phoneNumber: true } }) : null;
+      event = {
+        id: `admin-${entry.id}`, kind: 'ADMIN_RELOCATION', agentId: agent?.id || entry.resourceId,
+        agentName: details.agentName || agent?.name || 'Agent', agentNumber: details.agentCode || agent?.agentId || '',
+        phoneNumber: agent?.phoneNumber || '', from: path('from') || '—', to: path('to') || '—',
+        requestedBy: personName(entry.user), reviewedBy: personName(entry.user), status: 'COMPLETED',
+        requestedAt: entry.createdAt, reviewedAt: entry.createdAt, completedAt: entry.createdAt,
+        reason: details.reason || '',
+      };
+    }
+    res.json({ event });
+  } catch (error) {
+    console.error('Movement detail load failed:', error.code || error.name);
+    res.status(500).json({ error: 'Could not load this transfer or relocation.' });
   }
 });
 

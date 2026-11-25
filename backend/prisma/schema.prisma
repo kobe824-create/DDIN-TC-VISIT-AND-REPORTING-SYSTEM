@@ -132,6 +132,7 @@ model User {
   requestedMoolaTransfers          MoolaAgentTransfer[]     @relation("MoolaTransferRequester")
   receivedMoolaTransfers           MoolaAgentTransfer[]     @relation("MoolaTransferRecipient")
   movementNotices                  AgentMovementNotice[]    @relation("MovementNoticeRecipient")
+  adminInboxStates                 AdminInboxRequestState[]
 }
 
 model Territory {
@@ -556,6 +557,20 @@ model AuditLog {
 
   @@index([createdAt])
   @@index([userId, createdAt])
+}
+
+model AdminInboxRequestState {
+  id             String    @id @default(uuid()) @db.Uuid
+  adminId        String    @db.Uuid
+  admin          User      @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  requestKey     String    @db.VarChar(220)
+  readAt         DateTime?
+  acknowledgedAt DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([adminId, requestKey])
+  @@index([adminId, acknowledgedAt])
 }
 
 model SystemConfig {

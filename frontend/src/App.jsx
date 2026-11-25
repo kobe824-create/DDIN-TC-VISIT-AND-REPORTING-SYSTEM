@@ -21,8 +21,10 @@ import UserForm from './pages/UserForm';
 import TerritoryList from './pages/TerritoryList';
 import TerritoryForm from './pages/TerritoryForm';
 import Reports from './pages/Reports';
+import MovementDetail from './pages/MovementDetail';
 import ConfigPage from './pages/ConfigPage';
 import AuditLogs from './pages/AuditLogs';
+import AdminRequests from './pages/AdminRequests';
 import ProfilePage from './pages/ProfilePage';
 import BulkImport from './pages/BulkImport';
 import SectorGroups from './pages/SectorGroups';
@@ -93,8 +95,10 @@ const AppRoutes = () => {
 
         {/* Reports */}
         <Route path="/reports" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER', 'TC', 'CHAMPION']}><Reports /></ProtectedRoute>} />
+        <Route path="/reports/movements/:eventKey" element={<ProtectedRoute allowedRoles={['ADMIN']}><MovementDetail /></ProtectedRoute>} />
 
         {/* Admin */}
+        <Route path="/admin/requests" element={<ProtectedRoute allowedRoles={['ADMIN']}><AdminRequests /></ProtectedRoute>} />
         <Route path="/config" element={<ProtectedRoute allowedRoles={['ADMIN']}><ConfigPage /></ProtectedRoute>} />
         <Route path="/audit-logs" element={<ProtectedRoute allowedRoles={['ADMIN']}><AuditLogs /></ProtectedRoute>} />
 
