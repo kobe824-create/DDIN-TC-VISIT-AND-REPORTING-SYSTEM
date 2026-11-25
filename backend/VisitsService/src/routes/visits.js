@@ -161,6 +161,7 @@ function moolaLocationShape(location) {
     accuracy: location.accuracy, locationVerified: location.locationVerified,
     isOnHold: location.isOnHold,
     firstLocationCapturedAt: location.firstLocationCapturedAt, firstVisitCompletedAt: location.firstVisitCompletedAt,
+    tcLocationDetailsCompletedAt: location.tcLocationDetailsCompletedAt,
     pendingRelocation: location.relocationRequests?.find((request) => request.status === 'PENDING') || null,
   };
 }
@@ -248,12 +249,84 @@ router.get('/moola-plus/agents/:externalAgentId/location', authenticateToken, re
       include: { territory: { select: { id: true, name: true } }, relocationRequests: { where: { status: 'PENDING' }, orderBy: { requestedAt: 'desc' }, take: 1, include: { toTerritory: { select: { id: true, name: true } } } } },
     });
     if (location && req.user.role === 'TC' && !(req.user.assignedTerritories || []).includes(location.territoryId)) return res.status(403).json({ error: 'This Moola Plus agent is outside your assigned territory.' });
+    let shapedLocation = moolaLocationShape(location);
+    const pendingRelocation = location?.relocationRequests?.[0];
+    if (pendingRelocation && shapedLocation) {
+      const areaIds = [pendingRelocation.toSectorId, pendingRelocation.toCellId, pendingRelocation.toVillageId].filter(Boolean);
+      const areas = areaIds.length ? await prisma.territory.findMany({ where: { id: { in: areaIds } }, select: { id: true, name: true } }) : [];
+      const areaById = new Map(areas.map((area) => [area.id, area]));
+      shapedLocation = {
+        ...shapedLocation,
+        pendingRelocation: {
+          ...pendingRelocation,
+          destinationPath: [pendingRelocation.toTerritory, areaById.get(pendingRelocation.toSectorId), areaById.get(pendingRelocation.toCellId), areaById.get(pendingRelocation.toVillageId)].filter(Boolean).map(({ name }) => name).join(' · '),
+          destinationVenue: pendingRelocation.toVenue || null,
+        },
+      };
+    }
     const visits = await prisma.visit.findMany({ where: { network: 'MOOLA_PLUS', externalAgentId: String(req.params.externalAgentId) }, select: { id: true, visitId: true, visitDate: true, visitStatus: true, locationStatus: true, countsForMetrics: true, tc: { select: { firstName: true, lastName: true, username: true } } }, orderBy: { visitDate: 'desc' }, take: 10 });
     const pendingTransfer = await prisma.moolaAgentTransfer.findFirst({ where: { externalAgentId: String(req.params.externalAgentId), status: { in: ['PENDING', 'ON_HOLD'] } }, orderBy: { requestedAt: 'desc' }, include: { fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } }, requestedByTc: { select: { id: true, firstName: true, lastName: true } }, recipientTc: { select: { id: true, firstName: true, lastName: true } } } });
-    res.json({ location: moolaLocationShape(location), recentVisits: visits, pendingTransfer });
+    res.json({ location: shapedLocation, recentVisits: visits, pendingTransfer });
   } catch (error) {
     console.error('Moola location lookup error:', error.code || error.name);
     res.status(500).json({ error: 'Could not load the Moola Plus field profile.' });
+  }
+});
+
+router.patch('/moola-plus/agents/:externalAgentId/location-details', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
+  try {
+    const externalAgentId = String(req.params.externalAgentId || '').trim();
+    if (!externalAgentId || externalAgentId.length > 200) return res.status(400).json({ error: 'The Moola Plus agent ID is invalid.' });
+    const [agent, existing] = await Promise.all([
+      getUpstreamMoolaAgent(req, externalAgentId),
+      prisma.moolaAgentLocation.findUnique({ where: { externalAgentId } }),
+    ]);
+    if (!agent) return res.status(404).json({ error: 'Moola Plus agent not found in the upstream registry.' });
+    const source = await moolaDistrictForAgent(agent, existing);
+    if (!source || !(req.user.assignedTerritories || []).includes(source.id)) return res.status(403).json({ error: 'This agent is outside your assigned district.' });
+    if (existing?.tcLocationDetailsCompletedAt) return res.status(409).json({ error: 'These location details have already been saved once. Send a relocation request to an administrator for any correction.' });
+    const territoryId = String(req.body.territoryId || source.id).trim();
+    if (territoryId !== source.id) return res.status(400).json({ error: 'This one-time update is limited to the agent’s current district. Use a transfer to move the agent to another TC.' });
+    const locationResult = await validateMoolaFieldLocation({ ...req.body, territoryId });
+    if (locationResult.error) return res.status(400).json({ error: locationResult.error });
+    const result = await prisma.$transaction(async (tx) => {
+      await advisoryTransactionLock(tx, externalAgentId, 'AGENT_MOVE');
+      const [current, pendingTransfer, pendingRelocation] = await Promise.all([
+        tx.moolaAgentLocation.findUnique({ where: { externalAgentId } }),
+        tx.moolaAgentTransfer.findFirst({ where: { externalAgentId, status: { in: ['PENDING', 'ON_HOLD'] } }, select: { id: true } }),
+        tx.moolaRelocationRequest.findFirst({ where: { externalAgentId, status: 'PENDING' }, select: { id: true } }),
+      ]);
+      if (current?.territoryId && current.territoryId !== source.id) throw conflict('The agent’s district changed. Reload the profile and try again.');
+      if ((!existing && current) || (existing && (!current || current.sectorId !== existing.sectorId || current.cellId !== existing.cellId || current.villageId !== existing.villageId || current.venue !== existing.venue))) throw conflict('The agent’s location changed. Reload the profile before saving these details.');
+      if (current?.tcLocationDetailsCompletedAt) throw conflict('These location details have already been saved once. Send a relocation request to an administrator for any correction.');
+      if (pendingTransfer || pendingRelocation) throw conflict('Resolve the pending transfer or relocation request before saving location details.');
+      const target = locationResult.location;
+      const locationChanged = !current || current.sectorId !== target.sectorId || current.cellId !== target.cellId || current.villageId !== target.villageId || current.venue !== target.venue;
+      return tx.moolaAgentLocation.upsert({
+        where: { externalAgentId },
+        create: {
+          externalAgentId, agentName: agent.name, loginName: agent.loginName || externalAgentId,
+          ...target, locationVerified: false, tcLocationDetailsCompletedAt: new Date(), updatedById: req.user.id,
+        },
+        update: {
+          agentName: agent.name, loginName: agent.loginName || externalAgentId,
+          ...target,
+          ...(locationChanged ? { latitude: null, longitude: null, accuracy: null, locationVerified: false } : {}),
+          tcLocationDetailsCompletedAt: new Date(), updatedById: req.user.id,
+        },
+      });
+    }, { maxWait: 10000, timeout: 15000 });
+    await logAction(req.user.id, 'SAVE_TC_MOOLA_LOCATION_DETAILS', 'MoolaAgentLocation', externalAgentId, {
+      agentName: agent.name, loginName: agent.loginName || externalAgentId,
+      from: existing ? { sectorId: existing.sectorId, cellId: existing.cellId, villageId: existing.villageId, venue: existing.venue } : null,
+      to: { territoryId, ...locationResult.location },
+    }, req);
+    const withTerritory = await prisma.moolaAgentLocation.findUnique({ where: { externalAgentId }, include: { territory: { select: { id: true, name: true } } } });
+    return res.json({ location: moolaLocationShape(withTerritory) });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    console.error('TC Moola Plus location details save failed:', error.code || error.name);
+    res.status(500).json({ error: 'Could not save the agent’s location details.' });
   }
 });
 
@@ -293,6 +366,9 @@ router.post('/moola-plus/agents/:externalAgentId/location/capture', authenticate
       if (outgoingTransfer) throw conflict('This agent is awaiting transfer review.');
       if (incomingTransfer && !incomingTransfer.acceptedAt) throw conflict('Accept the agent transfer before capturing its new location.');
       if (currentLocation && currentLocation.territoryId !== territoryId) throw conflict('This agent has a different saved district. Request relocation or transfer before capturing a new location.');
+      if (currentLocation?.tcLocationDetailsCompletedAt && !incomingTransfer?.acceptedAt && (currentLocation.sectorId !== locationResult.location.sectorId || currentLocation.cellId !== locationResult.location.cellId || currentLocation.villageId !== locationResult.location.villageId || currentLocation.venue !== locationResult.location.venue)) {
+        throw conflict('Location details are locked after their one-time save. Send a relocation request to an administrator for any correction.');
+      }
       if (!currentLocation && normalizeLocationName(agent.district) !== normalizeLocationName(territory.name) && !incomingTransfer?.acceptedAt) {
         throw conflict('Choose the agent’s registered district for its first location capture.');
       }
@@ -302,12 +378,13 @@ router.post('/moola-plus/agents/:externalAgentId/location/capture', authenticate
         create: {
           externalAgentId, agentName: agent.name, loginName: agent.loginName || externalAgentId,
           ...locationResult.location, latitude, longitude, accuracy, locationVerified: true,
-          firstLocationCapturedAt: capturedAt, updatedById: req.user.id,
+          firstLocationCapturedAt: capturedAt, tcLocationDetailsCompletedAt: capturedAt, updatedById: req.user.id,
         },
         update: {
           agentName: agent.name, loginName: agent.loginName || externalAgentId,
           ...locationResult.location, latitude, longitude, accuracy, locationVerified: true,
           firstLocationCapturedAt: currentLocation?.firstLocationCapturedAt || capturedAt,
+          tcLocationDetailsCompletedAt: currentLocation?.tcLocationDetailsCompletedAt || capturedAt,
           isOnHold: false, updatedById: req.user.id,
         },
       });
@@ -640,15 +717,22 @@ router.post('/moola-plus/agents/:externalAgentId/relocation-requests', authentic
     const reason = String(req.body.reason || '').trim();
     const [agent, destination, location] = await Promise.all([
       getUpstreamMoolaAgent(req, externalAgentId),
-      prisma.territory.findUnique({ where: { id: toTerritoryId }, select: { id: true, type: true, isActive: true } }),
+      prisma.territory.findUnique({ where: { id: toTerritoryId }, select: { id: true, name: true, type: true, isActive: true } }),
       prisma.moolaAgentLocation.findUnique({ where: { externalAgentId } }),
     ]);
     if (!agent) return res.status(404).json({ error: 'Moola Plus agent not found in the upstream registry.' });
-    if (!location) return res.status(409).json({ error: 'Complete the agent’s first visit before requesting a relocation.' });
+    if (!location?.tcLocationDetailsCompletedAt) return res.status(409).json({ error: 'Save the agent’s location details once before requesting a later change.' });
     if (!(req.user.assignedTerritories || []).includes(location.territoryId)) return res.status(403).json({ error: 'This agent is outside your assigned territory.' });
-    if (!(req.user.assignedTerritories || []).includes(toTerritoryId)) return res.status(403).json({ error: 'Relocation requests must stay inside your assigned districts. Use a transfer request for another TC’s district.' });
-    if (!destination || destination.type !== 'DISTRICT' || !destination.isActive || toTerritoryId === location.territoryId) return res.status(400).json({ error: 'Choose a different active district.' });
+    if (toTerritoryId !== location.territoryId) return res.status(403).json({ error: 'Relocation requests must stay inside the agent’s current district. Use a transfer request for another TC’s district.' });
+    if (!destination || destination.type !== 'DISTRICT' || !destination.isActive) return res.status(400).json({ error: 'Choose an active district.' });
     if (reason.length > 500) return res.status(400).json({ error: 'Relocation note must be 500 characters or fewer.' });
+    const locationResult = await validateMoolaFieldLocation({ ...req.body, territoryId: toTerritoryId, venue: req.body.venue || location.venue });
+    if (locationResult.error) return res.status(400).json({ error: locationResult.error });
+    const toVenue = locationResult.location.venue;
+    const { sectorId: toSectorId, cellId: toCellId, villageId: toVillageId } = locationResult.location;
+    if (location.sectorId === toSectorId && location.cellId === toCellId && location.villageId === toVillageId && location.venue === toVenue) {
+      return res.status(400).json({ error: 'Choose a different location before requesting relocation.' });
+    }
     const request = await prisma.$transaction(async (tx) => {
       await advisoryTransactionLock(tx, externalAgentId, 'AGENT_MOVE');
       const [pending, pendingTransfer] = await Promise.all([
@@ -656,12 +740,20 @@ router.post('/moola-plus/agents/:externalAgentId/relocation-requests', authentic
         tx.moolaAgentTransfer.findFirst({ where: { externalAgentId, status: { in: ['PENDING', 'ON_HOLD'] } }, select: { id: true } }),
       ]);
       if (pending || pendingTransfer) throw conflict(pending ? 'This agent already has a relocation request awaiting review.' : 'This agent already has a transfer awaiting review.');
+      const currentLocation = await tx.moolaAgentLocation.findUnique({ where: { externalAgentId }, select: { territoryId: true, sectorId: true, cellId: true, villageId: true, venue: true, tcLocationDetailsCompletedAt: true } });
+      if (!currentLocation || currentLocation.territoryId !== location.territoryId || currentLocation.sectorId !== location.sectorId || currentLocation.cellId !== location.cellId || currentLocation.villageId !== location.villageId || currentLocation.venue !== location.venue || !currentLocation.tcLocationDetailsCompletedAt) throw conflict('The agent’s saved location changed. Reload the profile before requesting another change.');
       return tx.moolaRelocationRequest.create({ data: {
         externalAgentId, agentName: agent.name, loginName: agent.loginName || externalAgentId,
-        fromTerritoryId: location.territoryId, toTerritoryId, reason: reason || null, requestedByTcId: req.user.id,
+        fromTerritoryId: location.territoryId, toTerritoryId, toSectorId, toCellId, toVillageId, toVenue,
+        reason: reason || null, requestedByTcId: req.user.id,
       }, include: { fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } } } });
     }, { maxWait: 10000, timeout: 15000 });
-    res.status(201).json(request);
+    await logAction(req.user.id, 'REQUEST_MOOLA_LOCATION_CHANGE', 'MoolaRelocationRequest', request.id, { externalAgentId, fromTerritoryId: location.territoryId, toTerritoryId, toSectorId, toCellId, toVillageId, toVenue }, req);
+    res.status(201).json({
+      ...request,
+      destinationPath: [destination.name, locationResult.location.sectorName, locationResult.location.cellName, locationResult.location.villageName].join(' · '),
+      destinationVenue: toVenue,
+    });
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
     console.error('Moola relocation request error:', error.code || error.name);
@@ -672,7 +764,14 @@ router.post('/moola-plus/agents/:externalAgentId/relocation-requests', authentic
 router.get('/moola-plus/relocation-requests', authenticateToken, requireRole('ADMIN'), async (_req, res) => {
   try {
     const requests = await prisma.moolaRelocationRequest.findMany({ where: { status: 'PENDING' }, orderBy: { requestedAt: 'asc' }, include: { fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } }, requestedByTc: { select: { firstName: true, lastName: true, username: true } } } });
-    res.json(requests);
+    const areaIds = [...new Set(requests.flatMap(({ toSectorId, toCellId, toVillageId }) => [toSectorId, toCellId, toVillageId]).filter(Boolean))];
+    const areas = areaIds.length ? await prisma.territory.findMany({ where: { id: { in: areaIds } }, select: { id: true, name: true } }) : [];
+    const areaById = new Map(areas.map((area) => [area.id, area]));
+    res.json(requests.map((request) => ({
+      ...request,
+      destinationPath: [request.toTerritory, areaById.get(request.toSectorId), areaById.get(request.toCellId), areaById.get(request.toVillageId)].filter(Boolean).map(({ name }) => name).join(' · '),
+      destinationVenue: request.toVenue || null,
+    })));
   } catch (error) { res.status(500).json({ error: 'Could not load Moola Plus relocation requests.' }); }
 });
 
@@ -695,13 +794,23 @@ router.post('/moola-plus/relocation-requests/:id/review', authenticateToken, req
       const reviewedAt = new Date();
       const updated = await tx.moolaRelocationRequest.update({ where: { id: request.id }, data: { status: action === 'APPROVE' ? 'APPROVED' : 'REJECTED', reviewedById: req.user.id, reviewedAt, reviewNote: reviewNote || null } });
       if (action === 'APPROVE') {
-        const location = await tx.moolaAgentLocation.update({ where: { externalAgentId: request.externalAgentId }, data: { territoryId: request.toTerritoryId, sectorId: null, cellId: null, villageId: null, sectorName: null, cellName: null, villageName: null, venue: null, latitude: null, longitude: null, accuracy: null, locationVerified: false, firstLocationCapturedAt: null, updatedById: req.user.id } });
-        await createMoolaMovementNotices(tx, { externalAgentId: request.externalAgentId, agentName: request.agentName, agentCode: request.loginName, fromTerritoryId: request.fromTerritoryId, toTerritoryId: request.toTerritoryId, noticeType: 'RELOCATED' });
+        const target = request.toSectorId && request.toCellId && request.toVillageId
+          ? await validateMoolaFieldLocation({ territoryId: request.toTerritoryId, sectorId: request.toSectorId, cellId: request.toCellId, villageId: request.toVillageId, venue: request.toVenue })
+          : null;
+        if (target?.error) throw conflict(`The requested location is no longer valid: ${target.error}`);
+        const location = await tx.moolaAgentLocation.update({ where: { externalAgentId: request.externalAgentId }, data: {
+          territoryId: request.toTerritoryId,
+          sectorId: target?.location.sectorId || null, cellId: target?.location.cellId || null, villageId: target?.location.villageId || null,
+          sectorName: target?.location.sectorName || null, cellName: target?.location.cellName || null, villageName: target?.location.villageName || null,
+          venue: target?.location.venue || request.toVenue || null,
+          latitude: null, longitude: null, accuracy: null, locationVerified: false, firstLocationCapturedAt: null, updatedById: req.user.id,
+        } });
+        if (request.fromTerritoryId !== request.toTerritoryId) await createMoolaMovementNotices(tx, { externalAgentId: request.externalAgentId, agentName: request.agentName, agentCode: request.loginName, fromTerritoryId: request.fromTerritoryId, toTerritoryId: request.toTerritoryId, noticeType: 'RELOCATED' });
         return { ...updated, location };
       }
       return updated;
     });
-    await logAction(req.user.id, action === 'APPROVE' ? 'APPROVE_MOOLA_RELOCATION' : 'REJECT_MOOLA_RELOCATION', 'MoolaRelocationRequest', result.id, { externalAgentId: result.externalAgentId, toTerritoryId: result.toTerritoryId }, req);
+    await logAction(req.user.id, action === 'APPROVE' ? 'APPROVE_MOOLA_RELOCATION' : 'REJECT_MOOLA_RELOCATION', 'MoolaRelocationRequest', result.id, { externalAgentId: result.externalAgentId, toTerritoryId: result.toTerritoryId, toSectorId: result.toSectorId, toCellId: result.toCellId, toVillageId: result.toVillageId, toVenue: result.toVenue }, req);
     res.json(result);
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });

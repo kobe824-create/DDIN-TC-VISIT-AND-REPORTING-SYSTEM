@@ -205,6 +205,7 @@ model Agent {
   village                      Territory?               @relation("AgentVillage", fields: [villageId], references: [id])
   firstVisitLocationCapturedAt DateTime?
   firstVisitCompletedAt        DateTime?
+  tcLocationDetailsCompletedAt DateTime?
   championId                   String?                  @db.Uuid
   champion                     User?                    @relation("AgentChampion", fields: [championId], references: [id])
   status                       AgentStatus              @default(ACTIVE)
@@ -268,6 +269,7 @@ model AgentRelocationRequest {
   toSectorId      String                       @db.Uuid
   toCellId        String                       @db.Uuid
   toVillageId     String                       @db.Uuid
+  toVenue         String?                      @db.VarChar(200)
   latitude        Float?
   longitude       Float?
   accuracy        Float?
@@ -349,32 +351,33 @@ model Visit {
 // This is a field-location overlay keyed to the upstream DDIN ID. It does not
 // copy or replace Moola Plus agent records in the local Agent table.
 model MoolaAgentLocation {
-  externalAgentId         String                   @id
-  agentName               String
-  loginName               String
-  territoryId             String                   @db.Uuid
-  territory               Territory                @relation("MoolaLocationTerritory", fields: [territoryId], references: [id])
-  sectorId                String?                  @db.Uuid
-  sector                  Territory?               @relation("MoolaLocationSector", fields: [sectorId], references: [id], onDelete: SetNull)
-  cellId                  String?                  @db.Uuid
-  cell                    Territory?               @relation("MoolaLocationCell", fields: [cellId], references: [id], onDelete: SetNull)
-  villageId               String?                  @db.Uuid
-  village                 Territory?               @relation("MoolaLocationVillage", fields: [villageId], references: [id], onDelete: SetNull)
-  sectorName              String?
-  cellName                String?
-  villageName             String?
-  venue                   String?                  @db.VarChar(200)
-  latitude                Float?
-  longitude               Float?
-  accuracy                Float?
-  locationVerified        Boolean                  @default(false)
-  isOnHold                Boolean                  @default(false)
-  firstLocationCapturedAt DateTime?
-  firstVisitCompletedAt   DateTime?
-  updatedById             String                   @db.Uuid
-  updatedAt               DateTime                 @updatedAt
-  createdAt               DateTime                 @default(now())
-  relocationRequests      MoolaRelocationRequest[]
+  externalAgentId              String                   @id
+  agentName                    String
+  loginName                    String
+  territoryId                  String                   @db.Uuid
+  territory                    Territory                @relation("MoolaLocationTerritory", fields: [territoryId], references: [id])
+  sectorId                     String?                  @db.Uuid
+  sector                       Territory?               @relation("MoolaLocationSector", fields: [sectorId], references: [id], onDelete: SetNull)
+  cellId                       String?                  @db.Uuid
+  cell                         Territory?               @relation("MoolaLocationCell", fields: [cellId], references: [id], onDelete: SetNull)
+  villageId                    String?                  @db.Uuid
+  village                      Territory?               @relation("MoolaLocationVillage", fields: [villageId], references: [id], onDelete: SetNull)
+  sectorName                   String?
+  cellName                     String?
+  villageName                  String?
+  venue                        String?                  @db.VarChar(200)
+  latitude                     Float?
+  longitude                    Float?
+  accuracy                     Float?
+  locationVerified             Boolean                  @default(false)
+  isOnHold                     Boolean                  @default(false)
+  firstLocationCapturedAt      DateTime?
+  firstVisitCompletedAt        DateTime?
+  tcLocationDetailsCompletedAt DateTime?
+  updatedById                  String                   @db.Uuid
+  updatedAt                    DateTime                 @updatedAt
+  createdAt                    DateTime                 @default(now())
+  relocationRequests           MoolaRelocationRequest[]
 
   @@index([territoryId, locationVerified])
 }
@@ -389,6 +392,10 @@ model MoolaRelocationRequest {
   fromTerritory   Territory                    @relation("MoolaRelocationFromTerritory", fields: [fromTerritoryId], references: [id])
   toTerritoryId   String                       @db.Uuid
   toTerritory     Territory                    @relation("MoolaRelocationToTerritory", fields: [toTerritoryId], references: [id])
+  toSectorId      String?                      @db.Uuid
+  toCellId        String?                      @db.Uuid
+  toVillageId     String?                      @db.Uuid
+  toVenue         String?                      @db.VarChar(200)
   reason          String?                      @db.VarChar(500)
   requestedByTcId String                       @db.Uuid
   requestedByTc   User                         @relation("MoolaRelocationCreator", fields: [requestedByTcId], references: [id])
