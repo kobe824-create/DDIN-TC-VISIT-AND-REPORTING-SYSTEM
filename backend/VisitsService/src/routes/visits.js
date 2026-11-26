@@ -225,14 +225,31 @@ async function createMoolaMovementNotices(tx, { externalAgentId, agentName, agen
   });
 }
 
+async function supersedeMoolaAgentMoves(tx, externalAgentId, adminId) {
+  const [transfers, relocations] = await Promise.all([
+    tx.moolaAgentTransfer.findMany({ where: { externalAgentId, status: { in: ['PENDING', 'ON_HOLD'] } }, select: { id: true } }),
+    tx.moolaRelocationRequest.findMany({ where: { externalAgentId, status: 'PENDING' }, select: { id: true } }),
+  ]);
+  const reviewedAt = new Date();
+  if (transfers.length) await tx.moolaAgentTransfer.updateMany({
+    where: { id: { in: transfers.map(({ id }) => id) }, status: { in: ['PENDING', 'ON_HOLD'] } },
+    data: { status: 'CANCELLED', reviewedAt, reviewNote: 'Superseded by an administrator move.' },
+  });
+  if (relocations.length) await tx.moolaRelocationRequest.updateMany({
+    where: { id: { in: relocations.map(({ id }) => id) }, status: 'PENDING' },
+    data: { status: 'REJECTED', reviewedAt, reviewedById: adminId, reviewNote: 'Superseded by an administrator move.' },
+  });
+  return { transferIds: transfers.map(({ id }) => id), relocationIds: relocations.map(({ id }) => id) };
+}
+
 router.get('/moola-plus/relocation-districts', authenticateToken, requireTerritoryAccess, requireRole('TC'), async (req, res) => {
   try {
     const districts = await prisma.territory.findMany({
       where: { type: 'DISTRICT', isActive: true, id: { in: req.user.assignedTerritories || [] } },
-      select: { id: true, name: true },
+      select: { id: true, name: true, parent: { select: { name: true } } },
       orderBy: { name: 'asc' },
     });
-    res.json(districts);
+    res.json(districts.map(({ parent, ...district }) => ({ ...district, province: parent?.name || '' })));
   } catch (error) {
     console.error('Moola relocation district lookup error:', error.code || error.name);
     res.status(500).json({ error: 'Could not load relocation districts.' });
@@ -428,24 +445,19 @@ router.post('/moola-plus/agents/:externalAgentId/admin-relocate', authenticateTo
     if (!agent) return res.status(404).json({ error: 'Moola Plus agent not found.' });
     if (!destination || destination.type !== 'DISTRICT' || !destination.isActive) return res.status(400).json({ error: 'Choose an active destination district.' });
     const source = await moolaDistrictForAgent(agent, location);
-    if (!source) return res.status(409).json({ error: 'The agent has no recorded district. Capture the first field location before relocating.' });
-    if (source.id === destination.id) return res.status(400).json({ error: 'Choose a different district for relocation.' });
-    const updated = await prisma.$transaction(async (tx) => {
+    if (source?.id === destination.id) return res.status(400).json({ error: 'Choose a different district for relocation.' });
+    const { updated, supersededMoves } = await prisma.$transaction(async (tx) => {
       await advisoryTransactionLock(tx, externalAgentId, 'AGENT_MOVE');
-      const [pendingTransfer, pendingRelocation] = await Promise.all([
-        tx.moolaAgentTransfer.findFirst({ where: { externalAgentId, status: { in: ['PENDING', 'ON_HOLD'] } }, select: { id: true } }),
-        tx.moolaRelocationRequest.findFirst({ where: { externalAgentId, status: 'PENDING' }, select: { id: true } }),
-      ]);
-      if (pendingTransfer || pendingRelocation) throw conflict(pendingTransfer ? 'Resolve the pending transfer before relocating this agent.' : 'Resolve the pending relocation request before moving this agent.');
+      const supersededMoves = await supersedeMoolaAgentMoves(tx, externalAgentId, req.user.id);
       const moved = await tx.moolaAgentLocation.upsert({
         where: { externalAgentId },
         create: { externalAgentId, agentName: agent.name, loginName: agent.loginName || externalAgentId, territoryId: destination.id, updatedById: req.user.id },
         update: { territoryId: destination.id, sectorId: null, cellId: null, villageId: null, sectorName: null, cellName: null, villageName: null, venue: null, latitude: null, longitude: null, accuracy: null, locationVerified: false, firstLocationCapturedAt: null, isOnHold: false, updatedById: req.user.id },
       });
-      await createMoolaMovementNotices(tx, { externalAgentId, agentName: agent.name, agentCode: agent.loginName || externalAgentId, fromTerritoryId: source.id, toTerritoryId: destination.id, noticeType: 'RELOCATED' });
-      return moved;
+      await createMoolaMovementNotices(tx, { externalAgentId, agentName: agent.name, agentCode: agent.loginName || externalAgentId, fromTerritoryId: source?.id, toTerritoryId: destination.id, noticeType: 'RELOCATED' });
+      return { updated: moved, supersededMoves };
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, 'ADMIN_RELOCATE_MOOLA_AGENT', 'MoolaAgentLocation', externalAgentId, { fromTerritoryId: source.id, toTerritoryId: destination.id, reason: String(req.body.reason || '').trim().slice(0, 500) || null }, req);
+    await logAction(req.user.id, 'ADMIN_RELOCATE_MOOLA_AGENT', 'MoolaAgentLocation', externalAgentId, { fromTerritoryId: source?.id || null, toTerritoryId: destination.id, supersededMoves, reason: String(req.body.reason || '').trim().slice(0, 500) || null }, req);
     res.json({ location: moolaLocationShape(updated), territory: destination });
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
@@ -465,26 +477,21 @@ router.post('/moola-plus/agents/:externalAgentId/admin-transfer', authenticateTo
     ]);
     if (!agent) return res.status(404).json({ error: 'Moola Plus agent not found.' });
     const source = await moolaDistrictForAgent(agent, location);
-    if (!source) return res.status(409).json({ error: 'The agent has no recorded district. Capture the first field location before transferring.' });
     const destination = await prisma.tcTerritoryAssignment.findFirst({ where: { territoryId: toTerritoryId, tcId: recipientTcId, isActive: true, territory: { is: { type: 'DISTRICT', isActive: true } }, tc: { is: { role: 'TC', isActive: true } } }, select: { territory: { select: { id: true, name: true } }, tc: { select: { id: true, firstName: true, lastName: true } } } });
-    if (!destination || toTerritoryId === source.id) return res.status(400).json({ error: 'Choose an active TC assigned to a different district.' });
-    const transfer = await prisma.$transaction(async (tx) => {
+    if (!destination || toTerritoryId === source?.id) return res.status(400).json({ error: 'Choose an active TC assigned to a different district.' });
+    const { transfer, supersededMoves } = await prisma.$transaction(async (tx) => {
       await advisoryTransactionLock(tx, externalAgentId, 'AGENT_MOVE');
-      const [pendingTransfer, pendingRelocation, sourceAssignments] = await Promise.all([
-        tx.moolaAgentTransfer.findFirst({ where: { externalAgentId, status: { in: ['PENDING', 'ON_HOLD'] } }, select: { id: true } }),
-        tx.moolaRelocationRequest.findFirst({ where: { externalAgentId, status: 'PENDING' }, select: { id: true } }),
-        tx.tcTerritoryAssignment.findMany({ where: { territoryId: source.id, isActive: true, tc: { is: { role: 'TC', isActive: true } } }, select: { tcId: true } }),
-      ]);
-      if (pendingTransfer || pendingRelocation) throw conflict(pendingTransfer ? 'This agent already has a transfer awaiting review.' : 'This agent already has a relocation request awaiting review.');
+      const supersededMoves = await supersedeMoolaAgentMoves(tx, externalAgentId, req.user.id);
+      const sourceAssignments = source ? await tx.tcTerritoryAssignment.findMany({ where: { territoryId: source.id, isActive: true, tc: { is: { role: 'TC', isActive: true } } }, select: { tcId: true } }) : [];
       const created = await tx.moolaAgentTransfer.create({ data: {
         externalAgentId, agentName: agent.name, loginName: agent.loginName || externalAgentId, phoneNumber: agent.phone || null,
-        fromTerritoryId: source.id, toTerritoryId, requestedByTcId: sourceAssignments[0]?.tcId || req.user.id,
+        fromTerritoryId: source?.id || null, toTerritoryId, requestedByTcId: sourceAssignments[0]?.tcId || req.user.id,
         recipientTcId, reason: String(req.body.reason || '').trim().slice(0, 500) || null, adminRoutedAt: new Date(),
       }, include: { fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } }, recipientTc: { select: { id: true, firstName: true, lastName: true } } } });
-      await createMoolaMovementNotices(tx, { externalAgentId, agentName: agent.name, agentCode: agent.loginName || externalAgentId, fromTerritoryId: source.id, toTerritoryId, noticeType: 'TRANSFER_ROUTED' });
-      return created;
+      await createMoolaMovementNotices(tx, { externalAgentId, agentName: agent.name, agentCode: agent.loginName || externalAgentId, fromTerritoryId: source?.id, toTerritoryId, noticeType: 'TRANSFER_ROUTED' });
+      return { transfer: created, supersededMoves };
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, 'ADMIN_ROUTE_MOOLA_AGENT_TRANSFER', 'MoolaAgentTransfer', transfer.id, { externalAgentId, fromTerritoryId: source.id, toTerritoryId, recipientTcId }, req);
+    await logAction(req.user.id, 'ADMIN_ROUTE_MOOLA_AGENT_TRANSFER', 'MoolaAgentTransfer', transfer.id, { externalAgentId, fromTerritoryId: source?.id || null, toTerritoryId, recipientTcId, supersededMoves }, req);
     res.status(201).json(transfer);
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
@@ -558,7 +565,7 @@ router.put('/moola-plus/transfer-requests/:id/review', authenticateToken, requir
       if (decision === 'REJECT') {
         const changed = await tx.moolaAgentTransfer.updateMany({ where: { id: current.id, status: 'PENDING', acceptedAt: null }, data: { status: 'ON_HOLD', reviewedAt: now, reviewNote } });
         if (!changed.count) throw conflict('This Moola Plus transfer has already been reviewed.');
-        await tx.moolaAgentLocation.upsert({ where: { externalAgentId: current.externalAgentId }, create: { externalAgentId: current.externalAgentId, agentName: current.agentName, loginName: current.loginName, territoryId: current.fromTerritoryId, updatedById: req.user.id, isOnHold: true }, update: { isOnHold: true, updatedById: req.user.id } });
+        if (current.fromTerritoryId) await tx.moolaAgentLocation.upsert({ where: { externalAgentId: current.externalAgentId }, create: { externalAgentId: current.externalAgentId, agentName: current.agentName, loginName: current.loginName, territoryId: current.fromTerritoryId, updatedById: req.user.id, isOnHold: true }, update: { isOnHold: true, updatedById: req.user.id } });
         return tx.moolaAgentTransfer.findUnique({ where: { id: current.id } });
       }
       const [pendingRelocation, moved] = await Promise.all([

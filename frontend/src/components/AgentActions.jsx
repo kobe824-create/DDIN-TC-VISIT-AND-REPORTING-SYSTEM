@@ -26,7 +26,7 @@ export default function AgentActions({ agent, onAgentChange }) {
   // The TC-scoped territories endpoint is authoritative. AuthContext may hold
   // assignments from the previous login, so intersecting with that cache can
   // hide districts assigned since then.
-  const districts = useMemo(() => territories.filter((item) => item.type === 'DISTRICT' && item.isActive), [territories]);
+  const districts = useMemo(() => [...new Map(territories.filter((item) => item.type === 'DISTRICT' && item.isActive).map((item) => [item.id, item])).values()], [territories]);
   const sectors = useMemo(() => territories.filter((item) => item.type === 'SECTOR' && item.isActive && item.parentId === territoryId), [territories, territoryId]);
   const cells = useMemo(() => territories.filter((item) => item.type === 'CELL' && item.isActive && item.parentId === sectorId), [territories, sectorId]);
   const villages = useMemo(() => territories.filter((item) => item.type === 'VILLAGE' && item.isActive && item.parentId === cellId), [territories, cellId]);
@@ -189,7 +189,7 @@ export default function AgentActions({ agent, onAgentChange }) {
 function LocationForm({ mode, agent, districts, territoryId, setTerritoryId, sectors, cells, villages, sectorId, setSectorId, cellId, setCellId, villageId, setVillageId, venue, setVenue, reason, setReason, saving, error, territoriesStatus, onSubmit, onCancel }) {
   return <form className="agent-relocation-form" onSubmit={onSubmit}>
     <h4>{mode === 'INITIAL' ? 'Complete location details' : 'Request an administrator-approved change'}</h4>
-    <label>District<select value={territoryId} onChange={(event) => { setTerritoryId(event.target.value); setSectorId(''); setCellId(''); setVillageId(''); }} required disabled={territoriesStatus !== 'loaded' || (mode === 'INITIAL' && Boolean(agent.tcMoveUsed || agent.tcRelocationUsed))}><option value="">Choose an assigned district</option>{districts.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+    <label>District<select value={territoryId} onChange={(event) => { setTerritoryId(event.target.value); setSectorId(''); setCellId(''); setVillageId(''); }} required disabled={territoriesStatus !== 'loaded' || (mode === 'INITIAL' && Boolean(agent.tcMoveUsed || agent.tcRelocationUsed))}><option value="">Choose an assigned district</option>{districts.map((item) => <option key={item.id} value={item.id}>{item.name}{item.parentName ? ` · ${item.parentName}` : ''}</option>)}</select></label>
     <div className="agent-relocation-grid">
       <label>Sector<select value={sectorId} onChange={(event) => { setSectorId(event.target.value); setCellId(''); setVillageId(''); }} required disabled={territoriesStatus !== 'loaded'}><option value="">Choose sector</option>{sectors.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
       <label>Cell<select value={cellId} onChange={(event) => { setCellId(event.target.value); setVillageId(''); }} required disabled={territoriesStatus !== 'loaded' || !sectorId}><option value="">Choose cell</option>{cells.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>

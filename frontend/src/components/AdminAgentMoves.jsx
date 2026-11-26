@@ -73,7 +73,6 @@ export default function AdminAgentMoves({ network, agent, onComplete }) {
   };
 
   const selectedTarget = targets.find((item) => item.id === territoryId);
-  const currentDistrictName = String(agent.fieldLocation?.district || agent.district || '').trim().toLocaleLowerCase();
   return <div className="admin-agent-moves" onClick={(event) => event.stopPropagation()}>
     <div className="admin-agent-move-buttons">
       <button type="button" className="btn btn-secondary btn-sm" onClick={() => void open('RELOCATE')}><MapPin size={14} />Relocate</button>
@@ -82,7 +81,7 @@ export default function AdminAgentMoves({ network, agent, onComplete }) {
     {mode && <form className="admin-agent-move-form" onSubmit={submit}>
       <strong>{mode === 'RELOCATE' ? 'Relocate agent' : 'Transfer agent to a TC'}</strong>
       {loading ? <p>Loading active districts…</p> : <>
-        <label>Destination district<select className="input" required value={territoryId} onChange={(event) => { const next = event.target.value; setTerritoryId(next); setSectorId(''); setCellId(''); setVillageId(''); setRecipientTcId(targets.find((item) => item.id === next)?.coordinators?.[0]?.id || ''); }}><option value="">Choose district</option>{(mode === 'TRANSFER' ? targets : districts).filter((item) => item.id !== (agent.localTerritoryId || agent.fieldLocation?.territoryId || agent.territoryId) && item.name.trim().toLocaleLowerCase() !== currentDistrictName).map((item) => <option key={item.id} value={item.id}>{item.name}{item.province ? ` · ${item.province}` : ''}</option>)}</select></label>
+        <label>Destination district<select className="input" required value={territoryId} onChange={(event) => { const next = event.target.value; setTerritoryId(next); setSectorId(''); setCellId(''); setVillageId(''); setRecipientTcId(targets.find((item) => item.id === next)?.coordinators?.[0]?.id || ''); }}><option value="">Choose district</option>{(mode === 'TRANSFER' ? targets : districts).filter((item) => item.id !== (agent.localTerritoryId || agent.fieldLocation?.territoryId || agent.territoryId)).map((item) => <option key={item.id} value={item.id}>{item.name}{item.province ? ` · ${item.province}` : ''}</option>)}</select></label>
         {mode === 'RELOCATE' && network === 'IREMBO' && <>
           <label>Sector<select className="input" required value={sectorId} onChange={(event) => { setSectorId(event.target.value); setCellId(''); setVillageId(''); }}><option value="">Choose sector</option>{sectors.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
           <label>Cell<select className="input" value={cellId} onChange={(event) => { setCellId(event.target.value); setVillageId(''); }} disabled={!sectorId} required><option value="">Choose cell</option>{cells.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>

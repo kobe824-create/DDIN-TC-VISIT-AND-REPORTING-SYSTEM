@@ -272,12 +272,49 @@ function getIremboActivitySummary(agents, fetchedAt, stale) {
 }
 
 const normalizedFilter = (value) => String(value || '').trim().toLocaleLowerCase().replace(/\s+/g, ' ');
-function getNetworkFilterOptions(agents) {
-  const unique = (key) => [...new Set(agents.map((agent) => String(agent[key] || '').trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+const provinceAliases = new Map([
+  ['east', 'eastern province'], ['eastern', 'eastern province'], ['eastern province', 'eastern province'],
+  ['north', 'northern province'], ['northern', 'northern province'], ['northern province', 'northern province'],
+  ['south', 'southern province'], ['southern', 'southern province'], ['southern province', 'southern province'],
+  ['west', 'western province'], ['western', 'western province'], ['western province', 'western province'],
+  ['kigali', 'kigali city'], ['kigali city', 'kigali city'],
+]);
+function normalizedNetworkLocation(field, value) {
+  const normalized = normalizedFilter(value);
+  return field === 'province' ? (provinceAliases.get(normalized) || normalized) : normalized;
+}
+function displayNetworkLocation(field, value) {
+  const text = String(value || '').trim();
+  if (field === 'province') {
+    const canonical = provinceAliases.get(normalizedFilter(text));
+    if (canonical) return canonical.replace(/\b\w/g, (letter) => letter.toLocaleUpperCase());
+  }
+  return text;
+}
+async function assignedTcFilterLocations(user) {
+  if (user.role !== 'TC') return [];
+  const assignments = await prisma.tcTerritoryAssignment.findMany({
+    where: { tcId: user.id, isActive: true, territory: { is: { type: 'DISTRICT', isActive: true } } },
+    select: { territory: { select: { name: true, parent: { select: { name: true } } } } },
+  });
+  return assignments.map(({ territory }) => ({ province: territory.parent?.name || '', district: territory.name }));
+}
+function getNetworkFilterOptions(agents, additionalLocations = []) {
+  const rows = [...agents, ...additionalLocations];
+  const unique = (field) => {
+    const values = new Map();
+    for (const row of rows) {
+      const value = displayNetworkLocation(field, row[field]);
+      const key = normalizedNetworkLocation(field, value);
+      if (!value || !key) continue;
+      if (!values.has(key) || (field === 'province' && provinceAliases.has(normalizedFilter(value)))) values.set(key, value);
+    }
+    return [...values.values()].sort((a, b) => a.localeCompare(b));
+  };
   const locations = new Map();
-  for (const agent of agents) {
-    const row = Object.fromEntries(['province', 'district', 'sector', 'cell', 'village'].map((field) => [field, String(agent[field] || '').trim()]));
-    const key = Object.values(row).join('\u0000');
+  for (const agent of rows) {
+    const row = Object.fromEntries(['province', 'district', 'sector', 'cell', 'village'].map((field) => [field, displayNetworkLocation(field, agent[field])]));
+    const key = ['province', 'district', 'sector', 'cell', 'village'].map((field) => normalizedNetworkLocation(field, row[field])).join('\u0000');
     locations.set(key, row);
   }
   return { provinces: unique('province'), districts: unique('district'), sectors: unique('sector'), cells: unique('cell'), villages: unique('village'), locations: [...locations.values()] };
@@ -312,8 +349,8 @@ function filterNetworkAgents(agents, query = {}) {
     return agent;
   }).filter((agent) => {
     for (const field of filters) {
-      const selected = normalizedFilter(query[field]);
-      if (selected && normalizedFilter(agent[field]) !== selected) return false;
+      const selected = normalizedNetworkLocation(field, query[field]);
+      if (selected && normalizedNetworkLocation(field, agent[field]) !== selected) return false;
     }
     const fromDate = String(query.fromDate || '');
     const toDate = String(query.toDate || '');
@@ -874,7 +911,7 @@ router.get('/moola-plus/summary', authenticateToken, requireRole('ADMIN', 'MANAG
     const agents = filterNetworkAgents(scoped, req.query);
     const canSeeMoney = ['ADMIN', 'MANAGER'].includes(req.user.role);
     const summary = getMoolaAnalytics(agents, registry.fetchedAt, registry.stale, canSeeMoney, registry.balanceRows);
-    summary.filters = getNetworkFilterOptions(scoped);
+    summary.filters = getNetworkFilterOptions(scoped, await assignedTcFilterLocations(req.user));
     summary.performance = await getPerformanceSnapshot(agents.map((agent) => ({ ...agent, transactionCount: agent.reportedDepositCount })), req.user);
     res.json(summary);
   } catch (error) {
@@ -921,7 +958,7 @@ router.get('/moola-plus/agents', authenticateToken, requireRole('ADMIN', 'MANAGE
       fetchedAt: registry.fetchedAt,
       stale: registry.stale,
       filters: {
-        ...getNetworkFilterOptions(scoped),
+        ...getNetworkFilterOptions(scoped, await assignedTcFilterLocations(req.user)),
       },
     });
   } catch (error) {
@@ -948,7 +985,7 @@ router.get('/irembo/agents', authenticateToken, requireRole('ADMIN', 'MANAGER', 
     const pageAgents = filtered.slice((page - 1) * limit, page * limit);
     res.json({
       data: pageAgents, total: filtered.length, page, pages,
-      filters: getNetworkFilterOptions(scoped), activityLevels: getIremboActivityLevels(), fetchedAt: feed.fetchedAt, stale: feed.stale,
+      filters: getNetworkFilterOptions(scoped, await assignedTcFilterLocations(req.user)), activityLevels: getIremboActivityLevels(), fetchedAt: feed.fetchedAt, stale: feed.stale,
     });
   } catch (error) {
     console.error('Irembo agent list error:', error.name || 'Error');
@@ -993,7 +1030,7 @@ router.get('/irembo/activity', authenticateToken, requireRole('ADMIN', 'MANAGER'
     const scoped = scopedMoolaAgents(await enrichIremboTerritories(feed.agents), districts);
     const agents = filterNetworkAgents(scoped, req.query);
     const summary = getIremboActivitySummary(agents, feed.fetchedAt, feed.stale);
-    summary.filters = getNetworkFilterOptions(scoped);
+    summary.filters = getNetworkFilterOptions(scoped, await assignedTcFilterLocations(req.user));
     summary.performance = await getPerformanceSnapshot(agents, req.user);
     res.json(summary);
   } catch (error) {

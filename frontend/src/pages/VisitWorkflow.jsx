@@ -1164,7 +1164,7 @@ export default function VisitWorkflow() {
               <select id="visit-work-territory" className="form-select visit-route-district" value={workTerritoryId || workDistrict?.id || ''} onChange={(event) => {
                 setWorkTerritoryId(event.target.value); setWorkSectorIds([]); setWorkCellIds([]); setWorkVillageIds([]); setAgentPage(1);
               }}>
-                {workTerritories.map((territory) => <option value={territory.id} key={territory.id}>{territory.name}</option>)}
+                {workTerritories.map((territory) => <option value={territory.id} key={territory.id}>{territory.name}{territory.type === 'DISTRICT' && territory.parentName ? ` · ${territory.parentName}` : ''}</option>)}
               </select>
               {!workTerritories.length && <p className="text-sm text-amber-800">Connect to refresh your assigned territories before planning the day.</p>}
               {!isMoolaPlus && <div className="visit-route-filters">
@@ -1250,7 +1250,7 @@ export default function VisitWorkflow() {
           {showMoolaLocationCapture && !selectedAgent.moolaPendingRelocation && <div className="first-visit-location-panel">
             <div className="first-visit-location-intro"><span className="first-visit-location-mark"><MapPin size={18} aria-hidden="true" /></span><div><span className="first-visit-location-kicker">MOOLA PLUS FIELD LOCATION</span><h3>Set the agent’s area and venue</h3><p>Choose the official district, sector, cell and village. GPS is captured with this check-in.</p></div></div>
             <div className="grid gap-3 sm:grid-cols-2">
-              <label className="text-sm font-medium text-gray-700">District<select className="form-select mt-1 w-full" value={firstVisitFields.territoryId} onChange={(event) => setFirstVisitFields((current) => ({ ...current, territoryId: event.target.value, sectorId: '', cellId: '', cellName: '', villageId: '', villageName: '' }))}><option value="">Choose district</option>{workTerritories.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+              <label className="text-sm font-medium text-gray-700">District<select className="form-select mt-1 w-full" value={firstVisitFields.territoryId} onChange={(event) => setFirstVisitFields((current) => ({ ...current, territoryId: event.target.value, sectorId: '', cellId: '', cellName: '', villageId: '', villageName: '' }))}><option value="">Choose district</option>{workTerritories.map((item) => <option key={item.id} value={item.id}>{item.name}{item.type === 'DISTRICT' && item.parentName ? ` · ${item.parentName}` : ''}</option>)}</select></label>
               <label className="text-sm font-medium text-gray-700">Sector<select className="form-select mt-1 w-full" value={firstVisitFields.sectorId} onChange={(event) => setFirstVisitFields((current) => ({ ...current, sectorId: event.target.value, cellId: '', cellName: '', villageId: '', villageName: '' }))} disabled={!locationDistrict}><option value="">Choose sector</option>{locationSectors.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
               <label className="text-sm font-medium text-gray-700">Cell<select className="form-select mt-1 w-full" value={firstVisitFields.cellId} onChange={(event) => { const cell = locationCells.find((item) => item.id === event.target.value); setFirstVisitFields((current) => ({ ...current, cellId: cell?.id || '', cellName: cell?.name || '', villageId: '', villageName: '' })); }} disabled={!locationSector}><option value="">Choose cell</option>{locationCells.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
               <label className="text-sm font-medium text-gray-700">Village<select className="form-select mt-1 w-full" value={firstVisitFields.villageId} onChange={(event) => { const village = locationVillages.find((item) => item.id === event.target.value); setFirstVisitFields((current) => ({ ...current, villageId: village?.id || '', villageName: village?.name || '' })); }} disabled={!locationCell}><option value="">Choose village</option>{locationVillages.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
@@ -1274,7 +1274,7 @@ export default function VisitWorkflow() {
               <div className="grid gap-3 sm:grid-cols-2">
                 <label className="text-sm font-medium text-gray-700">District
                   <select className="form-select mt-1 w-full" value={firstVisitFields.territoryId} disabled={!needsLocationCapture} onChange={(event) => setFirstVisitFields((current) => ({ ...current, territoryId: event.target.value, sectorId: '', cellId: '', cellName: '', villageId: '', villageName: '' }))}>
-                    <option value="">Choose district</option>{workTerritories.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                    <option value="">Choose district</option>{workTerritories.map((item) => <option key={item.id} value={item.id}>{item.name}{item.type === 'DISTRICT' && item.parentName ? ` · ${item.parentName}` : ''}</option>)}
                   </select>
                 </label>
                 <label className="text-sm font-medium text-gray-700">Sector

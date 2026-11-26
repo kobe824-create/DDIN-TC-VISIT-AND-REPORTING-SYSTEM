@@ -417,8 +417,8 @@ model MoolaAgentTransfer {
   agentName       String
   loginName       String
   phoneNumber     String?
-  fromTerritoryId String              @db.Uuid
-  fromTerritory   Territory           @relation("MoolaTransferFromTerritory", fields: [fromTerritoryId], references: [id])
+  fromTerritoryId String?             @db.Uuid
+  fromTerritory   Territory?          @relation("MoolaTransferFromTerritory", fields: [fromTerritoryId], references: [id])
   toTerritoryId   String              @db.Uuid
   toTerritory     Territory           @relation("MoolaTransferToTerritory", fields: [toTerritoryId], references: [id])
   requestedByTcId String              @db.Uuid

@@ -1275,8 +1275,24 @@ router.post('/moola-plus-sector-groups/:groupId/create', authenticateToken, requ
   }
 });
 
-async function lockAgentMoveAndCheckPending(tx, agentId) {
+async function lockAgentMoveAndCheckPending(tx, agentId, adminOverride = null) {
   await advisoryTransactionLock(tx, agentId, 'AGENT_MOVE');
+  if (adminOverride?.enabled) {
+    const [transfers, relocations] = await Promise.all([
+      tx.agentTransfer.findMany({ where: { agentId, status: { in: ['PENDING', 'ON_HOLD'] } }, select: { id: true } }),
+      tx.agentRelocationRequest.findMany({ where: { agentId, status: 'PENDING' }, select: { id: true } }),
+    ]);
+    const reviewedAt = new Date();
+    if (transfers.length) await tx.agentTransfer.updateMany({
+      where: { id: { in: transfers.map(({ id }) => id) }, status: { in: ['PENDING', 'ON_HOLD'] } },
+      data: { status: 'CANCELLED', reviewedAt, reviewNote: 'Superseded by an administrator move.' },
+    });
+    if (relocations.length) await tx.agentRelocationRequest.updateMany({
+      where: { id: { in: relocations.map(({ id }) => id) }, status: 'PENDING' },
+      data: { status: 'REJECTED', reviewedAt, reviewedById: adminOverride.userId, reviewNote: 'Superseded by an administrator move.' },
+    });
+    return { transferIds: transfers.map(({ id }) => id), relocationIds: relocations.map(({ id }) => id) };
+  }
   const [pendingTransfer, pendingRelocation] = await Promise.all([
     tx.agentTransfer.findFirst({ where: { agentId, status: 'PENDING' }, select: { id: true } }),
     tx.agentRelocationRequest.findFirst({ where: { agentId, status: 'PENDING' }, select: { id: true } }),
@@ -1288,6 +1304,7 @@ async function lockAgentMoveAndCheckPending(tx, agentId) {
     conflict.statusCode = 409;
     throw conflict;
   }
+  return { transferIds: [], relocationIds: [] };
 }
 
 router.get('/', authenticateToken, requireTerritoryAccess, async (req, res) => {
@@ -1621,22 +1638,20 @@ router.post('/:id/admin-transfer', authenticateToken, requireRole('ADMIN'), asyn
     const recipientTcId = String(req.body.recipientTcId || '').trim();
     const destination = await prisma.tcTerritoryAssignment.findFirst({ where: { territoryId: toTerritoryId, tcId: recipientTcId, isActive: true, territory: { is: { type: 'DISTRICT', isActive: true } }, tc: { is: { role: 'TC', isActive: true } } }, select: { territory: { select: { id: true, name: true } }, tc: { select: { id: true, firstName: true, lastName: true } } } });
     if (!destination || toTerritoryId === agent.territoryId) return res.status(400).json({ error: 'Choose an active TC assigned to a different district.' });
-    const transfer = await prisma.$transaction(async (tx) => {
-      await advisoryTransactionLock(tx, agent.id, 'AGENT_MOVE');
-      const [pendingTransfer, pendingRelocation, sourceAssignment] = await Promise.all([
-        tx.agentTransfer.findFirst({ where: { agentId: agent.id, status: { in: ['PENDING', 'ON_HOLD'] } }, select: { id: true } }),
-        tx.agentRelocationRequest.findFirst({ where: { agentId: agent.id, status: 'PENDING' }, select: { id: true } }),
-        tx.tcTerritoryAssignment.findFirst({ where: { territoryId: agent.territoryId, isActive: true, tc: { is: { role: 'TC', isActive: true } } }, select: { tcId: true } }),
-      ]);
-      if (pendingTransfer || pendingRelocation) throw Object.assign(new Error(pendingTransfer ? 'This agent already has a transfer awaiting review.' : 'This agent already has a relocation request awaiting review.'), { statusCode: 409 });
+    const { transfer, supersededMoves } = await prisma.$transaction(async (tx) => {
+      const supersededMoves = await lockAgentMoveAndCheckPending(tx, agent.id, { enabled: true, userId: req.user.id });
+      const sourceAssignment = await tx.tcTerritoryAssignment.findFirst({
+        where: { territoryId: agent.territoryId, isActive: true, tc: { is: { role: 'TC', isActive: true } } },
+        select: { tcId: true },
+      });
       const created = await tx.agentTransfer.create({ data: {
         agentId: agent.id, fromTerritoryId: agent.territoryId, toTerritoryId, requestedByTcId: sourceAssignment?.tcId || req.user.id,
         recipientTcId, reason: String(req.body.reason || '').trim().slice(0, 500) || null, adminRoutedAt: new Date(),
       }, include: { fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } }, recipientTc: { select: { id: true, firstName: true, lastName: true } } } });
       if (sourceAssignment?.tcId) await tx.agentMovementNotice.create({ data: { recipientTcId: sourceAssignment.tcId, agentId: agent.id, network: 'IREMBO', agentName: agent.name, agentCode: agent.agentId, noticeType: 'TRANSFER_ROUTED', fromTerritoryName: (await tx.territory.findUnique({ where: { id: agent.territoryId }, select: { name: true } }))?.name, toTerritoryName: destination.territory.name } });
-      return created;
+      return { transfer: created, supersededMoves };
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, 'ADMIN_ROUTE_AGENT_TRANSFER', 'Agent', agent.id, { transferId: transfer.id, fromTerritoryId: agent.territoryId, toTerritoryId, recipientTcId }, req);
+    await logAction(req.user.id, 'ADMIN_ROUTE_AGENT_TRANSFER', 'Agent', agent.id, { transferId: transfer.id, fromTerritoryId: agent.territoryId, toTerritoryId, recipientTcId, supersededMoves }, req);
     res.status(201).json(transfer);
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
@@ -2300,8 +2315,10 @@ router.patch('/:id/location', authenticateToken, requireRole('ADMIN'), async (re
     if (hierarchyError) return res.status(400).json({ error: hierarchyError });
     const reason = String(req.body.reason || '').trim().slice(0, 500) || (moved ? 'Administrator relocation' : 'Administrator GPS correction');
     const currentAddress = moved ? await areaAddress({ territoryId: nextTerritoryId, sectorId: nextSectorId, cellId: nextCellId, villageId: nextVillageId }) : undefined;
-    const agent = await prisma.$transaction(async (tx) => {
-      await lockAgentMoveAndCheckPending(tx, existing.id);
+    const { agent, supersededMoves } = await prisma.$transaction(async (tx) => {
+      const supersededMoves = moved
+        ? await lockAgentMoveAndCheckPending(tx, existing.id, { enabled: true, userId: req.user.id })
+        : (await advisoryTransactionLock(tx, existing.id, 'AGENT_MOVE'), { transferIds: [], relocationIds: [] });
       const updatedCount = await tx.agent.updateMany({ where: {
         id: req.params.id,
         territoryId: existing.territoryId,
@@ -2324,14 +2341,14 @@ router.patch('/:id/location', authenticateToken, requireRole('ADMIN'), async (re
       const updated = await tx.agent.findUnique({ where: { id: req.params.id } });
       if (moved) await createAgentMovementNotices(tx, { agent: updated, fromTerritoryId: existing.territoryId, toTerritoryId: nextTerritoryId, noticeType: 'RELOCATED' });
       if (!moved) await tx.agentLocation.create({ data: { agentId: updated.id, latitude, longitude, accuracy, recordedById: req.user.id, reason } });
-      return updated;
+      return { agent: updated, supersededMoves };
     });
     await logAction(req.user.id, moved ? 'ADMIN_RELOCATE_AGENT' : 'ADMIN_UPDATE_AGENT_LOCATION', 'Agent', agent.id, {
       agentName: agent.name, agentCode: agent.agentId, reason,
       fromTerritoryId: existing.territoryId, toTerritoryId: nextTerritoryId,
       fromSectorId: existing.sectorId, toSectorId: nextSectorId,
       fromCellId: existing.cellId, toCellId: nextCellId,
-      fromVillageId: existing.villageId, toVillageId: nextVillageId,
+      fromVillageId: existing.villageId, toVillageId: nextVillageId, supersededMoves,
     }, req);
     res.json(agent);
   } catch (error) {
