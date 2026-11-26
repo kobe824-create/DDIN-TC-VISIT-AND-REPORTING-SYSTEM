@@ -8,6 +8,7 @@ import LoginPage from './pages/LoginPage';
 import ForgotPassword from './pages/ForgotPassword';
 import Dashboard from './pages/Dashboard';
 import AgentList from './pages/AgentList';
+import AgentMoveTracker from './pages/AgentMoveTracker';
 import AgentForm from './pages/AgentForm';
 import AgentDetail from './pages/AgentDetail';
 import MoolaPlusAgentDetail from './pages/MoolaPlusAgentDetail';
@@ -75,6 +76,7 @@ const AppRoutes = () => {
 
         {/* Agents */}
         <Route path="/agents" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER', 'TC', 'CHAMPION']}><AgentList /></ProtectedRoute>} />
+        <Route path="/agent-moves" element={<ProtectedRoute allowedRoles={['TC']}><AgentMoveTracker /></ProtectedRoute>} />
         <Route path="/irembo/agents/:id" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER', 'TC', 'CHAMPION']}><IremboAgentDetail /></ProtectedRoute>} />
         <Route path="/moola-plus/agents/:id" element={<ProtectedRoute allowedRoles={['ADMIN', 'MANAGER', 'TC', 'CHAMPION']}><MoolaPlusAgentDetail /></ProtectedRoute>} />
         <Route path="/sector-groups" element={<ProtectedRoute allowedRoles={['TC']}><SectorGroups /></ProtectedRoute>} />

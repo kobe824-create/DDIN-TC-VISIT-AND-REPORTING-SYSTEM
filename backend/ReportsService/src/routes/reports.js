@@ -703,6 +703,170 @@ function shapeMoolaAgent(agent, canSeeMoney) {
   return canSeeMoney ? { ...publicFields, totalDeposited } : publicFields;
 }
 
+const movementTimestamp = (event) => event.completedAt || event.reviewedAt || event.requestedAt || null;
+
+function createMovementTrackerRow(agent, events, tcId, network) {
+  const chronological = [...events].sort((a, b) => new Date(movementTimestamp(b) || 0) - new Date(movementTimestamp(a) || 0));
+  const successful = chronological.filter((event) => event.successful);
+  const mine = successful.filter((event) => event.requestedByTcId === tcId);
+  const pending = chronological.filter((event) => event.requestedByTcId === tcId && event.pending);
+  const latest = mine[0] || successful[0] || pending[0] || null;
+  const status = successful.length ? 'MOVED' : pending.length ? 'PENDING' : 'NOT_MOVED';
+  const district = agent.district || agent.territory || '';
+  const displayName = agent.name || agent.agentName || agent.agentId || agent.id || 'Agent';
+  return {
+    id: String(agent.id || agent.agentId),
+    code: String(agent.agentId || agent.loginName || agent.id || ''),
+    name: displayName,
+    phone: agent.phoneNumber || agent.phone || '',
+    district,
+    location: [agent.sector, agent.cell, agent.village].filter(Boolean).join(' · '),
+    status,
+    movedByMe: mine.length > 0,
+    movementType: latest?.kind || null,
+    movedAt: latest ? movementTimestamp(latest) : null,
+    movedBy: latest?.requestedByName || '',
+    profilePath: network === 'IREMBO'
+      ? (agent.trackerFallback && agent.localAgentId
+        ? `/agents/${encodeURIComponent(agent.localAgentId)}`
+        : `/irembo/agents/${encodeURIComponent(agent.id || agent.agentId)}`)
+      : `/moola-plus/agents/${encodeURIComponent(agent.id)}`,
+  };
+}
+
+function movementTrackerResponse(rows, req) {
+  const movedByMe = rows.filter((row) => row.movedByMe);
+  const distinctByType = (type) => new Set(movedByMe.filter((row) => row.movementType === type).map((row) => row.id)).size;
+  const summary = {
+    totalAgents: rows.length,
+    moved: rows.filter((row) => row.status === 'MOVED').length,
+    movedByMe: new Set(movedByMe.map((row) => row.id)).size,
+    transfersByMe: distinctByType('TRANSFER'),
+    relocationsByMe: distinctByType('RELOCATION'),
+    pending: rows.filter((row) => row.status === 'PENDING').length,
+    notMoved: rows.filter((row) => row.status === 'NOT_MOVED').length,
+  };
+  const search = String(req.query.search || '').trim().toLocaleLowerCase();
+  const district = String(req.query.district || '').trim();
+  const status = String(req.query.status || 'ALL').trim().toUpperCase();
+  const kind = String(req.query.kind || 'ALL').trim().toUpperCase();
+  const filtered = rows.filter((row) => {
+    if (status === 'MOVED_BY_ME' ? !row.movedByMe : status !== 'ALL' && row.status !== status) return false;
+    if (kind !== 'ALL' && row.movementType !== kind) return false;
+    if (district && normalizeDistrictName(row.district) !== normalizeDistrictName(district)) return false;
+    if (search && ![row.name, row.code, row.phone, row.district, row.location].some((value) => String(value || '').toLocaleLowerCase().includes(search))) return false;
+    return true;
+  }).sort((a, b) => a.name.localeCompare(b.name));
+  const limit = 25;
+  const pages = Math.ceil(filtered.length / limit);
+  const requestedPage = Number.parseInt(req.query.page, 10);
+  const page = Math.min(Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1, Math.max(pages, 1));
+  return {
+    data: filtered.slice((page - 1) * limit, page * limit),
+    total: filtered.length,
+    page,
+    pages,
+    limit,
+    summary,
+    filters: { districts: [...new Set(rows.map((row) => row.district).filter(Boolean))].sort((a, b) => a.localeCompare(b)) },
+  };
+}
+
+router.get('/agent-movement-tracker', authenticateToken, requireRole('TC'), async (req, res) => {
+  try {
+    const network = String(req.query.network || 'IREMBO').toUpperCase();
+    if (!['IREMBO', 'MOOLA_PLUS'].includes(network)) return res.status(400).json({ error: 'Choose Irembo or Moola Plus.' });
+    const districts = await allowedNetworkDistricts(req.user);
+    const rows = [];
+
+    if (network === 'IREMBO') {
+      const [feed, activeAssignments] = await Promise.all([
+        fetchIremboActivityData(),
+        prisma.tcTerritoryAssignment.findMany({ where: { tcId: req.user.id, isActive: true, territory: { is: { type: 'DISTRICT', isActive: true } } }, select: { territory: { select: { name: true } } } }),
+      ]);
+      const roster = scopedMoolaAgents((await enrichIremboTerritories(feed.agents)).filter((agent) => !agent.isOnHold), districts);
+      const transferRows = await prisma.agentTransfer.findMany({
+        where: { requestedByTcId: req.user.id, status: { in: ['PENDING', 'ON_HOLD', 'COMPLETED'] } },
+        select: { agentId: true, requestedByTcId: true, requestedAt: true, completedAt: true, reviewedAt: true, status: true, fromTerritory: { select: { name: true } }, toTerritory: { select: { name: true } }, requestedByTc: { select: { firstName: true, lastName: true } }, agent: { select: { id: true, agentId: true, name: true, phoneNumber: true, territory: { select: { name: true } }, sector: { select: { name: true } }, cell: { select: { name: true } }, village: { select: { name: true } } } } },
+      });
+      const relocationRows = await prisma.agentRelocationRequest.findMany({
+        where: { requestedByTcId: req.user.id, status: { in: ['PENDING', 'APPROVED'] } },
+        select: { agentId: true, requestedByTcId: true, requestedAt: true, reviewedAt: true, status: true, fromTerritory: { select: { name: true } }, toTerritory: { select: { name: true } }, requestedByTc: { select: { firstName: true, lastName: true } }, agent: { select: { id: true, agentId: true, name: true, phoneNumber: true, territory: { select: { name: true } }, sector: { select: { name: true } }, cell: { select: { name: true } }, village: { select: { name: true } } } } },
+      });
+      const candidates = new Map(roster.map((agent) => [String(agent.agentId || agent.id), { ...agent, trackerKey: String(agent.agentId || agent.id) }]));
+      for (const event of [...transferRows, ...relocationRows]) {
+        const agent = event.agent;
+        if (!agent?.agentId || candidates.has(String(agent.agentId))) continue;
+        const assignedSource = activeAssignments.some(({ territory }) => normalizeDistrictName(territory.name) === normalizeDistrictName(event.fromTerritory?.name));
+        if (assignedSource) candidates.set(String(agent.agentId), {
+          id: agent.agentId, agentId: agent.agentId, name: agent.name, phoneNumber: agent.phoneNumber,
+          district: agent.territory?.name || event.toTerritory?.name || '', sector: agent.sector?.name || '', cell: agent.cell?.name || '', village: agent.village?.name || '',
+          localAgentId: agent.id, trackerKey: String(agent.agentId), trackerFallback: true,
+        });
+      }
+      const localIds = [...new Set([...candidates.values()].map((agent) => agent.localAgentId).filter(Boolean))];
+      const [completedTransfers, approvedRelocations] = localIds.length ? await Promise.all([
+        prisma.agentTransfer.findMany({ where: { agentId: { in: localIds }, status: 'COMPLETED' }, select: { agentId: true, requestedByTcId: true, requestedAt: true, completedAt: true, status: true, fromTerritory: { select: { name: true } }, toTerritory: { select: { name: true } }, requestedByTc: { select: { firstName: true, lastName: true } } } }),
+        prisma.agentRelocationRequest.findMany({ where: { agentId: { in: localIds }, status: 'APPROVED' }, select: { agentId: true, requestedByTcId: true, requestedAt: true, reviewedAt: true, status: true, fromTerritory: { select: { name: true } }, toTerritory: { select: { name: true } }, requestedByTc: { select: { firstName: true, lastName: true } } } }),
+      ]) : [[], []];
+      for (const agent of candidates.values()) {
+        const localId = agent.localAgentId;
+        const events = [
+          ...completedTransfers.filter((event) => event.agentId === localId).map((event) => ({ ...event, kind: 'TRANSFER', successful: true, pending: false, requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
+          ...approvedRelocations.filter((event) => event.agentId === localId).map((event) => ({ ...event, kind: 'RELOCATION', successful: true, pending: false, requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
+          ...transferRows.filter((event) => event.agentId === localId).map((event) => ({ ...event, kind: 'TRANSFER', successful: event.status === 'COMPLETED', pending: ['PENDING', 'ON_HOLD'].includes(event.status), requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
+          ...relocationRows.filter((event) => event.agentId === localId).map((event) => ({ ...event, kind: 'RELOCATION', successful: event.status === 'APPROVED', pending: event.status === 'PENDING', requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
+        ];
+        rows.push(createMovementTrackerRow(agent, events, req.user.id, network));
+      }
+      void feed;
+    } else {
+      const [registry, activeAssignments] = await Promise.all([
+        fetchDdinAgentData(),
+        prisma.tcTerritoryAssignment.findMany({ where: { tcId: req.user.id, isActive: true, territory: { is: { type: 'DISTRICT', isActive: true } } }, select: { territory: { select: { name: true } } } }),
+      ]);
+      const roster = await withMoolaFieldLocations(registry.agents, districts, true);
+      const transferRows = await prisma.moolaAgentTransfer.findMany({
+        where: { requestedByTcId: req.user.id, status: { in: ['PENDING', 'ON_HOLD', 'COMPLETED'] } },
+        select: { externalAgentId: true, agentName: true, loginName: true, phoneNumber: true, requestedByTcId: true, requestedAt: true, completedAt: true, reviewedAt: true, status: true, fromTerritory: { select: { name: true } }, toTerritory: { select: { name: true } }, requestedByTc: { select: { firstName: true, lastName: true } } },
+      });
+      const relocationRows = await prisma.moolaRelocationRequest.findMany({
+        where: { requestedByTcId: req.user.id, status: { in: ['PENDING', 'APPROVED'] } },
+        select: { externalAgentId: true, agentName: true, loginName: true, requestedByTcId: true, requestedAt: true, reviewedAt: true, status: true, fromTerritory: { select: { name: true } }, toTerritory: { select: { name: true } }, requestedByTc: { select: { firstName: true, lastName: true } } },
+      });
+      const candidates = new Map(roster.map((agent) => [String(agent.id), { ...agent, trackerKey: String(agent.id) }]));
+      for (const event of [...transferRows, ...relocationRows]) {
+        if (candidates.has(String(event.externalAgentId))) continue;
+        const assignedSource = activeAssignments.some(({ territory }) => normalizeDistrictName(territory.name) === normalizeDistrictName(event.fromTerritory?.name));
+        if (assignedSource) candidates.set(String(event.externalAgentId), {
+          id: String(event.externalAgentId), name: event.agentName, loginName: event.loginName, phone: event.phoneNumber || '',
+          district: event.toTerritory?.name || event.fromTerritory?.name || '', sector: '', cell: '', village: '', trackerKey: String(event.externalAgentId),
+        });
+      }
+      const externalIds = [...candidates.keys()];
+      const [completedTransfers, approvedRelocations] = externalIds.length ? await Promise.all([
+        prisma.moolaAgentTransfer.findMany({ where: { externalAgentId: { in: externalIds }, status: 'COMPLETED' }, select: { externalAgentId: true, requestedByTcId: true, requestedAt: true, completedAt: true, status: true, fromTerritory: { select: { name: true } }, toTerritory: { select: { name: true } }, requestedByTc: { select: { firstName: true, lastName: true } } } }),
+        prisma.moolaRelocationRequest.findMany({ where: { externalAgentId: { in: externalIds }, status: 'APPROVED' }, select: { externalAgentId: true, requestedByTcId: true, requestedAt: true, reviewedAt: true, status: true, fromTerritory: { select: { name: true } }, toTerritory: { select: { name: true } }, requestedByTc: { select: { firstName: true, lastName: true } } } }),
+      ]) : [[], []];
+      for (const agent of candidates.values()) {
+        const id = String(agent.id);
+        const events = [
+          ...completedTransfers.filter((event) => event.externalAgentId === id).map((event) => ({ ...event, kind: 'TRANSFER', successful: true, pending: false, requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
+          ...approvedRelocations.filter((event) => event.externalAgentId === id).map((event) => ({ ...event, kind: 'RELOCATION', successful: true, pending: false, requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
+          ...transferRows.filter((event) => String(event.externalAgentId) === id).map((event) => ({ ...event, kind: 'TRANSFER', successful: event.status === 'COMPLETED', pending: ['PENDING', 'ON_HOLD'].includes(event.status), requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
+          ...relocationRows.filter((event) => String(event.externalAgentId) === id).map((event) => ({ ...event, kind: 'RELOCATION', successful: event.status === 'APPROVED', pending: event.status === 'PENDING', requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
+        ];
+        rows.push(createMovementTrackerRow(agent, events, req.user.id, network));
+      }
+      void registry;
+    }
+    res.json(movementTrackerResponse(rows, req));
+  } catch (error) {
+    console.error('TC agent movement tracker error:', error.code || error.name || 'Error');
+    res.status(502).json({ error: 'Could not load your transfer and relocation activity.' });
+  }
+});
+
 router.get('/moola-plus/summary', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC', 'CHAMPION'), async (req, res) => {
   try {
     const [registry, districts] = await Promise.all([fetchDdinAgentData(req.query.refresh === 'true'), allowedNetworkDistricts(req.user)]);

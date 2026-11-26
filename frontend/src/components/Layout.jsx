@@ -3,7 +3,7 @@ import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
   ChevronDown, FileBarChart2, FileClock, Inbox, Upload,
   LayoutDashboard, LogOut, Map, MapPinned, Menu, Settings2, ShieldCheck,
-  KeyRound, MessageCircle, UserRound, UsersRound, X
+  Activity, KeyRound, MessageCircle, UserRound, UsersRound, X
 } from 'lucide-react';
 import { useAuth } from '../AuthContext';
 import { IREMBO_NETWORK, MOOLA_PLUS_NETWORK, useNetwork } from '../NetworkContext';
@@ -15,6 +15,7 @@ import { syncPendingVisits } from '../offline/sync';
 const primaryNav = [
   { label: 'Visits', path: '/visits', icon: MapPinned, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
   { label: 'Agents', path: '/agents', icon: UsersRound, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
+  { label: 'Agent moves', path: '/agent-moves', icon: Activity, roles: ['TC'] },
   { label: 'WhatsApp groups', path: '/sector-groups', icon: MessageCircle, roles: ['TC'] },
   { label: 'Reports', path: '/reports', icon: FileBarChart2, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
   { label: 'Request inbox', path: '/admin/requests', icon: Inbox, roles: ['ADMIN'] },
