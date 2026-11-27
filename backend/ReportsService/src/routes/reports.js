@@ -904,6 +904,137 @@ router.get('/agent-movement-tracker', authenticateToken, requireRole('TC'), asyn
   }
 });
 
+router.get('/moola-plus/movements', authenticateToken, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const todayKey = kigaliDateKey(new Date());
+    const selected = selectedDateWindow(String(req.query.fromDate || ''), String(req.query.toDate || ''), todayKey);
+    if (selected.error) return res.status(400).json({ error: selected.error });
+    const requestedAt = { gte: selected.range.gte, lt: selected.range.lt };
+    const [transfers, relocations, transferStatusCounts, acceptedTransfers, relocationStatusCounts, adminMoves, venueAudits, relocationAudits] = await Promise.all([
+      prisma.moolaAgentTransfer.findMany({ where: { requestedAt }, orderBy: [{ requestedAt: 'desc' }, { id: 'desc' }], take: 500, include: {
+        fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } },
+        requestedByTc: { select: { firstName: true, lastName: true, username: true } }, recipientTc: { select: { firstName: true, lastName: true, username: true } },
+      } }),
+      prisma.moolaRelocationRequest.findMany({ where: { requestedAt }, orderBy: [{ requestedAt: 'desc' }, { id: 'desc' }], take: 500, include: {
+        fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } },
+        requestedByTc: { select: { firstName: true, lastName: true, username: true } }, reviewedBy: { select: { firstName: true, lastName: true, username: true } },
+      } }),
+      prisma.moolaAgentTransfer.groupBy({ by: ['status'], where: { requestedAt }, _count: { _all: true } }),
+      prisma.moolaAgentTransfer.count({ where: { requestedAt, status: 'PENDING', acceptedAt: { not: null } } }),
+      prisma.moolaRelocationRequest.groupBy({ by: ['status'], where: { requestedAt }, _count: { _all: true } }),
+      prisma.auditLog.findMany({ where: { action: 'ADMIN_RELOCATE_MOOLA_AGENT', resourceType: 'MoolaAgentLocation', createdAt: requestedAt }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 500, include: { user: { select: { firstName: true, lastName: true, username: true } } } }),
+      prisma.auditLog.findMany({ where: { action: 'SAVE_TC_MOOLA_LOCATION_DETAILS', resourceType: 'MoolaAgentLocation', createdAt: requestedAt }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 1000, include: { user: { select: { firstName: true, lastName: true, username: true } } } }),
+      prisma.auditLog.findMany({ where: { action: 'REQUEST_MOOLA_LOCATION_CHANGE', resourceType: 'MoolaRelocationRequest', createdAt: requestedAt }, select: { resourceId: true, details: true } }),
+    ]);
+    const transferCounts = Object.fromEntries(transferStatusCounts.map((row) => [row.status, row._count._all]));
+    const relocationCounts = Object.fromEntries(relocationStatusCounts.map((row) => [row.status, row._count._all]));
+    const relocationAuditById = new Map(relocationAudits.map(({ resourceId, details }) => [resourceId, details]));
+    const locationVenueAudits = venueAudits.filter(({ details }) => {
+      const from = details?.from || {};
+      const to = details?.to || {};
+      return Boolean(from.villageId && from.villageId === to.villageId
+        && from.sectorId === to.sectorId && from.cellId === to.cellId
+        && String(from.venue || '').trim() !== String(to.venue || '').trim());
+    });
+    const venueOnlyRelocationCount = relocations.filter((item) => {
+      const details = relocationAuditById.get(item.id) || {};
+      const from = details.from || {};
+      const to = details.to || {};
+      return Boolean(from.villageId && from.villageId === to.villageId && from.sectorId === to.sectorId && from.cellId === to.cellId
+        && String(from.venue || '').trim() !== String(to.venue || '').trim());
+    }).length;
+    const territoryIds = [...new Set([
+      ...transfers.flatMap(({ fromTerritoryId, toTerritoryId }) => [fromTerritoryId, toTerritoryId]),
+      ...relocations.flatMap(({ fromTerritoryId, toTerritoryId, toSectorId, toCellId, toVillageId }) => [fromTerritoryId, toTerritoryId, toSectorId, toCellId, toVillageId]),
+      ...adminMoves.flatMap(({ details }) => [details?.fromTerritoryId, details?.toTerritoryId]),
+      ...locationVenueAudits.flatMap(({ details }) => [details?.from?.territoryId, details?.from?.sectorId, details?.from?.cellId, details?.from?.villageId, details?.to?.territoryId, details?.to?.sectorId, details?.to?.cellId, details?.to?.villageId]),
+      ...relocationAudits.flatMap(({ details }) => [details?.from?.territoryId, details?.from?.sectorId, details?.from?.cellId, details?.from?.villageId, details?.to?.territoryId, details?.to?.sectorId, details?.to?.cellId, details?.to?.villageId]),
+    ].filter(Boolean))];
+    const externalAgentIds = [...new Set([...adminMoves.map(({ resourceId }) => resourceId), ...locationVenueAudits.map(({ resourceId }) => resourceId)].filter(Boolean))];
+    const [territories, agents] = await Promise.all([
+      territoryIds.length ? prisma.territory.findMany({ where: { id: { in: territoryIds } }, select: { id: true, name: true } }) : [],
+      externalAgentIds.length ? prisma.moolaAgentLocation.findMany({ where: { externalAgentId: { in: externalAgentIds } }, select: { externalAgentId: true, agentName: true, loginName: true } }) : [],
+    ]);
+    const territoryById = new Map(territories.map(({ id, name }) => [id, name]));
+    const agentById = new Map(agents.map((agent) => [agent.externalAgentId, agent]));
+    const personName = (person) => [person?.firstName, person?.lastName].filter(Boolean).join(' ') || person?.username || '—';
+    const path = (location) => [location?.territoryId, location?.sectorId, location?.cellId, location?.villageId].map((id) => territoryById.get(id)).filter(Boolean);
+    const rows = [
+      ...transfers.map((item) => ({
+        id: `moola-transfer-${item.id}`, kind: 'TRANSFER', network: 'MOOLA_PLUS', agentId: item.externalAgentId,
+        agentName: item.agentName, agentNumber: item.loginName, phoneNumber: item.phoneNumber || '',
+        from: item.fromTerritory?.name || 'Unrecorded district', to: item.toTerritory.name,
+        requestedBy: personName(item.requestedByTc), reviewedBy: item.acceptedAt ? personName(item.recipientTc) : '—',
+        status: item.status === 'COMPLETED' ? 'COMPLETED' : item.acceptedAt ? 'ACCEPTED_GPS_PENDING' : item.status,
+        requestedAt: item.requestedAt, reviewedAt: item.acceptedAt || item.reviewedAt, completedAt: item.completedAt, reason: item.reason || '',
+      })),
+      ...relocations.map((item) => {
+        const details = relocationAuditById.get(item.id) || {};
+        const from = details.from || {};
+        const to = details.to || {};
+        const venueOnly = from.villageId && from.villageId === to.villageId && from.sectorId === to.sectorId && from.cellId === to.cellId
+          && String(from.venue || '').trim() !== String(to.venue || '').trim();
+        const toPath = [item.toTerritory.name, territoryById.get(item.toSectorId), territoryById.get(item.toCellId), territoryById.get(item.toVillageId), item.toVenue].filter(Boolean);
+        return {
+          id: `moola-relocation-${item.id}`, kind: 'RELOCATION', network: 'MOOLA_PLUS', agentId: item.externalAgentId,
+          agentName: item.agentName, agentNumber: item.loginName, phoneNumber: '',
+          from: [...(from.villageId ? path(from) : [item.fromTerritory.name]), ...(String(from.venue || '').trim() ? [String(from.venue).trim()] : [])].join(' · '),
+          to: toPath.join(' · '), requestedBy: personName(item.requestedByTc), reviewedBy: item.reviewedBy ? personName(item.reviewedBy) : '—',
+          status: item.status, requestedAt: item.requestedAt, reviewedAt: item.reviewedAt, completedAt: item.reviewedAt,
+          reason: item.reason || '', destinationVenue: item.toVenue || '', fromVenue: String(from.venue || '').trim(),
+          changeType: venueOnly ? 'VENUE_ASSIGNMENT' : 'LOCATION_RELOCATION',
+        };
+      }),
+      ...adminMoves.map((entry) => {
+        const details = entry.details || {};
+        const agent = agentById.get(entry.resourceId) || {};
+        const actor = personName(entry.user);
+        return {
+          id: `moola-admin-${entry.id}`, kind: 'ADMIN_RELOCATION', network: 'MOOLA_PLUS', agentId: entry.resourceId,
+          agentName: details.agentName || agent.agentName || 'Moola Plus agent', agentNumber: agent.loginName || entry.resourceId, phoneNumber: '',
+          from: territoryById.get(details.fromTerritoryId) || '—', to: territoryById.get(details.toTerritoryId) || '—',
+          requestedBy: actor, reviewedBy: actor, status: 'COMPLETED', requestedAt: entry.createdAt, reviewedAt: entry.createdAt,
+          completedAt: entry.createdAt, reason: details.reason || '',
+        };
+      }),
+      ...locationVenueAudits.map((entry) => {
+        const details = entry.details || {};
+        const agent = agentById.get(entry.resourceId) || {};
+        const actor = personName(entry.user);
+        const from = details.from || {};
+        const to = details.to || {};
+        return {
+          id: `moola-venue-${entry.id}`, kind: 'VENUE_ASSIGNMENT', network: 'MOOLA_PLUS', agentId: entry.resourceId,
+          agentName: details.agentName || agent.agentName || 'Moola Plus agent', agentNumber: details.loginName || agent.loginName || entry.resourceId,
+          phoneNumber: '', from: [...path({ ...from, territoryId: from.territoryId || to.territoryId }), ...(String(from.venue || '').trim() ? [String(from.venue).trim()] : [])].join(' · '),
+          to: [...path(to), ...(String(to.venue || '').trim() ? [String(to.venue).trim()] : [])].join(' · '), destinationVenue: String(to.venue || '').trim(),
+          fromVenue: String(from.venue || '').trim(), requestedBy: actor, reviewedBy: '—', status: 'COMPLETED', requestedAt: entry.createdAt,
+          reviewedAt: null, completedAt: entry.createdAt, reason: 'Venue assigned within the agent’s existing village.', changeType: 'VENUE_ASSIGNMENT',
+        };
+      }),
+    ].sort((a, b) => new Date(b.requestedAt) - new Date(a.requestedAt));
+    const transferTotal = Object.values(transferCounts).reduce((sum, value) => sum + value, 0);
+    const relocationTotal = Object.values(relocationCounts).reduce((sum, value) => sum + value, 0);
+    const reviewedRelocations = (relocationCounts.APPROVED || 0) + (relocationCounts.REJECTED || 0);
+    res.json({
+      selectedRange: { fromDate: selected.fromDate, toDate: selected.toDate },
+      summary: {
+        transferRequests: transferTotal, transfersCompleted: transferCounts.COMPLETED || 0,
+        transfersAwaitingReview: Math.max(0, (transferCounts.PENDING || 0) - acceptedTransfers),
+        relocations: relocationTotal, relocationsIncludingVenueAssignments: relocationTotal + locationVenueAudits.length,
+        venueAssignments: locationVenueAudits.length + venueOnlyRelocationCount, relocationsApproved: relocationCounts.APPROVED || 0,
+        relocationsRejected: relocationCounts.REJECTED || 0, relocationsAwaitingReview: relocationCounts.PENDING || 0,
+        relocationApprovalRate: reviewedRelocations ? Number(((relocationCounts.APPROVED || 0) / reviewedRelocations * 100).toFixed(1)) : 0,
+        adminRelocations: adminMoves.length,
+      },
+      events: rows.slice(0, 1000), eventLimitReached: rows.length > 1000,
+    });
+  } catch (error) {
+    console.error('Moola Plus movement report error:', error.code || error.name || 'Error');
+    res.status(500).json({ error: 'Could not load Moola Plus transfer and relocation activity.' });
+  }
+});
+
 router.get('/moola-plus/summary', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC', 'CHAMPION'), async (req, res) => {
   try {
     const [registry, districts] = await Promise.all([fetchDdinAgentData(req.query.refresh === 'true'), allowedNetworkDistricts(req.user)]);
@@ -1249,8 +1380,10 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
       ...territoryScope,
     };
     const auditWhere = { action: 'ADMIN_RELOCATE_AGENT', resourceType: 'Agent', createdAt: requestedAt };
+    const locationDetailAuditWhere = { action: 'SAVE_TC_AGENT_LOCATION_DETAILS', resourceType: 'Agent', createdAt: requestedAt };
+    const relocationAuditWhere = { action: 'REQUEST_AGENT_RELOCATION', resourceType: 'Agent', createdAt: requestedAt };
 
-    const [transfers, relocations, adminMoves, territoryOptions, coordinatorOptions] = await Promise.all([
+    const [transfers, relocations, adminMoves, territoryOptions, coordinatorOptions, locationDetailAudits, relocationAudits] = await Promise.all([
       prisma.agentTransfer.findMany({
         where: transferWhere,
         orderBy: [{ requestedAt: 'desc' }, { id: 'desc' }],
@@ -1286,12 +1419,45 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
         select: { id: true, firstName: true, lastName: true, username: true },
         orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }, { username: 'asc' }],
       }),
+      prisma.auditLog.findMany({
+        where: locationDetailAuditWhere,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: 1000,
+        include: { user: { select: { firstName: true, lastName: true, username: true } } },
+      }),
+      prisma.auditLog.findMany({
+        where: relocationAuditWhere,
+        select: { details: true },
+        take: 1000,
+      }),
     ]);
 
-    const moveAgentIds = [...new Set(adminMoves.map(({ resourceId }) => resourceId).filter(Boolean))];
+    const locationVenueAudits = locationDetailAudits.filter(({ details }) => {
+      const from = details?.from || {};
+      const to = details?.to || {};
+      return Boolean(from.villageId && from.villageId === to.villageId
+        && from.sectorId === to.sectorId && from.cellId === to.cellId
+        && String(from.venue || '').trim() !== String(to.venue || '').trim());
+    });
+    const relocationAuditById = new Map(relocationAudits.map(({ details }) => [details?.requestId, details]).filter(([id]) => id));
+    const venueOnlyRelocationCount = relocations.filter((item) => {
+      const details = relocationAuditById.get(item.id) || {};
+      const from = details.from || {};
+      const to = details.to || {};
+      return Boolean(from.villageId && from.villageId === to.villageId && from.sectorId === to.sectorId && from.cellId === to.cellId
+        && String(from.venue || '').trim() !== String(to.venue || '').trim());
+    }).length;
+    const moveAgentIds = [...new Set([
+      ...adminMoves.map(({ resourceId }) => resourceId),
+      ...locationVenueAudits.map(({ resourceId }) => resourceId),
+    ].filter(Boolean))];
     const detailTerritoryIds = [...new Set([
       ...relocations.flatMap(({ toTerritoryId, toSectorId, toCellId, toVillageId }) => [toTerritoryId, toSectorId, toCellId, toVillageId]),
       ...adminMoves.flatMap(({ details }) => [details?.fromTerritoryId, details?.toTerritoryId, details?.fromSectorId, details?.toSectorId, details?.fromCellId, details?.toCellId, details?.fromVillageId, details?.toVillageId]),
+      ...locationVenueAudits.flatMap(({ details }) => [
+        details?.from?.territoryId, details?.from?.sectorId, details?.from?.cellId, details?.from?.villageId,
+        details?.to?.territoryId, details?.to?.sectorId, details?.to?.cellId, details?.to?.villageId,
+      ]),
     ].filter(Boolean))];
     const [moveAgents, moveTerritories] = await Promise.all([
       moveAgentIds.length ? prisma.agent.findMany({ where: { id: { in: moveAgentIds } }, select: { id: true, agentId: true, name: true, phoneNumber: true } }) : [],
@@ -1320,6 +1486,14 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
         requestedByTcId: item.requestedByTcId,
         requestedBy: personName(item.requestedByTc), reviewedBy: item.reviewedBy ? personName(item.reviewedBy) : '—',
         status: item.status, requestedAt: item.requestedAt, reviewedAt: item.reviewedAt, completedAt: item.reviewedAt, reason: item.reason || '',
+        destinationVenue: item.toVenue || '',
+        changeType: (() => {
+          const details = relocationAuditById.get(item.id);
+          const from = details?.from || {};
+          const to = details?.to || {};
+          return from.villageId && from.villageId === to.villageId && from.sectorId === to.sectorId && from.cellId === to.cellId
+            && String(from.venue || '').trim() !== String(to.venue || '').trim() ? 'VENUE_ASSIGNMENT' : 'LOCATION_RELOCATION';
+        })(),
       })),
       ...adminMoves.map((entry) => {
         const details = entry.details || {};
@@ -1335,6 +1509,28 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
           requestedByTcId: '',
           requestedBy: actor, reviewedBy: actor, status: 'COMPLETED',
           requestedAt: entry.createdAt, reviewedAt: entry.createdAt, completedAt: entry.createdAt, reason: details.reason || '',
+        };
+      }),
+      ...locationVenueAudits.map((entry) => {
+        const details = entry.details || {};
+        const agent = agentById.get(entry.resourceId) || {};
+        const actor = personName(entry.user);
+        const from = details.from || {};
+        const to = details.to || {};
+        const path = (location) => [location?.territoryId, location?.sectorId, location?.cellId, location?.villageId]
+          .map((id) => territoryById.get(id)).filter(Boolean);
+        const fromTerritoryId = from.territoryId || to.territoryId || '';
+        const toTerritoryId = to.territoryId || from.territoryId || '';
+        return {
+          id: 'venue-' + entry.id, kind: 'RELOCATION', changeType: 'VENUE_ASSIGNMENT',
+          agentName: details.agentName || agent.name || 'Agent', agentNumber: details.agentCode || agent.agentId || '',
+          agentId: entry.resourceId, phoneNumber: agent.phoneNumber || '',
+          from: [...path(from), ...(String(from.venue || '').trim() ? [String(from.venue).trim()] : [])].join(' · '),
+          to: [...path(to), ...(String(to.venue || '').trim() ? [String(to.venue).trim()] : [])].join(' · '),
+          fromTerritoryId, toTerritoryId, requestedByTcId: entry.userId,
+          requestedBy: actor, reviewedBy: '—', status: 'COMPLETED',
+          requestedAt: entry.createdAt, reviewedAt: null, completedAt: entry.createdAt,
+          reason: 'Venue assigned within the agent’s existing village.',
         };
       }),
     ];
@@ -1386,7 +1582,9 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
         transfersAwaitingReview,
         transferAcceptanceRate: transferRequests ? Number((transfersAccepted / transferRequests * 100).toFixed(1)) : 0,
         transferCompletionRate: transfersAccepted ? Number((transfersCompleted / transfersAccepted * 100).toFixed(1)) : 0,
-        relocationRequests: tcRelocationRows.length,
+        relocationRequests: tcRelocationRows.length - locationVenueAudits.length,
+        relocationsIncludingVenueAssignments: tcRelocationRows.length,
+        venueAssignments: locationVenueAudits.length + venueOnlyRelocationCount,
         relocationsApproved,
         relocationsRejected,
         relocationsAwaitingReview: tcRelocationRows.filter((event) => event.status === 'PENDING').length,
@@ -1406,7 +1604,7 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
 
 router.get('/movements/:eventKey', authenticateToken, requireRole('ADMIN'), async (req, res) => {
   try {
-    const match = String(req.params.eventKey || '').match(/^(transfer|relocation|admin)-([0-9a-f-]{36})$/i);
+    const match = String(req.params.eventKey || '').match(/^(moola-transfer|moola-relocation|moola-admin|moola-venue|transfer|relocation|admin|venue)-([0-9a-f-]{36})$/i);
     if (!match) return res.status(400).json({ error: 'This movement link is not valid.' });
     const [, eventType, id] = match;
     const personName = (person) => [person?.firstName, person?.lastName].filter(Boolean).join(' ') || person?.username || '—';
@@ -1421,7 +1619,7 @@ router.get('/movements/:eventKey', authenticateToken, requireRole('ADMIN'), asyn
       if (!item) return res.status(404).json({ error: 'This transfer was not found.' });
       event = {
         id: `transfer-${item.id}`, kind: 'TRANSFER', agentId: item.agent.id, agentName: item.agent.name,
-        agentNumber: item.agent.agentId, phoneNumber: item.agent.phoneNumber, from: item.fromTerritory.name,
+        agentNumber: item.agent.agentId, phoneNumber: item.agent.phoneNumber, from: item.fromTerritory?.name || 'Unrecorded district',
         to: item.toTerritory.name, fromTerritory: item.fromTerritory, toTerritory: item.toTerritory,
         requestedBy: personName(item.requestedByTc), reviewedBy: item.acceptedAt ? personName(item.recipientTc) : '—',
         status: item.status === 'COMPLETED' ? 'COMPLETED' : item.acceptedAt ? 'ACCEPTED_GPS_PENDING' : item.status,
@@ -1449,6 +1647,107 @@ router.get('/movements/:eventKey', authenticateToken, requireRole('ADMIN'), asyn
         status: item.status, requestedAt: item.requestedAt, reviewedAt: item.reviewedAt, completedAt: item.reviewedAt,
         reason: item.reason || '', reviewNote: item.reviewNote || '', destinationVenue: item.toVenue || '',
       };
+    } else if (eventType === 'venue') {
+      const entry = await prisma.auditLog.findFirst({ where: { id, action: 'SAVE_TC_AGENT_LOCATION_DETAILS', resourceType: 'Agent' }, include: { user: { select: { firstName: true, lastName: true, username: true } } } });
+      if (!entry) return res.status(404).json({ error: 'This venue assignment was not found.' });
+      const details = entry.details || {};
+      const from = details.from || {};
+      const to = details.to || {};
+      if (!from.villageId || from.villageId !== to.villageId || from.sectorId !== to.sectorId || from.cellId !== to.cellId || String(from.venue || '').trim() === String(to.venue || '').trim()) {
+        return res.status(404).json({ error: 'This record is not a same-village venue assignment.' });
+      }
+      const areaIds = [from.territoryId, from.sectorId, from.cellId, from.villageId, to.territoryId, to.sectorId, to.cellId, to.villageId].filter(Boolean);
+      const areas = areaIds.length ? await prisma.territory.findMany({ where: { id: { in: areaIds } }, select: { id: true, name: true } }) : [];
+      const areaById = new Map(areas.map((area) => [area.id, area.name]));
+      const path = (location) => [location?.territoryId, location?.sectorId, location?.cellId, location?.villageId].map((value) => areaById.get(value)).filter(Boolean);
+      const agent = entry.resourceId ? await prisma.agent.findUnique({ where: { id: entry.resourceId }, select: { id: true, agentId: true, name: true, phoneNumber: true } }) : null;
+      event = {
+        id: `venue-${entry.id}`, kind: 'VENUE_ASSIGNMENT', changeType: 'VENUE_ASSIGNMENT', agentId: agent?.id || entry.resourceId,
+        agentName: details.agentName || agent?.name || 'Agent', agentNumber: details.agentCode || agent?.agentId || '', phoneNumber: agent?.phoneNumber || '',
+        from: [...path(from), ...(String(from.venue || '').trim() ? [String(from.venue).trim()] : [])].join(' · '),
+        to: [...path(to), ...(String(to.venue || '').trim() ? [String(to.venue).trim()] : [])].join(' · '),
+        requestedBy: personName(entry.user), reviewedBy: '—', status: 'COMPLETED', requestedAt: entry.createdAt,
+        reviewedAt: null, completedAt: entry.createdAt, reason: 'Venue assigned within the agent’s existing village.',
+        fromVenue: String(from.venue || '').trim(), destinationVenue: String(to.venue || '').trim(),
+      };
+    } else if (eventType === 'moola-transfer') {
+      const item = await prisma.moolaAgentTransfer.findUnique({ where: { id }, include: {
+        fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } },
+        requestedByTc: { select: { firstName: true, lastName: true, username: true } }, recipientTc: { select: { firstName: true, lastName: true, username: true } },
+      } });
+      if (!item) return res.status(404).json({ error: 'This Moola Plus transfer was not found.' });
+      event = {
+        id: `moola-transfer-${item.id}`, kind: 'TRANSFER', network: 'MOOLA_PLUS', agentId: item.externalAgentId,
+        agentName: item.agentName, agentNumber: item.loginName, phoneNumber: item.phoneNumber || '',
+        from: item.fromTerritory?.name || 'Unrecorded district', to: item.toTerritory.name,
+        requestedBy: personName(item.requestedByTc), reviewedBy: item.acceptedAt ? personName(item.recipientTc) : '—',
+        status: item.status === 'COMPLETED' ? 'COMPLETED' : item.acceptedAt ? 'ACCEPTED_GPS_PENDING' : item.status,
+        requestedAt: item.requestedAt, reviewedAt: item.acceptedAt || item.reviewedAt, completedAt: item.completedAt,
+        reason: item.reason || '', reviewNote: item.reviewNote || '',
+      };
+    } else if (eventType === 'moola-relocation') {
+      const item = await prisma.moolaRelocationRequest.findUnique({ where: { id }, include: {
+        fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } },
+        requestedByTc: { select: { firstName: true, lastName: true, username: true } }, reviewedBy: { select: { firstName: true, lastName: true, username: true } },
+      } });
+      if (!item) return res.status(404).json({ error: 'This Moola Plus relocation was not found.' });
+      const movementAudit = await prisma.auditLog.findFirst({ where: { action: 'REQUEST_MOOLA_LOCATION_CHANGE', resourceType: 'MoolaRelocationRequest', resourceId: item.id }, select: { details: true } });
+      const details = movementAudit?.details || {};
+      const from = details.from || {};
+      const to = details.to || {};
+      const areaIds = [item.toSectorId, item.toCellId, item.toVillageId, from.sectorId, from.cellId, from.villageId].filter(Boolean);
+      const areas = areaIds.length ? await prisma.territory.findMany({ where: { id: { in: areaIds } }, select: { id: true, name: true } }) : [];
+      const areaById = new Map(areas.map((area) => [area.id, area.name]));
+      const toPath = [item.toTerritory.name, item.toSectorId, item.toCellId, item.toVillageId].map((value) => areaById.get(value) || value).filter(Boolean);
+      if (item.toVenue) toPath.push(item.toVenue);
+      const fromPath = from.villageId
+        ? [from.territoryId || item.fromTerritoryId, from.sectorId, from.cellId, from.villageId].map((value) => areaById.get(value) || value).filter(Boolean)
+        : [item.fromTerritory.name];
+      if (String(from.venue || '').trim()) fromPath.push(String(from.venue).trim());
+      const venueOnly = from.villageId && from.villageId === to.villageId && from.sectorId === to.sectorId && from.cellId === to.cellId && String(from.venue || '').trim() !== String(to.venue || '').trim();
+      event = {
+        id: `moola-relocation-${item.id}`, kind: 'RELOCATION', network: 'MOOLA_PLUS', agentId: item.externalAgentId,
+        agentName: item.agentName, agentNumber: item.loginName, phoneNumber: '', from: fromPath.join(' · '), to: toPath.join(' · '),
+        destinationPath: toPath.join(' · '), requestedBy: personName(item.requestedByTc), reviewedBy: personName(item.reviewedBy),
+        status: item.status, requestedAt: item.requestedAt, reviewedAt: item.reviewedAt, completedAt: item.reviewedAt,
+        reason: item.reason || '', reviewNote: item.reviewNote || '', destinationVenue: item.toVenue || '',
+        fromVenue: String(from.venue || '').trim(), changeType: venueOnly ? 'VENUE_ASSIGNMENT' : 'LOCATION_RELOCATION',
+      };
+    } else if (eventType === 'moola-admin' || eventType === 'moola-venue') {
+      const action = eventType === 'moola-admin' ? 'ADMIN_RELOCATE_MOOLA_AGENT' : 'SAVE_TC_MOOLA_LOCATION_DETAILS';
+      const entry = await prisma.auditLog.findFirst({ where: { id, action, resourceType: 'MoolaAgentLocation' }, include: { user: { select: { firstName: true, lastName: true, username: true } } } });
+      if (!entry) return res.status(404).json({ error: 'This Moola Plus movement record was not found.' });
+      const details = entry.details || {};
+      const from = details.from || {};
+      const to = details.to || {};
+      const externalAgentId = String(details.externalAgentId || entry.resourceId || '');
+      const agent = await prisma.moolaAgentLocation.findUnique({ where: { externalAgentId }, select: { agentName: true, loginName: true } });
+      const areaIds = [details.fromTerritoryId, details.toTerritoryId, from.territoryId, from.sectorId, from.cellId, from.villageId, to.territoryId, to.sectorId, to.cellId, to.villageId].filter(Boolean);
+      const areas = areaIds.length ? await prisma.territory.findMany({ where: { id: { in: areaIds } }, select: { id: true, name: true } }) : [];
+      const areaById = new Map(areas.map((area) => [area.id, area.name]));
+      const path = (location) => [location?.territoryId, location?.sectorId, location?.cellId, location?.villageId].map((value) => areaById.get(value)).filter(Boolean);
+      const sameVillageVenueChange = eventType === 'moola-venue' && from.villageId && from.villageId === to.villageId && from.sectorId === to.sectorId && from.cellId === to.cellId && String(from.venue || '').trim() !== String(to.venue || '').trim();
+      if (eventType === 'moola-venue' && !sameVillageVenueChange) return res.status(404).json({ error: 'This record is not a same-village venue assignment.' });
+      const fromNames = eventType === 'moola-admin' ? [areaById.get(details.fromTerritoryId)].filter(Boolean) : path({ ...from, territoryId: from.territoryId || to.territoryId });
+      const toNames = eventType === 'moola-admin' ? [areaById.get(details.toTerritoryId)].filter(Boolean) : path(to);
+      if (eventType === 'moola-admin') {
+        event = {
+          id: `moola-admin-${entry.id}`, kind: 'ADMIN_RELOCATION', network: 'MOOLA_PLUS', agentId: externalAgentId,
+          agentName: details.agentName || agent?.agentName || 'Moola Plus agent', agentNumber: agent?.loginName || externalAgentId,
+          phoneNumber: '', from: fromNames.join(' · ') || '—', to: toNames.join(' · ') || '—', requestedBy: personName(entry.user),
+          reviewedBy: personName(entry.user), status: 'COMPLETED', requestedAt: entry.createdAt, reviewedAt: entry.createdAt,
+          completedAt: entry.createdAt, reason: details.reason || '',
+        };
+      } else {
+        event = {
+          id: `moola-venue-${entry.id}`, kind: 'VENUE_ASSIGNMENT', network: 'MOOLA_PLUS', agentId: externalAgentId,
+          agentName: details.agentName || agent?.agentName || 'Moola Plus agent', agentNumber: details.loginName || agent?.loginName || externalAgentId,
+          phoneNumber: '', from: [...fromNames, ...(String(from.venue || '').trim() ? [String(from.venue).trim()] : [])].join(' · '),
+          to: [...toNames, ...(String(to.venue || '').trim() ? [String(to.venue).trim()] : [])].join(' · '),
+          requestedBy: personName(entry.user), reviewedBy: '—', status: 'COMPLETED', requestedAt: entry.createdAt, reviewedAt: null,
+          completedAt: entry.createdAt, reason: 'Venue assigned within the agent’s existing village.', fromVenue: String(from.venue || '').trim(), destinationVenue: String(to.venue || '').trim(),
+        };
+      }
     } else {
       const entry = await prisma.auditLog.findFirst({ where: { id, action: 'ADMIN_RELOCATE_AGENT', resourceType: 'Agent' }, include: { user: { select: { firstName: true, lastName: true, username: true } } } });
       if (!entry) return res.status(404).json({ error: 'This relocation was not found.' });
@@ -1461,10 +1760,10 @@ router.get('/movements/:eventKey', authenticateToken, requireRole('ADMIN'), asyn
       event = {
         id: `admin-${entry.id}`, kind: 'ADMIN_RELOCATION', agentId: agent?.id || entry.resourceId,
         agentName: details.agentName || agent?.name || 'Agent', agentNumber: details.agentCode || agent?.agentId || '',
-        phoneNumber: agent?.phoneNumber || '', from: path('from') || '—', to: path('to') || '—',
+        phoneNumber: agent?.phoneNumber || '', from: path('from') || '—', to: [path('to'), details.toVenue].filter(Boolean).join(' · ') || '—',
         requestedBy: personName(entry.user), reviewedBy: personName(entry.user), status: 'COMPLETED',
         requestedAt: entry.createdAt, reviewedAt: entry.createdAt, completedAt: entry.createdAt,
-        reason: details.reason || '',
+        reason: details.reason || '', fromVenue: details.fromVenue || '', destinationVenue: details.toVenue || '',
       };
     }
     res.json({ event });

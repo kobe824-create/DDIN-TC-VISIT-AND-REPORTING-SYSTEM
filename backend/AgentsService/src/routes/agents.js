@@ -1578,6 +1578,47 @@ router.post('/', authenticateToken, requireTerritoryAccess, requireRole('ADMIN',
   }
 });
 
+router.get('/notifications', authenticateToken, requireRole('TC'), async (req, res) => {
+  try {
+    // Scope notifications directly to their recipient. Do not require a current
+    // territory assignment here: transfers may be the reason an assignment is pending.
+    const [transfers, moolaTransfers, notices] = await Promise.all([
+      prisma.agentTransfer.findMany({
+        where: { recipientTcId: req.user.id },
+        include: {
+          agent: { select: { id: true, agentId: true, name: true, phoneNumber: true, businessName: true } },
+          fromTerritory: { select: { id: true, name: true, parent: { select: { name: true } } } },
+          toTerritory: { select: { id: true, name: true, parent: { select: { name: true } } } },
+          requestedByTc: { select: { id: true, firstName: true, lastName: true, username: true } },
+        },
+        orderBy: [{ requestedAt: 'desc' }, { id: 'desc' }],
+      }),
+      prisma.moolaAgentTransfer.findMany({
+        where: { recipientTcId: req.user.id },
+        include: {
+          fromTerritory: { select: { id: true, name: true, parent: { select: { name: true } } } },
+          toTerritory: { select: { id: true, name: true, parent: { select: { name: true } } } },
+          requestedByTc: { select: { id: true, firstName: true, lastName: true, username: true } },
+        },
+        orderBy: [{ requestedAt: 'desc' }, { id: 'desc' }],
+      }),
+      prisma.agentMovementNotice.findMany({
+        where: { recipientTcId: req.user.id },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      }),
+    ]);
+    const notifications = [
+      ...transfers.map((item) => ({ ...item, network: 'IREMBO', kind: 'TRANSFER' })),
+      ...moolaTransfers.map((item) => ({ ...item, network: 'MOOLA_PLUS', kind: 'MOOLA_TRANSFER', agent: { id: item.externalAgentId, name: item.agentName, agentId: item.loginName, phoneNumber: item.phoneNumber } })),
+      ...notices.map((item) => ({ ...item, network: `MOVEMENT_${item.network}`, kind: 'MOVEMENT_NOTICE' })),
+    ].sort((a, b) => new Date(b.requestedAt || b.createdAt) - new Date(a.requestedAt || a.createdAt));
+    res.json({ notifications });
+  } catch (error) {
+    console.error('TC notification portal error:', error.code || error.name);
+    res.status(500).json({ error: 'Could not load your notifications. Refresh the page to try again.' });
+  }
+});
+
 router.get('/movement-notices', authenticateToken, requireRole('TC'), async (req, res) => {
   try {
     const notices = await prisma.agentMovementNotice.findMany({ where: { recipientTcId: req.user.id, readAt: null }, orderBy: { createdAt: 'desc' }, take: 20 });
@@ -1936,7 +1977,7 @@ router.patch('/:id/location-details', authenticateToken, requireTerritoryAccess,
     }, { maxWait: 10000, timeout: 15000 });
     await logAction(req.user.id, 'SAVE_TC_AGENT_LOCATION_DETAILS', 'Agent', agent.id, {
       agentName: agent.name, agentCode: agent.agentId,
-      from: { sectorId: agent.sectorId, cellId: agent.cellId, villageId: agent.villageId, venue: agent.venue },
+      from: { territoryId: agent.territoryId, sectorId: agent.sectorId, cellId: agent.cellId, villageId: agent.villageId, venue: agent.venue },
       to: { territoryId, sectorId, cellId, villageId, venue }, gpsCleared: locationChanged,
     }, req);
     res.json(saved);
@@ -2001,7 +2042,12 @@ router.post('/:id/relocation-requests', authenticateToken, requireTerritoryAcces
         requestedByTcId: req.user.id,
       } });
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, 'REQUEST_AGENT_RELOCATION', 'Agent', agent.id, { agentName: agent.name, agentCode: agent.agentId, requestId: request.id, fromTerritoryId: agent.territoryId, toTerritoryId, toSectorId, toCellId, toVillageId, toVenue }, req);
+    await logAction(req.user.id, 'REQUEST_AGENT_RELOCATION', 'Agent', agent.id, {
+      agentName: agent.name, agentCode: agent.agentId, requestId: request.id,
+      from: { territoryId: agent.territoryId, sectorId: agent.sectorId, cellId: agent.cellId, villageId: agent.villageId, venue: agent.venue },
+      to: { territoryId: toTerritoryId, sectorId: toSectorId, cellId: toCellId, villageId: toVillageId, venue: toVenue },
+      fromTerritoryId: agent.territoryId, toTerritoryId, toSectorId, toCellId, toVillageId, toVenue,
+    }, req);
     res.status(201).json(request);
   } catch (error) {
     console.error('Relocation request failed:', error.code || error.name);

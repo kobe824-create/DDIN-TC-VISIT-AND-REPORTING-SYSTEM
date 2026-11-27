@@ -27,6 +27,7 @@ import ConfigPage from './pages/ConfigPage';
 import AuditLogs from './pages/AuditLogs';
 import AdminRequests from './pages/AdminRequests';
 import ProfilePage from './pages/ProfilePage';
+import TcNotifications from './pages/TcNotifications';
 import BulkImport from './pages/BulkImport';
 import SectorGroups from './pages/SectorGroups';
 import NetworkNotice from './components/NetworkNotice';
@@ -102,6 +103,7 @@ const AppRoutes = () => {
         {/* Admin */}
         <Route path="/admin/requests" element={<ProtectedRoute allowedRoles={['ADMIN']}><AdminRequests /></ProtectedRoute>} />
         <Route path="/config" element={<ProtectedRoute allowedRoles={['ADMIN']}><ConfigPage /></ProtectedRoute>} />
+        <Route path="/notifications" element={<ProtectedRoute allowedRoles={['TC']}><TcNotifications /></ProtectedRoute>} />
         <Route path="/audit-logs" element={<ProtectedRoute allowedRoles={['ADMIN']}><AuditLogs /></ProtectedRoute>} />
 
         {/* Profile & Notifications */}

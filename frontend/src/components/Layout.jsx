@@ -16,6 +16,7 @@ const primaryNav = [
   { label: 'Visits', path: '/visits', icon: MapPinned, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
   { label: 'Agents', path: '/agents', icon: UsersRound, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
   { label: 'Agent moves', path: '/agent-moves', icon: Activity, roles: ['TC'] },
+  { label: 'Notifications', path: '/notifications', icon: Inbox, roles: ['TC'] },
   { label: 'WhatsApp groups', path: '/sector-groups', icon: MessageCircle, roles: ['TC'] },
   { label: 'Reports', path: '/reports', icon: FileBarChart2, roles: ['ADMIN', 'MANAGER', 'TC', 'CHAMPION'] },
   { label: 'Request inbox', path: '/admin/requests', icon: Inbox, roles: ['ADMIN'] },
@@ -292,7 +293,7 @@ export default function Layout() {
             </div>
           </div>
         </header>
-        {location.pathname !== '/admin/requests' && <div className="request-notification-host"><RequestNotifications role={mustChangePassword ? null : role} /></div>}
+        {!['/admin/requests', '/notifications'].includes(location.pathname) && <div className="request-notification-host"><RequestNotifications role={mustChangePassword ? null : role} /></div>}
         <main className={`page-canvas${location.pathname === '/visits/new' ? ' visit-workflow-canvas' : ''}`}><Outlet /></main>
       </div>
       <nav className={`mobile-tabs${mustChangePassword ? ' mobile-tabs-single' : ''}`} aria-label="Quick navigation">

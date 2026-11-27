@@ -334,7 +334,7 @@ router.patch('/moola-plus/agents/:externalAgentId/location-details', authenticat
     }, { maxWait: 10000, timeout: 15000 });
     await logAction(req.user.id, 'SAVE_TC_MOOLA_LOCATION_DETAILS', 'MoolaAgentLocation', externalAgentId, {
       agentName: agent.name, loginName: agent.loginName || externalAgentId,
-      from: existing ? { sectorId: existing.sectorId, cellId: existing.cellId, villageId: existing.villageId, venue: existing.venue } : null,
+      from: existing ? { territoryId: existing.territoryId, sectorId: existing.sectorId, cellId: existing.cellId, villageId: existing.villageId, venue: existing.venue } : null,
       to: { territoryId, ...locationResult.location },
     }, req);
     const withTerritory = await prisma.moolaAgentLocation.findUnique({ where: { externalAgentId }, include: { territory: { select: { id: true, name: true } } } });
@@ -746,7 +746,12 @@ router.post('/moola-plus/agents/:externalAgentId/relocation-requests', authentic
         reason: reason || null, requestedByTcId: req.user.id,
       }, include: { fromTerritory: { select: { id: true, name: true } }, toTerritory: { select: { id: true, name: true } } } });
     }, { maxWait: 10000, timeout: 15000 });
-    await logAction(req.user.id, 'REQUEST_MOOLA_LOCATION_CHANGE', 'MoolaRelocationRequest', request.id, { externalAgentId, fromTerritoryId: location.territoryId, toTerritoryId, toSectorId, toCellId, toVillageId, toVenue }, req);
+    await logAction(req.user.id, 'REQUEST_MOOLA_LOCATION_CHANGE', 'MoolaRelocationRequest', request.id, {
+      externalAgentId,
+      from: { territoryId: location.territoryId, sectorId: location.sectorId, cellId: location.cellId, villageId: location.villageId, venue: location.venue },
+      to: { territoryId: toTerritoryId, sectorId: toSectorId, cellId: toCellId, villageId: toVillageId, venue: toVenue },
+      fromTerritoryId: location.territoryId, toTerritoryId, toSectorId, toCellId, toVillageId, toVenue,
+    }, req);
     res.status(201).json({
       ...request,
       destinationPath: [destination.name, locationResult.location.sectorName, locationResult.location.cellName, locationResult.location.villageName].join(' · '),

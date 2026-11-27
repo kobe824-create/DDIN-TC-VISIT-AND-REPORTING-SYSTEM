@@ -1,21 +1,32 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, UsersRound } from 'lucide-react';
+import { ArrowRightLeft, MapPin, RefreshCw, UsersRound } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import api from '../api';
 import MoolaAnalytics from '../components/MoolaAnalytics';
 import PageHeader from '../components/PageHeader';
 import { ErrorState, LoadingState, StatusBadge } from '../components';
+import { useAuth } from '../AuthContext';
 
 const formatDate = (value) => value ? new Intl.DateTimeFormat('en-GB', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Africa/Kigali' }).format(new Date(value)) : '—';
+const dateToday = () => new Date().toISOString().slice(0, 10);
+const dateMonthStart = () => `${dateToday().slice(0, 7)}-01`;
+const movementStatus = (event) => event.status === 'ACCEPTED_GPS_PENDING' ? 'Accepted · first visit GPS pending' : event.status === 'PENDING' ? (event.kind === 'TRANSFER' ? 'Awaiting TC review' : 'Awaiting admin review') : String(event.status || '').replaceAll('_', ' ').toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase());
 
 export default function MoolaPlusReports() {
   const navigate = useNavigate();
+  const { user } = useAuth();
+  const isAdmin = user?.role === 'ADMIN';
   const [summary, setSummary] = useState(null);
   const [visitSummary, setVisitSummary] = useState(null);
   const [recentVisits, setRecentVisits] = useState([]);
   const [visitError, setVisitError] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [movementFromDate, setMovementFromDate] = useState(dateMonthStart());
+  const [movementToDate, setMovementToDate] = useState(dateToday());
+  const [movementReport, setMovementReport] = useState(null);
+  const [movementLoading, setMovementLoading] = useState(false);
+  const [movementError, setMovementError] = useState('');
   const load = useCallback(async (forceRefresh = false) => {
     setLoading(true);
     setError('');
@@ -37,6 +48,18 @@ export default function MoolaPlusReports() {
     }
   }, []);
   useEffect(() => { void load(); }, [load]);
+  const loadMovements = useCallback(async () => {
+    if (!isAdmin) return;
+    setMovementLoading(true);
+    setMovementError('');
+    try {
+      const { data } = await api.get('/api/v1/reports/moola-plus/movements', { params: { fromDate: movementFromDate, toDate: movementToDate } });
+      setMovementReport(data);
+    } catch (movementLoadError) {
+      setMovementError(movementLoadError.response?.data?.error || 'Could not load Moola Plus movement activity.');
+    } finally { setMovementLoading(false); }
+  }, [isAdmin, movementFromDate, movementToDate]);
+  useEffect(() => { if (isAdmin) void loadMovements(); }, [isAdmin, loadMovements]);
 
   return <div className="page moola-reports-page">
     <PageHeader title="Moola Plus reports" subtitle="Agent activity and classifications from DDIN’s registry and deposit report." actions={<div className="page-header-actions"><button className="btn btn-secondary" onClick={() => navigate('/agents')}><UsersRound size={16} />Browse agents</button><button className="btn btn-primary" onClick={() => load(true)} disabled={loading}><RefreshCw size={16} className={loading ? 'spin' : ''} />Refresh</button></div>} />
@@ -44,6 +67,22 @@ export default function MoolaPlusReports() {
     {loading && !summary ? <LoadingState type="cards" message="Loading Moola Plus reports…" /> : summary && <>
       <div className="network-source-note"><strong>{summary.stale ? 'Showing the last successful sync' : 'Live DDIN registry data'}</strong><span>Last synced {formatDate(summary.fetchedAt)} Rwanda time.</span></div>
       <MoolaAnalytics summary={summary} />
+      {isAdmin && <section className="surface-card moola-movement-report">
+        <div className="surface-heading"><div><span className="section-kicker">TERRITORY CHANGES</span><h3>Moola Plus transfers and relocations</h3><p>Includes same-village venue assignments saved by coordinators.</p></div><div className="page-header-actions"><label className="movement-date-filter"><span>From</span><input type="date" value={movementFromDate} onChange={(event) => setMovementFromDate(event.target.value)} /></label><label className="movement-date-filter"><span>To</span><input type="date" value={movementToDate} onChange={(event) => setMovementToDate(event.target.value)} /></label><button className="btn btn-secondary btn-sm" type="button" onClick={() => void loadMovements()} disabled={movementLoading}><RefreshCw size={15} className={movementLoading ? 'spin' : ''} />Refresh</button></div></div>
+        {movementError && <ErrorState message={movementError} onRetry={loadMovements} />}
+        {movementLoading ? <LoadingState message="Loading Moola Plus moves…" /> : !movementError && <>
+          <section className="report-metrics movement-metrics">
+            <div><span className="report-metric-icon orange"><ArrowRightLeft size={16} /></span><span><small>Transfer requests</small><strong>{Number(movementReport?.summary?.transferRequests || 0).toLocaleString()}</strong><em>{Number(movementReport?.summary?.transfersCompleted || 0).toLocaleString()} completed</em></span></div>
+            <div><span className="report-metric-icon amber"><MapPin size={16} /></span><span><small>Relocations + venue assignments</small><strong>{Number(movementReport?.summary?.relocationsIncludingVenueAssignments ?? movementReport?.summary?.relocations ?? 0).toLocaleString()}</strong><em>{Number(movementReport?.summary?.relocations || 0).toLocaleString()} requests · {Number(movementReport?.summary?.venueAssignments || 0).toLocaleString()} venue updates</em></span></div>
+            <div><span className="report-metric-icon blue"><UsersRound size={16} /></span><span><small>Admin relocations</small><strong>{Number(movementReport?.summary?.adminRelocations || 0).toLocaleString()}</strong><em>{Number(movementReport?.summary?.relocationsAwaitingReview || 0).toLocaleString()} awaiting review</em></span></div>
+          </section>
+          <div className="table-scroll"><table className="data-table report-table movement-table"><thead><tr><th>Type</th><th>Agent & login</th><th>From</th><th>To</th><th>Requested by</th><th>Reviewed by</th><th>Status</th><th>Date</th></tr></thead><tbody>
+            {(movementReport?.events || []).map((event) => <tr key={event.id} className="movement-report-row" tabIndex={0} role="link" onClick={() => navigate(`/reports/movements/${encodeURIComponent(event.id)}`)} onKeyDown={(keyEvent) => { if (keyEvent.key === 'Enter' || keyEvent.key === ' ') { keyEvent.preventDefault(); navigate(`/reports/movements/${encodeURIComponent(event.id)}`); } }}><td>{event.kind === 'TRANSFER' ? 'Transfer' : event.kind === 'VENUE_ASSIGNMENT' || event.changeType === 'VENUE_ASSIGNMENT' ? 'Venue assignment' : event.kind === 'RELOCATION' ? 'TC relocation' : 'Admin relocation'}</td><td><strong>{event.agentName}</strong><small className="visit-subtext">{event.agentNumber}</small></td><td>{event.from}</td><td>{event.to}</td><td>{event.requestedBy}</td><td>{event.reviewedBy}</td><td><span className={`movement-status ${String(event.status).toLowerCase().replaceAll('_', '-')}`}>{movementStatus(event)}</span></td><td>{formatDate(event.requestedAt)}</td></tr>)}
+            {!movementReport?.events?.length && <tr><td className="report-empty" colSpan="8">No Moola Plus transfers or relocations were recorded during this period.</td></tr>}
+          </tbody></table></div>
+          {movementReport?.eventLimitReached && <p className="card-footnote">Showing the latest 1,000 movement records in this period.</p>}
+        </>}
+      </section>}
       <section className="moola-analytics moola-report-visits">
         <div className="surface-heading"><div><span className="section-kicker">FIELD ACTIVITY</span><h3>Moola Plus visits</h3><p>Visits use upstream Moola Plus IDs and count under the rolling three-month coverage rule.</p></div><button className="btn btn-secondary btn-sm" onClick={() => navigate('/visits')}>All visits</button></div>
         <div className="metric-grid">

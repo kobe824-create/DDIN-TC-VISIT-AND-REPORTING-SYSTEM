@@ -3167,3 +3167,21 @@ html, body, #root {
   .move-tracker-tabs { padding-right: 12px; padding-left: 12px; }
   .move-tracker-filters { padding: 12px; }
 }
+
+/* Venue reporting and TC notification pages. */
+.tc-notifications-page { display: grid; gap: 18px; }
+.tc-notification-table thead th:first-child, .tc-notification-table td:first-child { width: auto; text-align: left; }
+.tc-notification-table { min-width: 700px; }
+.tc-notification-summary > div:nth-child(2) strong { color: #9a6328; }
+.tc-notification-summary > div:nth-child(3) strong { color: #516f58; }
+.moola-movement-report { display: grid; gap: 14px; padding: 18px; }
+.moola-movement-report > .surface-heading { align-items: flex-end; }
+.moola-movement-report .page-header-actions { align-items: flex-end; flex-wrap: wrap; }
+.movement-date-filter { display: grid; gap: 4px; color: #657267; font-size: 11px; font-weight: 650; }
+.movement-date-filter input { min-height: 36px; padding: 6px 8px; border: 1px solid #dfe5de; border-radius: 7px; color: #34443a; background: #fff; font: inherit; }
+
+@media (max-width: 700px) {
+  .moola-movement-report > .surface-heading { align-items: flex-start; flex-direction: column; }
+  .moola-movement-report .page-header-actions { width: 100%; align-items: stretch; }
+  .movement-date-filter { flex: 1; min-width: 130px; }
+}

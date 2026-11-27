@@ -6,7 +6,7 @@ import PageHeader from '../components/PageHeader';
 import { ErrorState, LoadingState, StatusBadge } from '../components';
 
 const personDate = (value) => value ? new Intl.DateTimeFormat('en-GB', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : '—';
-const titleFor = (event) => event?.kind === 'TRANSFER' ? 'Agent transfer' : event?.kind === 'ADMIN_RELOCATION' ? 'Administrator relocation' : 'TC relocation request';
+const titleFor = (event) => event?.kind === 'TRANSFER' ? 'Agent transfer' : event?.kind === 'VENUE_ASSIGNMENT' || event?.changeType === 'VENUE_ASSIGNMENT' ? 'Venue assignment' : event?.kind === 'ADMIN_RELOCATION' ? 'Administrator relocation' : 'TC relocation request';
 
 export default function MovementDetail() {
   const { eventKey } = useParams();
@@ -32,7 +32,7 @@ export default function MovementDetail() {
     {loading ? <LoadingState message="Loading movement record…" /> : error ? <ErrorState message={error} onRetry={() => window.location.reload()} /> : event && <>
       <section className="movement-detail-hero surface-card">
         <span className="report-metric-icon orange"><ArrowRightLeft size={18} /></span>
-        <div><small>{event.kind === 'TRANSFER' ? 'TRANSFER' : 'RELOCATION'} · {event.agentNumber || 'Agent record'}</small><h2>{event.agentName}</h2><p>{event.phoneNumber || 'No phone number on record'}</p></div>
+        <div><small>{event.kind === 'TRANSFER' ? 'TRANSFER' : event.kind === 'VENUE_ASSIGNMENT' || event.changeType === 'VENUE_ASSIGNMENT' ? 'VENUE ASSIGNMENT' : 'RELOCATION'} · {event.agentNumber || 'Agent record'}</small><h2>{event.agentName}</h2><p>{event.phoneNumber || 'No phone number on record'}</p></div>
         <StatusBadge status={event.status === 'ACCEPTED_GPS_PENDING' ? 'Accepted · first visit GPS pending' : event.status} />
       </section>
       <section className="movement-detail-grid">
@@ -40,7 +40,7 @@ export default function MovementDetail() {
         <article className="surface-card movement-detail-card"><div className="movement-detail-heading"><UserRound size={17} /><h3>Request and review</h3></div><dl><div><dt>Requested by</dt><dd>{event.requestedBy || '—'}</dd></div><div><dt>Submitted</dt><dd>{personDate(event.requestedAt)}</dd></div><div><dt>Reviewed by</dt><dd>{event.reviewedBy || '—'}</dd></div><div><dt>Reviewed</dt><dd>{personDate(event.reviewedAt)}</dd></div><div><dt>Completed</dt><dd>{personDate(event.completedAt)}</dd></div></dl></article>
       </section>
       {(event.reason || event.reviewNote) && <section className="surface-card movement-detail-notes"><h3>Notes</h3>{event.reason && <div><small>Request note</small><p>{event.reason}</p></div>}{event.reviewNote && <div><small>Review note</small><p>{event.reviewNote}</p></div>}</section>}
-      {event.agentId && <div className="movement-detail-actions"><button type="button" className="btn btn-secondary" onClick={() => navigate(`/agents/${encodeURIComponent(event.agentId)}`)}>Open agent profile</button></div>}
+      {event.agentId && <div className="movement-detail-actions"><button type="button" className="btn btn-secondary" onClick={() => navigate(event.network === 'MOOLA_PLUS' ? `/moola-plus/agents/${encodeURIComponent(event.agentId)}` : `/irembo/agents/${encodeURIComponent(event.agentId)}`)}>Open agent profile</button></div>}
     </>}
   </div>;
 }
