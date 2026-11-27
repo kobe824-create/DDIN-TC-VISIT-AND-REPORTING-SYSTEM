@@ -742,6 +742,14 @@ function shapeMoolaAgent(agent, canSeeMoney) {
 
 const movementTimestamp = (event) => event.completedAt || event.reviewedAt || event.requestedAt || null;
 
+function isVenueAssignmentAudit(details) {
+  const from = details?.from || {};
+  const to = details?.to || {};
+  return Boolean(from.villageId && from.villageId === to.villageId
+    && from.sectorId === to.sectorId && from.cellId === to.cellId
+    && String(from.venue || '').trim() !== String(to.venue || '').trim());
+}
+
 function createMovementTrackerRow(agent, events, tcId, network) {
   const chronological = [...events].sort((a, b) => new Date(movementTimestamp(b) || 0) - new Date(movementTimestamp(a) || 0));
   const successful = chronological.filter((event) => event.successful);
@@ -771,15 +779,17 @@ function createMovementTrackerRow(agent, events, tcId, network) {
   };
 }
 
-function movementTrackerResponse(rows, req) {
+function movementTrackerResponse(rows, req, activitySummary = {}) {
   const movedByMe = rows.filter((row) => row.movedByMe);
   const distinctByType = (type) => new Set(movedByMe.filter((row) => row.movementType === type).map((row) => row.id)).size;
   const summary = {
     totalAgents: rows.length,
     moved: rows.filter((row) => row.status === 'MOVED').length,
     movedByMe: new Set(movedByMe.map((row) => row.id)).size,
-    transfersByMe: distinctByType('TRANSFER'),
-    relocationsByMe: distinctByType('RELOCATION'),
+    transfersByMe: activitySummary.transfersByMe ?? distinctByType('TRANSFER'),
+    relocationsByMe: activitySummary.relocationsByMe ?? distinctByType('RELOCATION'),
+    approvedRelocationsByMe: activitySummary.approvedRelocationsByMe ?? distinctByType('RELOCATION'),
+    venueAssignmentsByMe: activitySummary.venueAssignmentsByMe ?? 0,
     pending: rows.filter((row) => row.status === 'PENDING').length,
     notMoved: rows.filter((row) => row.status === 'NOT_MOVED').length,
   };
@@ -816,12 +826,19 @@ router.get('/agent-movement-tracker', authenticateToken, requireRole('TC'), asyn
     if (!['IREMBO', 'MOOLA_PLUS'].includes(network)) return res.status(400).json({ error: 'Choose Irembo or Moola Plus.' });
     const districts = await allowedNetworkDistricts(req.user);
     const rows = [];
+    let activitySummary = {};
 
     if (network === 'IREMBO') {
-      const [feed, activeAssignments] = await Promise.all([
+      const [feed, activeAssignments, venueAudits] = await Promise.all([
         fetchIremboActivityData(),
         prisma.tcTerritoryAssignment.findMany({ where: { tcId: req.user.id, isActive: true, territory: { is: { type: 'DISTRICT', isActive: true } } }, select: { territory: { select: { name: true } } } }),
+        prisma.auditLog.findMany({
+          where: { userId: req.user.id, action: 'SAVE_TC_AGENT_LOCATION_DETAILS', resourceType: 'Agent' },
+          select: { id: true, userId: true, resourceId: true, createdAt: true, details: true },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        }),
       ]);
+      const venueAssignmentAudits = venueAudits.filter((entry) => isVenueAssignmentAudit(entry.details));
       const roster = scopedMoolaAgents((await enrichIremboTerritories(feed.agents)).filter((agent) => !agent.isOnHold), districts);
       const transferRows = await prisma.agentTransfer.findMany({
         where: { requestedByTcId: req.user.id, status: { in: ['PENDING', 'ON_HOLD', 'COMPLETED'] } },
@@ -831,7 +848,38 @@ router.get('/agent-movement-tracker', authenticateToken, requireRole('TC'), asyn
         where: { requestedByTcId: req.user.id, status: { in: ['PENDING', 'APPROVED'] } },
         select: { agentId: true, requestedByTcId: true, requestedAt: true, reviewedAt: true, status: true, fromTerritory: { select: { name: true } }, toTerritory: { select: { name: true } }, requestedByTc: { select: { firstName: true, lastName: true } }, agent: { select: { id: true, agentId: true, name: true, phoneNumber: true, territory: { select: { name: true } }, sector: { select: { name: true } }, cell: { select: { name: true } }, village: { select: { name: true } } } } },
       });
+      const approvedRelocationsByMe = relocationRows.filter((event) => event.status === 'APPROVED').length;
+      const venueAssignmentsByMe = venueAssignmentAudits.length;
+      activitySummary = {
+        transfersByMe: transferRows.filter((event) => event.status === 'COMPLETED').length,
+        approvedRelocationsByMe,
+        venueAssignmentsByMe,
+        relocationsByMe: approvedRelocationsByMe + venueAssignmentsByMe,
+      };
       const candidates = new Map(roster.map((agent) => [String(agent.agentId || agent.id), { ...agent, trackerKey: String(agent.agentId || agent.id) }]));
+      const auditLocalIds = [...new Set(venueAssignmentAudits.map((entry) => entry.resourceId).filter(Boolean))];
+      const auditedAgents = auditLocalIds.length ? await prisma.agent.findMany({
+        where: { id: { in: auditLocalIds } },
+        select: {
+          id: true, agentId: true, name: true, phoneNumber: true,
+          territory: { select: { name: true } }, sector: { select: { name: true } },
+          cell: { select: { name: true } }, village: { select: { name: true } },
+        },
+      }) : [];
+      for (const agent of auditedAgents) {
+        if (!agent.agentId) continue;
+        if (candidates.has(String(agent.agentId))) {
+          const existing = candidates.get(String(agent.agentId));
+          candidates.set(String(agent.agentId), { ...existing, localAgentId: agent.id, trackerFallback: true });
+          continue;
+        }
+        candidates.set(String(agent.agentId), {
+          id: agent.agentId, agentId: agent.agentId, name: agent.name, phoneNumber: agent.phoneNumber,
+          district: agent.territory?.name || '', sector: agent.sector?.name || '',
+          cell: agent.cell?.name || '', village: agent.village?.name || '',
+          localAgentId: agent.id, trackerKey: String(agent.agentId), trackerFallback: true,
+        });
+      }
       for (const event of [...transferRows, ...relocationRows]) {
         const agent = event.agent;
         if (!agent?.agentId || candidates.has(String(agent.agentId))) continue;
@@ -854,15 +902,26 @@ router.get('/agent-movement-tracker', authenticateToken, requireRole('TC'), asyn
           ...approvedRelocations.filter((event) => event.agentId === localId).map((event) => ({ ...event, kind: 'RELOCATION', successful: true, pending: false, requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
           ...transferRows.filter((event) => event.agentId === localId).map((event) => ({ ...event, kind: 'TRANSFER', successful: event.status === 'COMPLETED', pending: ['PENDING', 'ON_HOLD'].includes(event.status), requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
           ...relocationRows.filter((event) => event.agentId === localId).map((event) => ({ ...event, kind: 'RELOCATION', successful: event.status === 'APPROVED', pending: event.status === 'PENDING', requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
+          ...venueAssignmentAudits.filter((entry) => entry.resourceId === localId).map((entry) => ({
+            kind: 'RELOCATION', successful: true, pending: false, requestedByTcId: entry.userId,
+            requestedAt: entry.createdAt, completedAt: entry.createdAt,
+            requestedByName: [req.user.firstName, req.user.lastName].filter(Boolean).join(' '),
+          })),
         ];
         rows.push(createMovementTrackerRow(agent, events, req.user.id, network));
       }
       void feed;
     } else {
-      const [registry, activeAssignments] = await Promise.all([
+      const [registry, activeAssignments, venueAudits] = await Promise.all([
         fetchDdinAgentData(),
         prisma.tcTerritoryAssignment.findMany({ where: { tcId: req.user.id, isActive: true, territory: { is: { type: 'DISTRICT', isActive: true } } }, select: { territory: { select: { name: true } } } }),
+        prisma.auditLog.findMany({
+          where: { userId: req.user.id, action: 'SAVE_TC_MOOLA_LOCATION_DETAILS', resourceType: 'MoolaAgentLocation' },
+          select: { id: true, userId: true, resourceId: true, createdAt: true, details: true },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        }),
       ]);
+      const venueAssignmentAudits = venueAudits.filter((entry) => isVenueAssignmentAudit(entry.details));
       const roster = await withMoolaFieldLocations(registry.agents, districts, true);
       const transferRows = await prisma.moolaAgentTransfer.findMany({
         where: { requestedByTcId: req.user.id, status: { in: ['PENDING', 'ON_HOLD', 'COMPLETED'] } },
@@ -872,7 +931,30 @@ router.get('/agent-movement-tracker', authenticateToken, requireRole('TC'), asyn
         where: { requestedByTcId: req.user.id, status: { in: ['PENDING', 'APPROVED'] } },
         select: { externalAgentId: true, agentName: true, loginName: true, requestedByTcId: true, requestedAt: true, reviewedAt: true, status: true, fromTerritory: { select: { name: true } }, toTerritory: { select: { name: true } }, requestedByTc: { select: { firstName: true, lastName: true } } },
       });
+      const approvedRelocationsByMe = relocationRows.filter((event) => event.status === 'APPROVED').length;
+      const venueAssignmentsByMe = venueAssignmentAudits.length;
+      activitySummary = {
+        transfersByMe: transferRows.filter((event) => event.status === 'COMPLETED').length,
+        approvedRelocationsByMe,
+        venueAssignmentsByMe,
+        relocationsByMe: approvedRelocationsByMe + venueAssignmentsByMe,
+      };
       const candidates = new Map(roster.map((agent) => [String(agent.id), { ...agent, trackerKey: String(agent.id) }]));
+      const missingAuditIds = venueAssignmentAudits.map((entry) => String(entry.resourceId || '')).filter((id) => id && !candidates.has(id));
+      const auditedLocations = missingAuditIds.length ? await prisma.moolaAgentLocation.findMany({
+        where: { externalAgentId: { in: [...new Set(missingAuditIds)] } },
+        select: { externalAgentId: true, agentName: true, loginName: true, venue: true, territory: { select: { name: true } }, sector: { select: { name: true } }, cell: { select: { name: true } }, village: { select: { name: true } } },
+      }) : [];
+      for (const location of auditedLocations) {
+        const id = String(location.externalAgentId);
+        if (candidates.has(id)) continue;
+        candidates.set(id, {
+          id, agentId: id, name: location.agentName, loginName: location.loginName,
+          phone: '', district: location.territory?.name || '',
+          sector: location.sector?.name || '', cell: location.cell?.name || '', village: location.village?.name || '',
+          trackerKey: id,
+        });
+      }
       for (const event of [...transferRows, ...relocationRows]) {
         if (candidates.has(String(event.externalAgentId))) continue;
         const assignedSource = activeAssignments.some(({ territory }) => normalizeDistrictName(territory.name) === normalizeDistrictName(event.fromTerritory?.name));
@@ -893,12 +975,17 @@ router.get('/agent-movement-tracker', authenticateToken, requireRole('TC'), asyn
           ...approvedRelocations.filter((event) => event.externalAgentId === id).map((event) => ({ ...event, kind: 'RELOCATION', successful: true, pending: false, requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
           ...transferRows.filter((event) => String(event.externalAgentId) === id).map((event) => ({ ...event, kind: 'TRANSFER', successful: event.status === 'COMPLETED', pending: ['PENDING', 'ON_HOLD'].includes(event.status), requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
           ...relocationRows.filter((event) => String(event.externalAgentId) === id).map((event) => ({ ...event, kind: 'RELOCATION', successful: event.status === 'APPROVED', pending: event.status === 'PENDING', requestedByName: [event.requestedByTc?.firstName, event.requestedByTc?.lastName].filter(Boolean).join(' ') })),
+          ...venueAssignmentAudits.filter((entry) => String(entry.resourceId) === id).map((entry) => ({
+            kind: 'RELOCATION', successful: true, pending: false, requestedByTcId: entry.userId,
+            requestedAt: entry.createdAt, completedAt: entry.createdAt,
+            requestedByName: [req.user.firstName, req.user.lastName].filter(Boolean).join(' '),
+          })),
         ];
         rows.push(createMovementTrackerRow(agent, events, req.user.id, network));
       }
       void registry;
     }
-    res.json(movementTrackerResponse(rows, req));
+    res.json(movementTrackerResponse(rows, req, activitySummary));
   } catch (error) {
     console.error('TC agent movement tracker error:', error.code || error.name || 'Error');
     res.status(502).json({ error: 'Could not load your transfer and relocation activity.' });
@@ -931,13 +1018,7 @@ router.get('/moola-plus/movements', authenticateToken, requireRole('ADMIN'), asy
     const transferCounts = Object.fromEntries(transferStatusCounts.map((row) => [row.status, row._count._all]));
     const relocationCounts = Object.fromEntries(relocationStatusCounts.map((row) => [row.status, row._count._all]));
     const relocationAuditById = new Map(relocationAudits.map(({ resourceId, details }) => [resourceId, details]));
-    const locationVenueAudits = venueAudits.filter(({ details }) => {
-      const from = details?.from || {};
-      const to = details?.to || {};
-      return Boolean(from.villageId && from.villageId === to.villageId
-        && from.sectorId === to.sectorId && from.cellId === to.cellId
-        && String(from.venue || '').trim() !== String(to.venue || '').trim());
-    });
+    const locationVenueAudits = venueAudits.filter(({ details }) => isVenueAssignmentAudit(details));
     const venueOnlyRelocationCount = relocations.filter((item) => {
       const details = relocationAuditById.get(item.id) || {};
       const from = details.from || {};
@@ -1435,13 +1516,7 @@ router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, re
       }),
     ]);
 
-    const locationVenueAudits = locationDetailAudits.filter(({ details }) => {
-      const from = details?.from || {};
-      const to = details?.to || {};
-      return Boolean(from.villageId && from.villageId === to.villageId
-        && from.sectorId === to.sectorId && from.cellId === to.cellId
-        && String(from.venue || '').trim() !== String(to.venue || '').trim());
-    });
+    const locationVenueAudits = locationDetailAudits.filter(({ details }) => isVenueAssignmentAudit(details));
     const relocationAuditById = new Map(relocationAudits.map(({ details }) => [details?.requestId, details]).filter(([id]) => id));
     const venueOnlyRelocationCount = relocations.filter((item) => {
       const details = relocationAuditById.get(item.id) || {};
