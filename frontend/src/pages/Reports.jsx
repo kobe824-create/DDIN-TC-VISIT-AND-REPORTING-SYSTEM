@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { ArrowLeft, Download, FileBarChart2, MapPin, Printer, ShieldCheck, UsersRound, ArrowRightLeft } from 'lucide-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { ArrowLeft, Download, FileBarChart2, MapPin, Printer, RefreshCw, ShieldCheck, UsersRound, ArrowRightLeft } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '../api';
 import { useAuth } from '../AuthContext';
@@ -11,6 +11,9 @@ import { MOOLA_PLUS_NETWORK, useNetwork } from '../NetworkContext';
 const monthAgo = () => { const date = new Date(); date.setDate(date.getDate() - 30); return date.toISOString().slice(0, 10); };
 const nameOf = (person) => [person?.firstName, person?.lastName].filter(Boolean).join(' ') || person?.username || '—';
 const day = (value) => value ? new Intl.DateTimeFormat('en-GB', { dateStyle: 'medium' }).format(new Date(value)) : '—';
+const timeLabel = (value) => value
+  ? new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Africa/Kigali' }).format(new Date(value))
+  : '';
 
 function IremboReports() {
   const { user } = useAuth();
@@ -46,6 +49,9 @@ function IremboReports() {
   const [movementReport, setMovementReport] = useState(null);
   const [movementLoading, setMovementLoading] = useState(false);
   const [movementError, setMovementError] = useState('');
+  const [movementUpdatedAt, setMovementUpdatedAt] = useState(null);
+  const movementRequestIdRef = useRef(0);
+  const movementRequestActiveRef = useRef(false);
   const isAdmin = user?.role === 'ADMIN';
 
   const loadReports = useCallback(async () => {
@@ -76,22 +82,49 @@ function IremboReports() {
   }, [fromDate, toDate, pageSize, visitsPage, verificationPage]);
 
   useEffect(() => { loadReports(); }, [loadReports]);
-  const loadMovements = useCallback(async () => {
+  const loadMovements = useCallback(async ({ silent = false } = {}) => {
     if (!isAdmin) return;
-    setMovementLoading(true); setMovementError('');
+    if (silent && movementRequestActiveRef.current) return;
+    const requestId = ++movementRequestIdRef.current;
+    movementRequestActiveRef.current = true;
+    if (!silent) { setMovementLoading(true); setMovementError(''); }
     try {
       const { data } = await api.get('/api/v1/reports/movements', { params: {
+        _refresh: Date.now(),
         fromDate, toDate, territoryId: movementTerritoryId, tcId: movementTcId,
         kind: movementKind, status: movementStatusFilter, search: movementQuery,
         sortBy: movementSortBy, page: movementPage, limit: 25,
       } });
+      if (requestId !== movementRequestIdRef.current) return;
       setMovementReport(data);
       setMovementFilters(data.filters || { territories: [], coordinators: [] });
+      setMovementUpdatedAt(Date.now());
+      setMovementError('');
       if (data.meta?.page && data.meta.page !== movementPage) setMovementPage(data.meta.page);
-    } catch (err) { setMovementError(err.response?.data?.error || 'Could not load transfer and relocation activity.'); }
-    finally { setMovementLoading(false); }
+    } catch (err) {
+      if (!silent && requestId === movementRequestIdRef.current) setMovementError(err.response?.data?.error || 'Could not load transfer and relocation activity.');
+    } finally {
+      if (requestId === movementRequestIdRef.current) {
+        movementRequestActiveRef.current = false;
+        if (!silent) setMovementLoading(false);
+      }
+    }
   }, [fromDate, toDate, isAdmin, movementTerritoryId, movementTcId, movementKind, movementStatusFilter, movementQuery, movementSortBy, movementPage]);
   useEffect(() => { if (tab === 'movements') loadMovements(); }, [tab, loadMovements]);
+  useEffect(() => {
+    if (!isAdmin || tab !== 'movements') return undefined;
+    const refreshIfVisible = () => {
+      if (document.visibilityState === 'visible') void loadMovements({ silent: true });
+    };
+    const interval = window.setInterval(refreshIfVisible, 10000);
+    window.addEventListener('focus', refreshIfVisible);
+    document.addEventListener('visibilitychange', refreshIfVisible);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', refreshIfVisible);
+      document.removeEventListener('visibilitychange', refreshIfVisible);
+    };
+  }, [isAdmin, tab, loadMovements]);
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setMovementQuery(movementSearch.trim());
@@ -157,7 +190,7 @@ function IremboReports() {
               <div className="movement-kind-filters" role="tablist" aria-label="Filter movement report">
                 {[['ALL', 'All movements'], ['TRANSFER', 'Transfers'], ['RELOCATION', 'Relocations']].map(([value, label]) => <button type="button" key={value} role="tab" aria-selected={movementKind === value} className={movementKind === value ? 'active' : ''} onClick={() => { setMovementKind(value); setMovementPage(1); }}>{label}</button>)}
               </div>
-              <small>Open any row to see the full movement record.</small>
+              <div className="movement-live-actions"><small aria-live="polite" title="Automatically refreshes every 10 seconds while this tab is visible.">{movementUpdatedAt ? `Live · updated ${timeLabel(movementUpdatedAt)}` : 'Updating…'}</small><button type="button" className="btn btn-secondary btn-sm" onClick={() => void loadMovements({ silent: true })} disabled={movementLoading}><RefreshCw size={14} />Refresh</button><small>Open any row to see the full movement record.</small></div>
             </div>
             <div className="movement-filter-grid">
               <label>District / territory<select className="input" value={movementTerritoryId} onChange={(event) => { setMovementTerritoryId(event.target.value); setMovementPage(1); }}><option value="">All territories</option>{movementFilters.territories.map((territory) => <option key={territory.id} value={territory.id}>{territory.name}</option>)}</select></label>

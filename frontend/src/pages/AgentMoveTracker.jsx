@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { Activity, ArrowLeftRight, ChevronLeft, ChevronRight, Clock3, MapPin, Search, UsersRound } from 'lucide-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Activity, ArrowLeftRight, ChevronLeft, ChevronRight, Clock3, MapPin, RefreshCw, Search, UsersRound } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import api from '../api';
 import { ErrorState, LoadingState } from '../components';
@@ -16,6 +16,9 @@ const tabs = [
 const dateLabel = (value) => value
   ? new Intl.DateTimeFormat('en-GB', { dateStyle: 'medium' }).format(new Date(value))
   : '—';
+const timeLabel = (value) => value
+  ? new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Africa/Kigali' }).format(new Date(value))
+  : '';
 
 export default function AgentMoveTracker() {
   const navigate = useNavigate();
@@ -34,13 +37,22 @@ export default function AgentMoveTracker() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [retryKey, setRetryKey] = useState(0);
+  const [updatedAt, setUpdatedAt] = useState(null);
+  const latestRequestRef = useRef(0);
+  const requestActiveRef = useRef(false);
 
-  const load = useCallback(async (signal) => {
-    setLoading(true);
-    setError('');
+  const load = useCallback(async (signal, { silent = false } = {}) => {
+    if (silent && requestActiveRef.current) return;
+    const requestId = ++latestRequestRef.current;
+    requestActiveRef.current = true;
+    if (!silent) {
+      setLoading(true);
+      setError('');
+    }
     try {
       const { data } = await api.get('/api/v1/reports/agent-movement-tracker', {
         params: {
+          _refresh: Date.now(),
           network,
           status,
           kind,
@@ -50,17 +62,22 @@ export default function AgentMoveTracker() {
         },
         signal,
       });
-      if (signal?.aborted) return;
+      if (signal?.aborted || requestId !== latestRequestRef.current) return;
       setRows(data.data || []);
       setSummary(data.summary || {});
       setDistricts(data.filters?.districts || []);
       setTotal(data.total || 0);
       setPages(data.pages || 0);
       setPage(data.page || 1);
+      setUpdatedAt(Date.now());
+      setError('');
     } catch (err) {
-      if (!signal?.aborted) setError(err.response?.data?.error || 'Could not load your agent movement tracker.');
+      if (!signal?.aborted && requestId === latestRequestRef.current && !silent) setError(err.response?.data?.error || 'Could not load your agent movement tracker.');
     } finally {
-      if (!signal?.aborted) setLoading(false);
+      if (requestId === latestRequestRef.current) {
+        requestActiveRef.current = false;
+        if (!signal?.aborted) setLoading(false);
+      }
     }
   }, [network, status, kind, district, search, page]);
 
@@ -69,6 +86,20 @@ export default function AgentMoveTracker() {
     const timer = window.setTimeout(() => void load(controller.signal), search.trim() ? 250 : 0);
     return () => { window.clearTimeout(timer); controller.abort(); };
   }, [load, retryKey, search]);
+
+  useEffect(() => {
+    const refreshIfVisible = () => {
+      if (document.visibilityState === 'visible') void load(undefined, { silent: true });
+    };
+    const interval = window.setInterval(refreshIfVisible, 10000);
+    window.addEventListener('focus', refreshIfVisible);
+    document.addEventListener('visibilitychange', refreshIfVisible);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', refreshIfVisible);
+      document.removeEventListener('visibilitychange', refreshIfVisible);
+    };
+  }, [load]);
 
   const changeFilter = (setter, value) => {
     setter(value);
@@ -98,7 +129,11 @@ export default function AgentMoveTracker() {
     <section className="surface-card move-tracker-card">
       <div className="move-tracker-heading">
         <div><h2>Movement history</h2><p>Use the status, movement type, territory, or search to find an agent.</p></div>
-        <span className="move-tracker-pending"><Clock3 size={15} />{Number(summary.pending || 0).toLocaleString()} pending</span>
+        <div className="move-tracker-live-actions">
+          <span className="move-tracker-live-status" title="Automatically refreshes every 10 seconds while this page is visible." aria-live="polite">{updatedAt ? `Live · updated ${timeLabel(updatedAt)}` : 'Updating…'}</span>
+          <button className="btn btn-secondary btn-sm" type="button" onClick={() => void load(undefined, { silent: true })} disabled={loading}><RefreshCw size={14} />Refresh</button>
+          <span className="move-tracker-pending"><Clock3 size={15} />{Number(summary.pending || 0).toLocaleString()} pending</span>
+        </div>
       </div>
 
       <div className="move-tracker-tabs" role="tablist" aria-label="Filter agents by movement status">

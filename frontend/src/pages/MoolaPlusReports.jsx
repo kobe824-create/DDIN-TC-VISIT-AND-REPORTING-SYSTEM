@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowRightLeft, MapPin, RefreshCw, UsersRound } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import api from '../api';
@@ -27,6 +27,9 @@ export default function MoolaPlusReports() {
   const [movementReport, setMovementReport] = useState(null);
   const [movementLoading, setMovementLoading] = useState(false);
   const [movementError, setMovementError] = useState('');
+  const [movementUpdatedAt, setMovementUpdatedAt] = useState(null);
+  const movementRequestIdRef = useRef(0);
+  const movementRequestActiveRef = useRef(false);
   const load = useCallback(async (forceRefresh = false) => {
     setLoading(true);
     setError('');
@@ -48,18 +51,45 @@ export default function MoolaPlusReports() {
     }
   }, []);
   useEffect(() => { void load(); }, [load]);
-  const loadMovements = useCallback(async () => {
+  const loadMovements = useCallback(async ({ silent = false } = {}) => {
     if (!isAdmin) return;
-    setMovementLoading(true);
-    setMovementError('');
+    if (silent && movementRequestActiveRef.current) return;
+    const requestId = ++movementRequestIdRef.current;
+    movementRequestActiveRef.current = true;
+    if (!silent) {
+      setMovementLoading(true);
+      setMovementError('');
+    }
     try {
-      const { data } = await api.get('/api/v1/reports/moola-plus/movements', { params: { fromDate: movementFromDate, toDate: movementToDate } });
+      const { data } = await api.get('/api/v1/reports/moola-plus/movements', { params: { fromDate: movementFromDate, toDate: movementToDate, _refresh: Date.now() } });
+      if (requestId !== movementRequestIdRef.current) return;
       setMovementReport(data);
+      setMovementUpdatedAt(Date.now());
+      setMovementError('');
     } catch (movementLoadError) {
-      setMovementError(movementLoadError.response?.data?.error || 'Could not load Moola Plus movement activity.');
-    } finally { setMovementLoading(false); }
+      if (!silent && requestId === movementRequestIdRef.current) setMovementError(movementLoadError.response?.data?.error || 'Could not load Moola Plus movement activity.');
+    } finally {
+      if (requestId === movementRequestIdRef.current) {
+        movementRequestActiveRef.current = false;
+        if (!silent) setMovementLoading(false);
+      }
+    }
   }, [isAdmin, movementFromDate, movementToDate]);
   useEffect(() => { if (isAdmin) void loadMovements(); }, [isAdmin, loadMovements]);
+  useEffect(() => {
+    if (!isAdmin) return undefined;
+    const refreshIfVisible = () => {
+      if (document.visibilityState === 'visible') void loadMovements({ silent: true });
+    };
+    const interval = window.setInterval(refreshIfVisible, 10000);
+    window.addEventListener('focus', refreshIfVisible);
+    document.addEventListener('visibilitychange', refreshIfVisible);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', refreshIfVisible);
+      document.removeEventListener('visibilitychange', refreshIfVisible);
+    };
+  }, [isAdmin, loadMovements]);
 
   return <div className="page moola-reports-page">
     <PageHeader title="Moola Plus reports" subtitle="Agent activity and classifications from DDIN’s registry and deposit report." actions={<div className="page-header-actions"><button className="btn btn-secondary" onClick={() => navigate('/agents')}><UsersRound size={16} />Browse agents</button><button className="btn btn-primary" onClick={() => load(true)} disabled={loading}><RefreshCw size={16} className={loading ? 'spin' : ''} />Refresh</button></div>} />
@@ -68,7 +98,7 @@ export default function MoolaPlusReports() {
       <div className="network-source-note"><strong>{summary.stale ? 'Showing the last successful sync' : 'Live DDIN registry data'}</strong><span>Last synced {formatDate(summary.fetchedAt)} Rwanda time.</span></div>
       <MoolaAnalytics summary={summary} />
       {isAdmin && <section className="surface-card moola-movement-report">
-        <div className="surface-heading"><div><span className="section-kicker">TERRITORY CHANGES</span><h3>Moola Plus transfers and relocations</h3><p>Includes same-village venue assignments saved by coordinators.</p></div><div className="page-header-actions"><label className="movement-date-filter"><span>From</span><input type="date" value={movementFromDate} onChange={(event) => setMovementFromDate(event.target.value)} /></label><label className="movement-date-filter"><span>To</span><input type="date" value={movementToDate} onChange={(event) => setMovementToDate(event.target.value)} /></label><button className="btn btn-secondary btn-sm" type="button" onClick={() => void loadMovements()} disabled={movementLoading}><RefreshCw size={15} className={movementLoading ? 'spin' : ''} />Refresh</button></div></div>
+        <div className="surface-heading"><div><span className="section-kicker">TERRITORY CHANGES</span><h3>Moola Plus transfers and relocations</h3><p>Includes same-village venue assignments saved by coordinators.</p><small className="movement-live-label" aria-live="polite" title="Automatically refreshes every 10 seconds while this page is visible.">{movementUpdatedAt ? `Live · updated ${timeLabel(movementUpdatedAt)} Rwanda time` : 'Updating…'}</small></div><div className="page-header-actions"><label className="movement-date-filter"><span>From</span><input type="date" value={movementFromDate} onChange={(event) => setMovementFromDate(event.target.value)} /></label><label className="movement-date-filter"><span>To</span><input type="date" value={movementToDate} onChange={(event) => setMovementToDate(event.target.value)} /></label><button className="btn btn-secondary btn-sm" type="button" onClick={() => void loadMovements({ silent: true })} disabled={movementLoading}><RefreshCw size={15} />Refresh</button></div></div>
         {movementError && <ErrorState message={movementError} onRetry={loadMovements} />}
         {movementLoading ? <LoadingState message="Loading Moola Plus moves…" /> : !movementError && <>
           <section className="report-metrics movement-metrics">

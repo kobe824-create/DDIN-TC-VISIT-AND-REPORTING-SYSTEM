@@ -810,6 +810,7 @@ function movementTrackerResponse(rows, req) {
 }
 
 router.get('/agent-movement-tracker', authenticateToken, requireRole('TC'), async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   try {
     const network = String(req.query.network || 'IREMBO').toUpperCase();
     if (!['IREMBO', 'MOOLA_PLUS'].includes(network)) return res.status(400).json({ error: 'Choose Irembo or Moola Plus.' });
@@ -905,6 +906,7 @@ router.get('/agent-movement-tracker', authenticateToken, requireRole('TC'), asyn
 });
 
 router.get('/moola-plus/movements', authenticateToken, requireRole('ADMIN'), async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   try {
     const todayKey = kigaliDateKey(new Date());
     const selected = selectedDateWindow(String(req.query.fromDate || ''), String(req.query.toDate || ''), todayKey);
@@ -1346,6 +1348,7 @@ router.get('/visits', authenticateToken, requireRole('ADMIN', 'MANAGER', 'TC', '
 });
 
 router.get('/movements', authenticateToken, requireRole('ADMIN'), async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   try {
     const todayKey = kigaliDateKey(new Date());
     const selected = selectedDateWindow(String(req.query.fromDate || ''), String(req.query.toDate || ''), todayKey);
